@@ -246,7 +246,10 @@
     },
 
     open() {
-      if (this.state.isFirstMessage && !this.state.emailCaptured && !this.state.emailPopupShown) {
+      // Email capture popup is controlled by the "Show email capture popup"
+      // setting on the app embed (off by default).
+      const emailPopupEnabled = window.shopChatConfig?.emailPopupEnabled === true;
+      if (emailPopupEnabled && this.state.isFirstMessage && !this.state.emailCaptured && !this.state.emailPopupShown) {
         this.showEmailPopup();
         this.state.emailPopupShown = true;
         sessionStorage.setItem('shopAiEmailPopupShown', 'true');
