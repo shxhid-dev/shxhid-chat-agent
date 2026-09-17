@@ -602,7 +602,8 @@
   .shop-ai-send-btn:hover{ transform: translateY(-1px) scale(1.06); box-shadow: 0 4px 14px rgba(255,157,92,0.35); }
   .shop-ai-send-btn svg{ width: 18px; height: 18px; }
 
-  .shop-ai-email-overlay{ position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; opacity: 0; visibility: hidden; transition: all 0.3s; }
+  .shop-ai-email-overlay{ display: none !important; }
+  .shop-ai-email-overlay-legacy{ position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; opacity: 0; visibility: hidden; transition: all 0.3s; }
   .shop-ai-email-overlay.active{ opacity: 1; visibility: visible; }
   .shop-ai-email-popup{ background: #fff; border-radius: 24px; padding: 36px 32px; max-width: 420px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.12); animation: popupSlide 0.3s cubic-bezier(0.16, 1, 0.3, 1); text-align: center; }
   @keyframes popupSlide{ from{ opacity: 0; transform: translateY(20px) scale(0.95); } to{ opacity: 1; transform: translateY(0) scale(1); } }
@@ -744,19 +745,6 @@
       <button class="shop-ai-menu-item danger" data-action="end"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> End chat</button>
     </div>
 
-    <div class="shop-ai-email-overlay" id="shop-ai-email-overlay">
-      <div class="shop-ai-email-popup">
-        <div class="shop-ai-email-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
-        <h3 class="shop-ai-email-title">Stay Connected</h3>
-        <p class="shop-ai-email-subtitle">Get exclusive offers and product updates</p>
-        <div class="shop-ai-email-input-wrapper">
-          <input type="email" class="shop-ai-email-input" id="shop-ai-email-input" placeholder="Enter your email..." autocomplete="email"/>
-          <p class="shop-ai-email-error" id="shop-ai-email-error">Please enter a valid email</p>
-        </div>
-        <button class="shop-ai-email-submit" id="shop-ai-email-submit">Continue</button>
-        <button class="shop-ai-email-skip" id="shop-ai-email-skip">Skip for now</button>
-      </div>
-    </div>
 
     <div class="shop-ai-messages" id="shop-ai-messages">
       <div class="shop-ai-suggestions visible" id="shop-ai-suggestions">
