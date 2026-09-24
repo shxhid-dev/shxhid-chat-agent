@@ -245,25 +245,32 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   let productsSentToFrontend = false;
 
   try {
-    let storefrontMcpTools = [], customerMcpTools = [];
+    let storefrontMcpTools = [], customerMcpTools = [], ucpMcpTools = [];
     try {
       const mcpResult = await Promise.race([
         (async () => {
+          // Catalog search now lives on /api/ucp/mcp, not /api/mcp.
+          const ucp = await mcpClient.connectToUcpCatalogServer();
           const sf = await mcpClient.connectToStorefrontServer();
           const cu = await mcpClient.connectToCustomerServer();
-          return { sf, cu };
+          return { ucp, sf, cu };
         })(),
         new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
       ]);
-      if (mcpResult) { storefrontMcpTools = mcpResult.sf; customerMcpTools = mcpResult.cu; }
-      console.log(`Connected to MCP: ${storefrontMcpTools.length + customerMcpTools.length} tools`);
+      if (mcpResult) {
+        ucpMcpTools = mcpResult.ucp;
+        storefrontMcpTools = mcpResult.sf;
+        customerMcpTools = mcpResult.cu;
+      }
+      const allMcpTools = [...ucpMcpTools, ...storefrontMcpTools, ...customerMcpTools];
+      console.log(`Connected to MCP: ${allMcpTools.length} tools`);
 
-      const catalogTool = (storefrontMcpTools || []).find((t) => isCatalogSearchTool(t.name));
+      const catalogTool = allMcpTools.find((t) => isCatalogSearchTool(t.name));
       if (catalogTool) {
         console.log(`[Chat] MCP catalog-search tool: "${catalogTool.name}"`);
         console.log(`[Chat] catalog tool input_schema keys: [${Object.keys(catalogTool.input_schema?.properties || {}).join(", ")}]`);
       } else {
-        console.warn(`[Chat] WARNING: No catalog-search tool found. Available: ${(storefrontMcpTools || []).map((t) => t.name).join(", ")}`);
+        console.warn(`[Chat] WARNING: No catalog-search tool found. Available: ${allMcpTools.map((t) => t.name).join(", ")}`);
       }
     } catch (error) {
       console.warn("[Chat] MCP connection failed:", error.message);
