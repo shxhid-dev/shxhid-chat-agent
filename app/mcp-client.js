@@ -1,6 +1,19 @@
 /**
- * MCPClient — v2.2
+ * MCPClient — v2.3
  * Client for interacting with Model Context Protocol (MCP) API endpoints
+ *
+ * CHANGES (v2.3 — Sept 2026):
+ *   - Shopify's UCP migration moved the catalog tools off /api/mcp.
+ *     search_catalog / lookup_catalog / get_product now live on
+ *     /api/ucp/mcp, while /api/mcp keeps only get_cart, update_cart and
+ *     search_shop_policies_and_faqs. Listing tools on the old endpoint was
+ *     returning policies only, which is why "No catalog-search tool found"
+ *     started firing and product search returned nothing.
+ *   - Added connectToUcpCatalogServer() and callUcpTool().
+ *   - Every UCP request carries an agent profile in `meta`; UCP rejects
+ *     calls without one.
+ *   - searchShopCatalog() now routes through callTool() so the request lands
+ *     on whichever server actually advertises the tool.
  *
  * CHANGES (v2.2 — May 2026):
  *   - `searchShopCatalog()` now inspects the tool's input_schema to determine
@@ -21,7 +34,7 @@
 
 const CATALOG_SEARCH_TOOL_NAMES = new Set([
   "search_shop_catalog",  // legacy
-  "search_catalog",       // current (confirmed April-May 2026)
+  "search_catalog",       // current (UCP)
   "search_products",      // defensive
 ]);
 
@@ -34,9 +47,21 @@ class MCPClient {
     this.tools = [];
     this.customerTools = [];
     this.storefrontTools = [];
+    this.ucpTools = [];
 
     this.hostUrl = this._normalizeUrl(hostUrl);
+
+    // Standard Storefront MCP: get_cart, update_cart,
+    // search_shop_policies_and_faqs ONLY.
     this.storefrontMcpEndpoint = `${this.hostUrl}/api/mcp`;
+
+    // UCP catalog MCP: search_catalog, lookup_catalog, get_product.
+    this.ucpMcpEndpoint = `${this.hostUrl}/api/ucp/mcp`;
+
+    // Every UCP catalog request must carry an agent profile.
+    this.ucpAgentProfile =
+      process.env.UCP_AGENT_PROFILE ||
+      "https://shopify.dev/ucp/agent-profiles/examples/2026-08-25/valid-with-capabilities.json";
 
     const accountHostUrl = this.hostUrl.replace(/(\.myshopify\.com)$/, '.account$1');
     this.customerMcpEndpoint = customerMcpEndpoint || `${accountHostUrl}/customer/api/mcp`;
@@ -65,20 +90,28 @@ class MCPClient {
     return `https://${resolved}`;
   }
 
+  _ucpMeta() {
+    return { "ucp-agent": { profile: this.ucpAgentProfile } };
+  }
+
+  /** Catalog tools may be advertised by either server. Check both. */
+  _catalogCandidateTools() {
+    return [...(this.ucpTools || []), ...(this.storefrontTools || [])];
+  }
+
   getCatalogSearchToolName() {
-    const found = (this.storefrontTools || []).find(t => isCatalogSearchTool(t.name));
+    const found = this._catalogCandidateTools().find(t => isCatalogSearchTool(t.name));
     return found?.name || "search_catalog";
   }
 
   /**
    * v2.2: Detect and return the correct args object for the catalog search tool.
    *
-   * The Shopify Storefront MCP changed its search tool's input schema:
    *   Old (search_shop_catalog): { query: "solenoid valve" }
    *   New (search_catalog):      { catalog: { query: "solenoid valve" } }
    *
-   * We inspect the tool's advertised input_schema to determine which shape to use.
-   * This ensures we always pass valid args regardless of MCP version.
+   * We inspect the tool's advertised input_schema to determine which shape to
+   * use, so we pass valid args regardless of MCP version.
    */
   getCatalogSearchToolArgs(query) {
     if (!query || typeof query !== 'string') {
@@ -87,7 +120,7 @@ class MCPClient {
 
     const cleanQuery = query.trim();
     const toolName = this.getCatalogSearchToolName();
-    const tool = (this.storefrontTools || []).find(t => t.name === toolName);
+    const tool = this._catalogCandidateTools().find(t => t.name === toolName);
 
     // Check the input_schema to determine expected argument structure
     if (tool?.input_schema?.properties) {
@@ -112,7 +145,7 @@ class MCPClient {
       }
     }
 
-    // Fallback: try to infer from tool name
+    // Fallback: infer from tool name.
     // search_catalog (new) → nested, search_shop_catalog (old) → flat
     if (toolName === 'search_catalog' || toolName === 'search_products') {
       if (this._catalogSearchSchema !== 'nested') {
@@ -201,13 +234,70 @@ class MCPClient {
     }
   }
 
+  async connectToUcpCatalogServer() {
+    try {
+      console.log(`🔌 Connecting to UCP catalog MCP: ${this.ucpMcpEndpoint}`);
+
+      const headers = { "Content-Type": "application/json" };
+
+      const response = await this._makeJsonRpcRequest(
+        this.ucpMcpEndpoint,
+        "tools/list",
+        { meta: this._ucpMeta() },
+        headers
+      );
+
+      const toolsData = response.result?.tools || [];
+      const ucpTools = this._formatToolsData(toolsData);
+
+      this.ucpTools = ucpTools;
+      this.tools = [...this.tools, ...ucpTools];
+
+      console.log(
+        `✅ Connected to UCP catalog MCP: ${ucpTools.length} tools available` +
+        (ucpTools.length ? ` (${ucpTools.map(t => t.name).join(", ")})` : "")
+      );
+      return ucpTools;
+
+    } catch (error) {
+      // Non-fatal: the assistant can still answer policy questions without it.
+      console.error("❌ Failed to connect to UCP catalog MCP:", error.message);
+      this.ucpTools = [];
+      return [];
+    }
+  }
+
   async callTool(toolName, toolArgs) {
     if (this.customerTools.some(tool => tool.name === toolName)) {
       return this.callCustomerTool(toolName, toolArgs);
+    } else if (this.ucpTools.some(tool => tool.name === toolName)) {
+      return this.callUcpTool(toolName, toolArgs);
     } else if (this.storefrontTools.some(tool => tool.name === toolName)) {
       return this.callStorefrontTool(toolName, toolArgs);
     } else {
       throw new Error(`Tool '${toolName}' not found in any connected MCP server`);
+    }
+  }
+
+  async callUcpTool(toolName, toolArgs) {
+    console.log(`📞 Calling UCP catalog tool: ${toolName}`);
+
+    const headers = { "Content-Type": "application/json" };
+
+    // UCP rejects the call without an agent profile in meta.
+    const args = { meta: this._ucpMeta(), ...(toolArgs || {}) };
+
+    try {
+      const response = await this._makeJsonRpcRequestWithRetry(
+        this.ucpMcpEndpoint,
+        "tools/call",
+        { name: toolName, arguments: args },
+        headers
+      );
+      return response.result || response;
+    } catch (error) {
+      console.error(`❌ UCP catalog tool '${toolName}' failed:`, error.message);
+      throw error;
     }
   }
 
@@ -293,10 +383,10 @@ class MCPClient {
   /**
    * Search shop catalog by natural language query.
    *
-   * v2.2: Uses getCatalogSearchToolArgs() to build the correct args object
-   * based on the advertised tool schema. This handles both:
-   *   - Old search_shop_catalog: { query: "..." }
-   *   - New search_catalog:      { catalog: { query: "..." } }
+   * v2.3: Dispatches through callTool() so the request goes to whichever
+   * server advertises the tool — the UCP endpoint in practice. Calling
+   * callStorefrontTool() directly here sent catalog searches to /api/mcp,
+   * which no longer serves them.
    */
   async searchShopCatalog(query) {
     if (!query || typeof query !== "string") {
@@ -309,7 +399,7 @@ class MCPClient {
     console.log(`🔍 Searching catalog for: "${query}" via tool "${toolName}" with args: ${JSON.stringify(toolArgs)}`);
 
     try {
-      const result = await this.callStorefrontTool(toolName, toolArgs);
+      const result = await this.callTool(toolName, toolArgs);
 
       if (!result || typeof result !== "object") {
         throw new Error("Invalid search result structure");
@@ -363,7 +453,14 @@ class MCPClient {
     try {
       const searchResult = await this.searchShopCatalog(productQuery);
 
-      const items = searchResult?.items || searchResult?.results || searchResult?.products || [];
+      const items =
+        searchResult?.items ||
+        searchResult?.results ||
+        searchResult?.products ||
+        searchResult?.catalog?.items ||
+        searchResult?.catalog?.products ||
+        [];
+
       if (!items || items.length === 0) {
         throw new Error(`No products found for "${productQuery}"`);
       }
@@ -479,6 +576,7 @@ class MCPClient {
       all: this.tools,
       customer: this.customerTools,
       storefront: this.storefrontTools,
+      ucp: this.ucpTools,
     };
   }
 
