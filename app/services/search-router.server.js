@@ -17,7 +17,7 @@ import { isAlgoliaConfigured, algoliaSearch } from './algolia.server.js';
 import { rewriteQueryForSearch } from './query-intelligence.server.js';
 import { adminTextSearch } from './admin-products.server.js';
 
-const STOREFRONT_HOST = "creativeautomation.ae"; // public storefront for product URLs
+const STOREFRONT_HOST = (process.env.STOREFRONT_HOST || "www.creativeautomation.ae").replace(/^https?:\/\//, "").replace(/^www\./, ""); // public storefront for product URLs
 
 function plainTextFromHtml(html) {
   if (!html || typeof html !== "string") return "";
@@ -124,8 +124,14 @@ function detectSku(message) {
   if (!normalized) return null;
 
   // Pattern 3 first: explicit "SKU: X" / "part# X" wins regardless of word count
-  const explicitPrefix = normalized.match(/(?:sku|part(?:\s*#)?)[:\s]+([A-Z0-9][A-Z0-9\-_\.\/]{2,})/i);
-  if (explicitPrefix) return explicitPrefix[1];
+  // Word-bounded, and "part" only counts as a prefix when followed by
+  // no/number/#/code. The old pattern matched "the part reaches near a
+  // sensor" and sent "reaches" to the Admin SKU lookup. The captured code
+  // must also contain a digit - real part numbers always do.
+  const explicitPrefix = normalized.match(
+    /\b(?:sku|p\/n|part\s*(?:no\.?|number|#|code)|model\s*(?:no\.?|number|#))\s*[:#]?\s*([A-Z0-9][A-Z0-9\-_\.\/]{2,})/i
+  );
+  if (explicitPrefix && /\d/.test(explicitPrefix[1])) return explicitPrefix[1];
 
   // Strip leading/trailing punctuation off each token, then test in order.
   const tokens = normalized
@@ -221,15 +227,26 @@ function matchSkuToken(token) {
     { input: "ACS580",      expect: "ACS580",      note: "short SKU" },
     { input: "DFS60S",      expect: "DFS60S",      note: "SICK encoder family" },
   ];
+  // Whole-message cases for detectSku (prefix handling).
+  const messageCases = [
+    { input: "when the part reaches near a proximity sensor its not showing output", expect: null, note: "'part' as a normal word" },
+    { input: "part# 12345", expect: "12345", note: "explicit part#" },
+    { input: "SKU: ABC123", expect: "ABC123", note: "explicit SKU" },
+    { input: "part no MCJI-12-32-100", expect: "MCJI-12-32-100", note: "part no" },
+  ];
   const failures = [];
   for (const c of cases) {
     const got = matchSkuToken(c.input);
     if (got !== c.expect) failures.push(`  FAIL ${c.input} (${c.note}): got ${JSON.stringify(got)}, expected ${JSON.stringify(c.expect)}`);
   }
+  for (const c of messageCases) {
+    const got = detectSku(c.input);
+    if (got !== c.expect) failures.push(`  FAIL "${c.input}" (${c.note}): got ${JSON.stringify(got)}, expected ${JSON.stringify(c.expect)}`);
+  }
   if (failures.length) {
     console.error(`[SearchRouter] SKU self-test FAILED:\n${failures.join("\n")}`);
   } else {
-    console.log("[SearchRouter] SKU self-test passed (15 cases)");
+    console.log(`[SearchRouter] SKU self-test passed (${cases.length + messageCases.length} cases)`);
   }
 })();
 
@@ -241,6 +258,11 @@ function isConversationalMessage(msg) {
   // Pure greetings/acks with no product substance
   const pureChat = /^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|sure|got it|great|perfect|sounds good|appreciate it|noted|understood|alright|cool|nice|good|fine)[\s!?.]*$/i;
   if (pureChat.test(lower)) return true;
+
+  // A follow-up that carries a number ("what about 50 stroke", "how about
+  // 24V?") is a refined search, not chit-chat -- let QueryIntel merge it
+  // with the previous request.
+  if (/\d/.test(lower)) return false;
 
   // Follow-up questions about previous results -- NOT new searches
   const followUp = /\b(other brand|another brand|different brand|any other|something else|other option|alternative|instead|other model|another model|similar to|like that|like this|show more|more like|anything else|what else|can you show|tell me more|what about|how about)\b/i;
@@ -369,12 +391,14 @@ async function handleTextSearch(query, shopDomain, conversationHistory = []) {
   // Run QueryIntel for the rewritten query that Algolia performs best on.
   let algoliaQuery = query;
   let skipSearch = false;
+  let requestedBrand = null;
 
   if (isAlgoliaConfigured()) {
     try {
       const intel = await rewriteQueryForSearch(query, conversationHistory);
       skipSearch = intel.skip;
       algoliaQuery = intel.query || query;
+      requestedBrand = intel.brand || null;
       console.log(`[SearchRouter] QueryIntel: "${query}" → "${algoliaQuery}" (skip=${skipSearch}, reason=${intel.reason})`);
     } catch (err) {
       console.warn(`[SearchRouter] QueryIntel error: ${err.message} -- using original query`);
@@ -388,17 +412,47 @@ async function handleTextSearch(query, shopDomain, conversationHistory = []) {
     return null;
   }
 
+  // Holds off-target Tier 1 hits so they can be used as a last resort if
+  // tiers 2 and 3 find nothing better.
+  let weakAlgoliaResults = null;
+  let weakAlgoliaQuery = null;
+
   // --- TIER 1: ALGOLIA (PRIMARY) -------------------------------------
   // Single request, max 10 results, no pagination.
   if (isAlgoliaConfigured() && algoliaQuery) {
     console.log(`[SearchRouter] TIER 1 (Algolia): querying "${algoliaQuery}"`);
     try {
-      const result = await algoliaSearch(algoliaQuery, { first: 10, shopDomain });
+      const result = await algoliaSearch(algoliaQuery, { first: 10, shopDomain, requestedBrand });
       const count = result?.products?.length || 0;
-      console.log(`[SearchRouter] TIER 1 (Algolia): ${count} results`);
-      if (count > 0) {
+      const confidence = result?.confidence || 'high';
+      console.log(`[SearchRouter] TIER 1 (Algolia): ${count} results (confidence=${confidence})`);
+      if (count > 0 && confidence === 'high') {
         console.log(`[SearchRouter] OK Returning Algolia results -- tiers 2/3 NOT consulted`);
         return formatStorefrontResult(result.products, 'algolia_search', algoliaQuery);
+      }
+      if (count > 0 && confidence === 'brand_missing') {
+        // Customer named a brand we don't carry (or that isn't indexed).
+        // Show same-spec alternatives but say so explicitly, and keep the
+        // catalog tools available (chat.jsx treats this path as low-confidence).
+        const altVendors = [...new Set(result.products.map((p) => p.vendor).filter(Boolean))].slice(0, 3);
+        console.warn(`[SearchRouter] Brand "${requestedBrand}" not found -- returning ${count} alternatives (${altVendors.join(', ')})`);
+        const out = formatStorefrontResult(result.products, 'algolia_brand_missing', algoliaQuery);
+        out.systemHint =
+          `The customer asked for ${requestedBrand} but we have NO ${requestedBrand} products in the catalog. ` +
+          `The cards show alternatives from ${altVendors.join(', ') || 'other brands'} with matching specs. ` +
+          `Say clearly that ${requestedBrand} is not currently listed, present these as alternatives (never as ${requestedBrand}), ` +
+          `and offer websales@creativeautomation.ae if they need ${requestedBrand} specifically.`;
+        return out;
+      }
+      if (count > 0) {
+        // Algolia matched something, but nothing in the top hit's structured
+        // fields relates to the query (the "hot cylinders" → TI hot-swap
+        // controllers case). Try the other tiers first; if they also come up
+        // empty we still return these, flagged weak so the chat layer keeps
+        // the catalog tools and Claude can re-search or say it found nothing.
+        console.warn(`[SearchRouter] TIER 1 (Algolia): results look off-target -- trying tiers 2/3`);
+        weakAlgoliaResults = result.products;
+        weakAlgoliaQuery = algoliaQuery;
       }
     } catch (err) {
       console.warn(`[SearchRouter] TIER 1 (Algolia) ERROR: ${err.message}`);
@@ -447,6 +501,26 @@ async function handleTextSearch(query, shopDomain, conversationHistory = []) {
     }
   } catch (err) {
     console.warn(`[SearchRouter] TIER 3 (Storefront) ERROR: ${err.message}`);
+  }
+
+  // Nothing better turned up. Return the off-target Tier 1 hits rather than
+  // nothing, but flagged weak: chat.jsx keeps the catalog tools available so
+  // Claude can re-search or tell the customer it found no good match, instead
+  // of presenting these as the answer.
+  if (weakAlgoliaResults && weakAlgoliaResults.length > 0) {
+    console.warn(
+      `[SearchRouter] Falling back to WEAK Algolia results (${weakAlgoliaResults.length}) for "${query}"`
+    );
+    const weak = formatStorefrontResult(
+      weakAlgoliaResults,
+      'algolia_search_weak',
+      weakAlgoliaQuery || query
+    );
+    weak.systemHint =
+      `Search returned ${weakAlgoliaResults.length} product(s) for "${weakAlgoliaQuery || query}", but they may NOT match what ` +
+      `the customer asked for. Check the titles against the request. If they are unrelated, say you could not find a ` +
+      `match and ask a clarifying question instead of presenting them as answers.`;
+    return weak;
   }
 
   console.log(`[SearchRouter] --- all tiers exhausted: 0 results for "${query}" ---`);
