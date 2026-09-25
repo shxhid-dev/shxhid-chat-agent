@@ -43,7 +43,11 @@ This store sells industrial automation equipment including:
 - PLCs, HMIs, Encoders
 
 RULES:
-1. Output ONLY valid JSON on a single line: {"query":"...","skip":false,"reason":"..."}
+1. Output ONLY valid JSON on a single line:
+   {"query":"...","skip":false,"reason":"...","brand":null}
+   "brand" = the manufacturer the user explicitly asked for (e.g. "Riko",
+   "Carlo Gavazzi", "SMC"), or null if none was named in the current message
+   or carried over from context. Never guess a brand the user did not name.
 2. Set skip:true ONLY if the message has NO product search intent whatsoever
 3. Extract brand name + product type as the core query (2-5 words max)
 
@@ -52,7 +56,6 @@ RULES:
      - Electrical specs: voltage (24V, 230VAC, 400V), amperage (100A), frequency (50Hz)
      - IP/protection ratings: IP67, IP68
      - Wire count: "3 wire", "4 wire"
-     - Sensing range as standalone spec: "4mm range", "sensing distance 50mm"
      - Generic fillers: industrial, commercial, heavy duty, professional grade
 
    KEEP (these ARE the product designation or appear in the product title):
@@ -76,7 +79,19 @@ RULES:
 
 6. Fix typos silently — but never "fix" SKU/part codes; copy them exactly.
 7. Use catalog-standard terminology (see mappings below)
-8. If conversation context is provided, use it to fill in missing product type
+8. FOLLOW-UP REFINEMENTS (very important):
+   If "Previous user messages" are provided AND the current message only adds,
+   changes or narrows specs/brand (e.g. "do you have 100 stroke?", "exactly 32
+   dia", "in riko brand only", "PNP only", "any in 24V?"), MERGE it with the
+   previous request: keep the previous product type, series words (compact,
+   ISO, guided, flush...), brand and specs, then apply the new/changed values.
+   If the current message names a DIFFERENT product type, it is a NEW search —
+   ignore the context. If it names only a brand ("do you have carlo gavazzi"),
+   output just the brand unless the user says "in that"/"same"/"for this".
+
+9. PNEUMATIC CYLINDERS: "dia", "diameter", "bore", "ID", "size" of a cylinder
+   = bore → write "N mm bore". "stroke"/"length" → "N mm stroke". Always keep
+   BOTH values and the series word (compact, ISO, guided, round, mini).
 
 TERMINOLOGY MAPPINGS (user term → catalog term):
 "flush mount/flush type/embeddable" → "flush" (keep it)
@@ -96,6 +111,8 @@ TERMINOLOGY MAPPINGS (user term → catalog term):
 "current transformer/CT" → "current transformer"
 "5/2 way / 5-2 way / 5/2-way" → keep as "5/2 solenoid valve" (valve type, not SKU)
 "3/2 way / 3-2 way" → keep as "3/2 solenoid valve"
+"cylinder dia 32 / 32 dia / 32 bore" → "32 mm bore"
+"100 stroke / stroke 100" → "100 mm stroke"
 
 EXAMPLES:
 User: "show me flush mount proximity sensors"
@@ -117,15 +134,15 @@ User: "3/2 way directional control valve"
 → {"query":"3/2 directional control valve","skip":false,"reason":"valve_config_kept"}
 
 User: "60 mm sensing range"
-Context: user was asking about SICK proximity sensors
+Previous user messages: "SICK proximity sensors"
 → {"query":"SICK proximity sensor 60 mm","skip":false,"reason":"context_enriched_size_kept_spaced"}
 
 User: "M12 4mm sensing range"
 → {"query":"M12 proximity sensor 4 mm","skip":false,"reason":"size_spaced"}
 
 User: "4mm sensing range M12"
-Context: user was asking about IFM sensors
-→ {"query":"IFM M12 proximity sensor","skip":false,"reason":"context_enriched"}
+Previous user messages: "IFM inductive sensors"
+→ {"query":"IFM M12 proximity sensor 4 mm","skip":false,"reason":"context_enriched","brand":"IFM"}
 
 User: "te connectivity productsd"
 → {"query":"TE Connectivity","skip":false,"reason":"brand_query_typo_fixed"}
@@ -137,13 +154,35 @@ User: "AODD pump 3 inch aluminum body"
 → {"query":"3 inch AODD pump aluminium","skip":false,"reason":"size_and_material_kept"}
 
 User: "push in fittings 6mm"
-→ {"query":"push-in pneumatic fitting","skip":false,"reason":"term_mapped"}
+→ {"query":"6 mm push-in pneumatic fitting","skip":false,"reason":"tube_size_kept"}
 
 User: "inverter drive 30kw power rating"
 → {"query":"inverter drive 30kw","skip":false,"reason":"power_rating_kept_as_designator"}
 
 User: "M12 threaded body non flush"
 → {"query":"M12 non-flush proximity sensor","skip":false,"reason":"spec_mapped"}
+
+User: "find me compact cylinder dia 32"
+→ {"query":"compact cylinder 32 mm bore","skip":false,"reason":"cylinder_bore_mapped","brand":null}
+
+User: "do you have 100 stroke ?"
+Previous user messages: "find me compact cylinder dia 32"
+→ {"query":"compact cylinder 32 mm bore 100 mm stroke","skip":false,"reason":"refinement_merged","brand":null}
+
+User: "give me exactly 32 dia and 100 stroke"
+Previous user messages: "compact cylinder dia 32 100 stroke"
+→ {"query":"compact cylinder 32 mm bore 100 mm stroke","skip":false,"reason":"refinement_merged","brand":null}
+
+User: "in riko brand only"
+Previous user messages: "proximity sensor m18 pnp"
+→ {"query":"Riko M18 PNP proximity sensor","skip":false,"reason":"refinement_brand_added","brand":"Riko"}
+
+User: "do you have carlo gavazzi"
+Previous user messages: "proximity sensor not showing output"
+→ {"query":"Carlo Gavazzi","skip":false,"reason":"brand_query","brand":"Carlo Gavazzi"}
+
+User: "when the part reaches near a proximity sensor its not showing output, why?"
+→ {"query":"","skip":true,"reason":"troubleshooting_no_product_search_intent","brand":null}
 
 User: "what brands do you carry?"
 → {"query":"","skip":true,"reason":"conversational"}
@@ -152,7 +191,7 @@ User: "thanks" or "ok" or "yes"
 → {"query":"","skip":true,"reason":"conversational"}
 
 User: "which one has the longest range?"
-Context: user was asking about photoelectric sensors
+Previous user messages: "photoelectric sensors"
 → {"query":"photoelectric sensor long range","skip":false,"reason":"context_used"}
 
 User: "do you have 1/4 Inch AODD Pumps BP06PP-PTT4-B -BSK"
@@ -177,6 +216,20 @@ User: "pneumatic parts"
 const queryCache = new Map();
 const MAX_CACHE_SIZE = 200;
 
+// Product-type nouns. A message containing one of these is a self-contained
+// search; a message without one ("100 stroke", "riko only") is a refinement.
+const PRODUCT_NOUN = /\b(sensors?|cylinders?|valves?|pumps?|drives?|motors?|relays?|breakers?|mcbs?|mccbs?|contactors?|fittings?|cables?|connectors?|switch(es)?|plcs?|hmis?|encoders?|supply|supplies|transformers?|gearbox(es)?|terminals?|fuses?|actuators?|regulators?|filters?|gauges?|transmitters?|timers?|controllers?|inverters?|vfds?|tubes?|tubing|hoses?|modules?|lamps?|lights?|meters?|thermocouples?|rtds?|coils?|grippers?|silencers?|lubricators?|manifolds?|couplings?|bearings?|enclosures?|barriers?|isolators?|starters?|sockets?|plugs?|glands?)\b/i;
+const REFINE_WORDS = /\b(only|exactly|same|also|instead|that one|those|these|this|it|them|brand|stroke|bore|dia|diameter|size|longer|shorter|bigger|smaller|cheaper|in stock|pnp|npn|flush|non-flush|\d+\s*(mm|v|vdc|vac|bar|a|kw)?)\b/i;
+
+export function looksLikeRefinement(msg) {
+  if (!msg) return false;
+  const words = msg.trim().split(/\s+/).length;
+  const CLARIFIER = /^(show me only|filter by|with |the first one|which one|only the|and the|in stock|cheaper|more expensive|larger|smaller|same but|like the (first|second|last|one|previous))\b/i;
+  if (CLARIFIER.test(msg)) return true;
+  if (!PRODUCT_NOUN.test(msg)) return REFINE_WORDS.test(msg) || words <= 4;
+  return false;
+}
+
 export async function rewriteQueryForSearch(userMessage, conversationContext = []) {
   if (!userMessage || typeof userMessage !== 'string') {
     return { query: userMessage, skip: false, reason: 'no_message' };
@@ -187,38 +240,37 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
     return { query: trimmed, skip: true, reason: 'too_short' };
   }
 
-  // Build a context summary from the last turn. We ONLY feed prior context
-  // when the current message is plainly a clarifier of the previous turn
-  // (e.g. "show me only", "with", "the first one"). Treating every message
-  // as a follow-up bleeds the previous brand/category into unrelated
-  // searches — "do you have circuit breakers" after a SICK sensor question
-  // would otherwise be rewritten as "SICK circuit breaker".
-  const CLARIFIER = /^(show me only|filter by|with |the first one|which one|only the|and the|in stock|cheaper|more expensive|larger|smaller|same but|like the (first|second|last|one|previous))\b/i;
-  const isClarifier = CLARIFIER.test(trimmed);
+  // Context gating. The old version only fed context when the message
+  // started with a narrow CLARIFIER phrase, so real follow-ups like
+  // "do you have 100 stroke ?" or "give me exactly 32 dia and 100 stroke"
+  // were rewritten WITHOUT the previous request and lost "compact cylinder".
+  // Now: feed the last user messages whenever the current message looks like
+  // a refinement (no product noun of its own, or explicit refinement words).
+  // A message that names its own product type is treated as a new search,
+  // which still prevents brand bleed ("SICK" -> "SICK circuit breaker").
+  const isRefinement = looksLikeRefinement(trimmed);
 
   let contextSummary = '';
-  if (isClarifier && conversationContext && conversationContext.length > 0) {
-    const recentTurns = conversationContext
-      .filter(m => m.role === 'user' || m.role === 'assistant')
-      .slice(-2) // last user+assistant pair only
+  if (isRefinement && conversationContext && conversationContext.length > 0) {
+    const prevUserTurns = conversationContext
+      .filter(m => m.role === 'user')
       .map(m => {
         const content = typeof m.content === 'string'
           ? m.content
           : (Array.isArray(m.content)
               ? m.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
               : '');
-        // Truncate individual messages and strip SYSTEM NOTE injections
-        const clean = content
-          .replace(/\[SYSTEM.*?\]/gs, '')
-          .replace(/\[SYSTEM NOTE.*?\]/gs, '')
+        return content
+          .replace(/\[SYSTEM[\s\S]*?\]/g, '')
+          .replace(/^User message:\s*/i, '')
           .trim()
-          .substring(0, 120);
-        return clean ? `${m.role}: ${clean}` : null;
+          .substring(0, 160);
       })
-      .filter(Boolean);
+      .filter(c => c && c !== trimmed)
+      .slice(-3); // last 3 user turns carry the running spec list
 
-    if (recentTurns.length > 0) {
-      contextSummary = `\nPrevious conversation:\n${recentTurns.join('\n')}`;
+    if (prevUserTurns.length > 0) {
+      contextSummary = `\nPrevious user messages (oldest first):\n${prevUserTurns.map(t => `- "${t}"`).join('\n')}`;
     }
   }
 
@@ -244,7 +296,7 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
 
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 100,
+      max_tokens: 150,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userContent }],
     });
@@ -261,6 +313,8 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
         query: (parsed.query || '').trim(),
         skip: !!parsed.skip,
         reason: parsed.reason || 'rewritten',
+        brand: typeof parsed.brand === 'string' && parsed.brand.trim() ? parsed.brand.trim() : null,
+        usedContext: !!contextSummary,
       };
 
       // If rewritten query is empty but skip=false, use original
@@ -275,7 +329,7 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
 
     if (result.query !== trimmed || result.skip) {
       console.log(
-        `[QueryIntel] "${trimmed}" → "${result.query}" (${result.reason})`
+        `[QueryIntel] "${trimmed}" → "${result.query}" (${result.reason}${result.brand ? `, brand=${result.brand}` : ''}${contextSummary ? ', context=yes' : ''})`
       );
     }
 
