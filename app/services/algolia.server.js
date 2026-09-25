@@ -43,16 +43,16 @@ function _cacheGet(key) {
   // refresh LRU order
   _resultCache.delete(key);
   _resultCache.set(key, v);
-  return v.products;
+  return { products: v.products, confidence: v.confidence || 'high' };
 }
 
-function _cacheSet(key, products) {
+function _cacheSet(key, products, confidence) {
   if (!products || products.length === 0) return;
   if (_resultCache.size >= RESULT_CACHE_MAX) {
     const oldest = _resultCache.keys().next().value;
     if (oldest) _resultCache.delete(oldest);
   }
-  _resultCache.set(key, { products, at: Date.now() });
+  _resultCache.set(key, { products, confidence: confidence || 'high', at: Date.now() });
 }
 
 const _DEBUG_SEARCH = process.env.DEBUG_SEARCH === '1';
@@ -97,6 +97,12 @@ export function isAlgoliaConfigured() {
 // facet call returns nothing, we fall back to letting the vendor name
 // remain in the free-text query.
 const VENDOR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Vendor names are compared in a normalised form so "Carlo-gavazzi",
+// "carlo gavazzi" and "CARLO_GAVAZZI" are the same brand.
+export function normVendor(v) {
+  return String(v || '').toLowerCase().replace(/[-_\/.]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 let _vendorCache = null; // { vendors: Set<string lowercase>, vendorMap: Map<string lowercase, string original>, fetchedAt: number }
 let _vendorInflight = null;
 
@@ -109,22 +115,50 @@ async function getVendorSet(client, indexName) {
 
   _vendorInflight = (async () => {
     try {
-      // Algolia v5 client: searchForFacetValues on a single facet.
-      const res = await client.searchForFacetValues({
-        indexName,
-        facetName: 'vendor',
-        searchForFacetValuesRequest: { facetQuery: '', maxFacetHits: 100 },
-      });
-      const facetHits = res?.facetHits || res?.results?.[0]?.facetHits || [];
       const vendors = new Set();
       const vendorMap = new Map();
-      for (const f of facetHits) {
-        const v = f.value;
-        if (typeof v === 'string' && v.trim()) {
-          const lower = v.toLowerCase();
-          vendors.add(lower);
-          if (!vendorMap.has(lower)) vendorMap.set(lower, v);
-        }
+
+      const addVendor = (v) => {
+        if (typeof v !== 'string' || !v.trim()) return;
+        const key = normVendor(v);
+        if (!key) return;
+        vendors.add(key);
+        // Keep EVERY original spelling so the filter matches all of them.
+        if (!vendorMap.has(key)) vendorMap.set(key, new Set());
+        vendorMap.get(key).add(v);
+      };
+
+      // PRIMARY: a facet-only search returns up to maxValuesPerFacet (1000)
+      // distinct values. searchForFacetValues caps at maxFacetHits=100, which
+      // silently truncated the vendor list — any brand outside the top 100 by
+      // count could never be routed.
+      let gotAll = false;
+      try {
+        const facetRes = await client.search({
+          requests: [{
+            indexName,
+            query: '',
+            hitsPerPage: 0,
+            facets: ['vendor'],
+            maxValuesPerFacet: 1000,
+          }],
+        });
+        const facetObj = facetRes?.results?.[0]?.facets?.vendor || {};
+        for (const v of Object.keys(facetObj)) addVendor(v);
+        gotAll = vendors.size > 0;
+      } catch (facetErr) {
+        console.warn(`[Algolia] facet-based vendor fetch failed: ${facetErr.message}`);
+      }
+
+      // FALLBACK: searchForFacetValues, still better than nothing.
+      if (!gotAll) {
+        const res = await client.searchForFacetValues({
+          indexName,
+          facetName: 'vendor',
+          searchForFacetValuesRequest: { facetQuery: '', maxFacetHits: 100 },
+        });
+        const facetHits = res?.facetHits || res?.results?.[0]?.facetHits || [];
+        for (const f of facetHits) addVendor(f.value);
       }
       _vendorCache = { vendors, vendorMap, fetchedAt: now };
       console.log(`[Algolia] vendor cache populated: ${vendors.size} vendors`);
@@ -151,11 +185,11 @@ async function getVendorSet(client, indexName) {
  * over "TE" alone.
  */
 async function applyVendorRouting(query, client, indexName) {
-  if (!query || typeof query !== 'string') return { algoliaQuery: query, filters: null };
+  if (!query || typeof query !== 'string') return { algoliaQuery: query, filters: null, matchedVendors: [] };
   const { vendors, vendorMap } = await getVendorSet(client, indexName);
-  if (!vendors || vendors.size === 0) return { algoliaQuery: query, filters: null };
+  if (!vendors || vendors.size === 0) return { algoliaQuery: query, filters: null, matchedVendors: [] };
 
-  const lower = query.toLowerCase();
+  const lower = normVendor(query);
   // Try to match each vendor (longest first) against the query as a
   // whole-word substring. Multiple vendors can match (OR them).
   const sorted = [...vendors].sort((a, b) => b.length - a.length);
@@ -164,11 +198,11 @@ async function applyVendorRouting(query, client, indexName) {
   for (const v of sorted) {
     const re = new RegExp(`\\s${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s`, 'g');
     if (re.test(stripped)) {
-      matched.push(vendorMap.get(v) || v);
+      for (const orig of (vendorMap.get(v) || [v])) matched.push(orig);
       stripped = stripped.replace(re, ' ');
     }
   }
-  if (matched.length === 0) return { algoliaQuery: query, filters: null };
+  if (matched.length === 0) return { algoliaQuery: query, filters: null, matchedVendors: [] };
 
   // Escape double quotes inside vendor names for the Algolia filter expr.
   const filters = matched
@@ -184,7 +218,7 @@ async function applyVendorRouting(query, client, indexName) {
   console.log(
     `[Algolia] vendor routing: matched=[${matched.join(', ')}] query="${query}" → query="${algoliaQuery}" filters=${filters}`
   );
-  return { algoliaQuery, filters };
+  return { algoliaQuery, filters, matchedVendors: matched };
 }
 
 /**
@@ -294,23 +328,81 @@ function extractSpecTokens(query) {
  * because metafields aren't in the Algolia hit but the values often
  * leak into title/description/tags.
  */
-function flattenHitText(hit) {
-  const parts = [
-    hit.title,
-    hit.handle,
-    hit.product_type,
-    hit.vendor,
-    Array.isArray(hit.tags) ? hit.tags.join(" ") : hit.tags,
-    Array.isArray(hit.named_tags) ? hit.named_tags.join(" ") : "",
-    hit.body_html_safe || hit.body_html || "",
-    hit.sku,
-  ];
+function _clean(parts) {
   return parts
     .filter(Boolean)
     .join(" ")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .toLowerCase();
+}
+
+/**
+ * STRONG surfaces: structured fields that describe what the product IS.
+ * A spec token found here is about the product itself.
+ */
+function flattenStrongText(hit) {
+  return _clean([
+    hit.title,
+    hit.handle,
+    hit.product_type,
+    hit.vendor,
+    Array.isArray(hit.tags) ? hit.tags.join(" ") : hit.tags,
+    Array.isArray(hit.named_tags) ? hit.named_tags.join(" ") : "",
+    hit.sku,
+  ]);
+}
+
+/**
+ * WEAK surface: the marketing description. A spec token found ONLY here is
+ * unreliable — "M12" in a description is usually the CONNECTOR on an M18
+ * sensor, and "hot" in a TI description means hot-swap, not temperature.
+ * Matches here earn partial credit, never a full match.
+ */
+function flattenWeakText(hit) {
+  return _clean([hit.body_html_safe || hit.body_html || ""]);
+}
+
+function flattenHitText(hit) {
+  return _clean([flattenStrongText(hit), flattenWeakText(hit)]);
+}
+
+// Words that carry no product meaning, stripped before term-overlap scoring.
+const STOPWORDS = new Set([
+  'a', 'an', 'the', 'for', 'of', 'and', 'or', 'with', 'to', 'in', 'on', 'at',
+  'me', 'my', 'we', 'our', 'i', 'you', 'your', 'find', 'need', 'want', 'get',
+  'show', 'search', 'looking', 'look', 'some', 'any', 'please', 'give', 'is',
+  'are', 'do', 'does', 'have', 'has', 'can', 'best', 'good', 'hot', 'new',
+  'cheap', 'top', 'nice', 'cool', 'great',
+]);
+
+function contentTerms(query) {
+  if (!query || typeof query !== 'string') return [];
+  return query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s.\-\/]/g, ' ')
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+}
+
+/**
+ * Fraction of the query's content words that appear in the hit's STRONG
+ * surfaces. This is the core relevance signal: a product whose title and
+ * type say nothing about what was asked for is not an answer, however
+ * enthusiastically Algolia matched a stray word in its description.
+ */
+function strongTermRatio(hit, terms) {
+  if (!terms.length) return 1;
+  const strong = flattenStrongText(hit);
+  let hitCount = 0;
+  for (const t of terms) {
+    // Singular/plural tolerance without a stemmer.
+    const stem = t.replace(/(ies|es|s)$/, '');
+    const pattern = stem.length >= 3 ? stem : t;
+    if (strong.includes(pattern)) hitCount++;
+  }
+  return hitCount / terms.length;
 }
 
 /**
@@ -349,7 +441,8 @@ function scoreHitByBusinessSignal(hit) {
 
 function scoreHitBySpec(hit, specTokens) {
   if (!specTokens.length) return 0;
-  const text = flattenHitText(hit);
+  const strong = flattenStrongText(hit);
+  const weak = flattenWeakText(hit);
   let score = 0;
 
   for (const tok of specTokens) {
@@ -367,37 +460,86 @@ function scoreHitBySpec(hit, specTokens) {
       );
     }
 
-    if (pattern.test(text)) {
-      // Exact spec match — huge positive signal.
-      score += 1000;
-    } else {
-      // Check if a DIFFERENT numeric value with the same unit appears
-      // in the text (e.g. user asked for 60mm, this product shows 5mm).
-      // That's an active mismatch → heavy negative score so the wrong
-      // size never ranks above the right size.
-      let mismatchRe;
-      if (tok.unit === "m_thread") {
-        mismatchRe = /\bm(\d{1,2})\b/gi;
-      } else if (tok.unit === "ip") {
-        mismatchRe = /\bip(\d{2})\b/gi;
-      } else {
-        mismatchRe = new RegExp(
-          `\\b(\\d+(?:\\.\\d+)?)\\s*${tok.unit}\\b`,
-          "gi"
-        );
-      }
+    // Build the mismatch detector once — used for both branches below.
+    function buildMismatchRe() {
+      if (tok.unit === "m_thread") return /\bm(\d{1,2})\b/gi;
+      if (tok.unit === "ip") return /\bip(\d{2})\b/gi;
+      return new RegExp(`\\b(\\d+(?:\\.\\d+)?)\\s*${tok.unit}\\b`, "gi");
+    }
+
+    function hasDifferentValue(text) {
+      const re = buildMismatchRe();
       let mm;
-      let foundDifferent = false;
-      while ((mm = mismatchRe.exec(text)) !== null) {
-        if (parseFloat(mm[1]) !== tok.value) {
-          foundDifferent = true;
-          break;
-        }
+      while ((mm = re.exec(text)) !== null) {
+        if (parseFloat(mm[1]) !== tok.value) return true;
       }
-      if (foundDifferent) score -= 800;
+      return false;
+    }
+
+    if (pattern.test(strong)) {
+      // The product's own title/type/tags/sku carry this spec. Real match.
+      score += 1000;
+    } else if (pattern.test(weak)) {
+      // Only the description mentions it. On an M12 query this is usually
+      // an M18 sensor that happens to have an M12 CONNECTOR — partial
+      // credit only, and still penalised below if the strong fields
+      // advertise a conflicting value.
+      score += 250;
+      if (hasDifferentValue(strong)) score -= 800;
+    } else if (hasDifferentValue(strong) || hasDifferentValue(weak)) {
+      // Actively wrong size — user asked 60mm, product is 5mm.
+      score -= 800;
     }
   }
   return score;
+}
+
+/**
+ * Cylinder dimensions are ROLE-sensitive: "32 mm bore x 100 mm stroke" and
+ * "100 mm bore x 32 mm stroke" contain the same numbers, and the generic spec
+ * scorer above cannot tell them apart. That is how "100 stroke" returned a
+ * 100 mm BORE cylinder and "32 dia 100 stroke" returned 32/300 cylinders.
+ * Parse bore and stroke explicitly from the query and from the product title.
+ */
+function extractCylinderDims(text) {
+  if (!text || typeof text !== 'string') return { bore: null, stroke: null };
+  const t = text.toLowerCase();
+  const num = (m) => (m ? parseFloat(m[1]) : null);
+  const bore =
+    num(t.match(/(\d+(?:\.\d+)?)\s*mm\s*(?:barrel\s*)?bore/)) ??
+    num(t.match(/\bbore\s*(?:dia(?:meter)?\s*)?[:=]?\s*(\d+(?:\.\d+)?)/)) ??
+    num(t.match(/(?:ø|\bdia(?:meter)?\s*)(\d+(?:\.\d+)?)/));
+  const stroke =
+    num(t.match(/(\d+(?:\.\d+)?)\s*mm\s*stroke/)) ??
+    num(t.match(/\bstroke\s*(?:length\s*)?[:=]?\s*(\d+(?:\.\d+)?)/));
+  return { bore, stroke };
+}
+
+function scoreHitByCylinderDims(hit, want) {
+  if (!want || (want.bore == null && want.stroke == null)) return 0;
+  const have = extractCylinderDims(`${hit.title || ''} ${hit.product_type || ''}`);
+  let s = 0;
+  for (const role of ['bore', 'stroke']) {
+    if (want[role] == null || have[role] == null) continue;
+    s += want[role] === have[role] ? 700 : -1200;
+  }
+  return s;
+}
+
+/**
+ * If the customer asked for a brand that we could not route to a vendor
+ * filter, check whether ANY hit actually carries that brand. If none does,
+ * the results are other brands and must not be presented as the answer
+ * ("proximity sensor m18 pnp in riko brand only" returned IFM, twice).
+ */
+function brandAppearsInHits(brand, hits) {
+  const b = normVendor(brand);
+  if (!b) return true;
+  return hits.some((h) => {
+    const v = normVendor(h.vendor);
+    if (v && (v === b || v.includes(b) || b.includes(v))) return true;
+    return normVendor(`${h.title || ''} ${Array.isArray(h.tags) ? h.tags.join(' ') : h.tags || ''}`).includes(b);
+  });
 }
 
 /**
@@ -440,7 +582,7 @@ function buildTypoPolicy({ looksLikeSku, hasNumericSpec }) {
   };
 }
 
-export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
+export async function algoliaSearch(query, { first = 10, shopDomain, requestedBrand = null } = {}) {
   if (!query || typeof query !== 'string') return null;
   const trimmed = query.trim();
   if (!trimmed) return null;
@@ -479,7 +621,7 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
 
   // Vendor filter routing (Bug 3): if the query contains a known vendor
   // token, lift it out into `filters` and strip from the free-text query.
-  const { algoliaQuery: queryForAlgolia, filters } = await applyVendorRouting(
+  const { algoliaQuery: queryForAlgolia, filters, matchedVendors = [] } = await applyVendorRouting(
     trimmed,
     client,
     indexName
@@ -489,14 +631,15 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
   const cacheKey = JSON.stringify({
     q: queryForAlgolia.toLowerCase().replace(/\s+/g, ' '),
     f: filters || '',
+    b: requestedBrand ? normVendor(requestedBrand) : '',
     first,
   });
   const cached = _cacheGet(cacheKey);
   if (cached) {
     console.log(
-      `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia_cache filters=${JSON.stringify(filters || '')} n=${cached.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(cached[0]?.sku || '')} top_vendor=${JSON.stringify(cached[0]?.vendor || '')} reranked=false`
+      `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia_cache filters=${JSON.stringify(filters || '')} n=${cached.products.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(cached.products[0]?.sku || '')} top_vendor=${JSON.stringify(cached.products[0]?.vendor || '')} reranked=false confidence=${cached.confidence}`
     );
-    return { products: cached };
+    return { products: cached.products, confidence: cached.confidence, requestedBrand };
   }
 
   // For non-SKU, non-numeric queries, let Algolia broaden by trimming
@@ -548,13 +691,23 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
   // numeric mismatches; business-signal score is a smaller tiebreaker for
   // in-stock products and a penalty for accessory/mounting-bracket records.
   const specTokens = extractSpecTokens(trimmed);
+  const cylWant = extractCylinderDims(trimmed);
+  const terms = contentTerms(queryForAlgolia || trimmed);
   let _reranked = false;
+  let _confidence = 'high';
+  let _topRatio = 1;
   if (hits.length > 0) {
     const originalTop3 = hits.slice(0, 3).map((h) => h.sku);
     const scored = hits.map((h, idx) => {
       const spec = specTokens.length ? scoreHitBySpec(h, specTokens) : 0;
       const biz = scoreHitByBusinessSignal(h);
-      return { hit: h, idx, spec, biz, score: spec + biz };
+      // Term score rewards products whose STRUCTURED fields actually talk
+      // about what was asked for, so a description-only keyword hit can no
+      // longer outrank a genuine product-type match.
+      const ratio = strongTermRatio(h, terms);
+      const term = Math.round(400 * ratio);
+      const dim = scoreHitByCylinderDims(h, cylWant);
+      return { hit: h, idx, spec, biz, term, dim, ratio, score: spec + biz + term + dim };
     });
 
     scored.sort((a, b) => {
@@ -565,6 +718,42 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
     hits = scored.map((s) => s.hit);
     const newTop3 = hits.slice(0, 3).map((h) => h.sku);
     _reranked = JSON.stringify(originalTop3) !== JSON.stringify(newTop3);
+
+    // ---- RELEVANCE FLOOR --------------------------------------------
+    // Previously ANY non-empty Algolia response was treated as a
+    // high-confidence answer, which is how "hot cylinders" returned
+    // Texas Instruments hot-swap controllers AND stripped the catalog
+    // tools so Claude could not recover. Now we grade the top hit.
+    const top = scored[0];
+    _topRatio = top?.ratio ?? 0;
+    const reasons = [];
+
+    // A vendor filter is itself strong evidence, so brand-only queries
+    // ("Bonfiglioli worm gearbox") are exempt from the term-overlap test.
+    if (!filters && terms.length > 0 && _topRatio === 0) {
+      reasons.push('no query term appears in any structured field of the top hit');
+    }
+    if (specTokens.length > 0 && (top?.spec ?? 0) <= 0) {
+      reasons.push('no product matched the requested spec');
+    }
+    if ((cylWant.bore != null || cylWant.stroke != null) && (top?.dim ?? 0) < 0) {
+      reasons.push('no cylinder matched the requested bore/stroke');
+    }
+    // Brand requested but not stocked / not routable → special verdict.
+    if (
+      requestedBrand &&
+      !matchedVendors.some((v) => normVendor(v) === normVendor(requestedBrand) || normVendor(v).includes(normVendor(requestedBrand))) &&
+      !brandAppearsInHits(requestedBrand, hits)
+    ) {
+      _confidence = 'brand_missing';
+      console.warn(`[Algolia] BRAND MISSING: "${requestedBrand}" requested but no hit carries it (top_vendor=${top?.hit?.vendor || '?'})`);
+    } else if (reasons.length > 0) {
+      _confidence = 'low';
+      console.warn(
+        `[Algolia] LOW CONFIDENCE for "${trimmed}": ${reasons.join('; ')} ` +
+        `(top_sku=${top?.hit?.sku || '?'} ratio=${_topRatio.toFixed(2)} spec=${top?.spec ?? 0})`
+      );
+    }
 
     if (specTokens.length > 0) {
       console.log(`[Algolia] spec tokens detected: ${JSON.stringify(specTokens)}`);
@@ -582,11 +771,11 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
         }
       }
     }
-    if (specTokens.length > 0 || _reranked) {
+    if (specTokens.length > 0 || _reranked || _confidence !== 'high') {
       console.log(`[Algolia] post-rerank top 5:`);
       scored.slice(0, 5).forEach((s, i) => {
         console.log(
-          `  ${i + 1}. score=${s.score} (spec=${s.spec} biz=${s.biz}) sku=${s.hit.sku} title="${(s.hit.title || "").slice(0, 80)}"`
+          `  ${i + 1}. score=${s.score} (spec=${s.spec} biz=${s.biz} term=${s.term} dim=${s.dim} ratio=${s.ratio.toFixed(2)}) sku=${s.hit.sku} title="${(s.hit.title || "").slice(0, 80)}"`
         );
       });
     }
@@ -627,7 +816,17 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
     ? await fetchVariantIdsByHandles(needsLookup, shopDomain)
     : new Map();
 
-  const STOREFRONT_HOST = 'www.creativeautomation.ae';
+  // Was hardcoded to the UAE store, which sent Saudi-store customers to the
+  // wrong country's product pages. Prefer an explicit env var, then the shop
+  // domain this request was made for.
+  // Set STOREFRONT_HOST per deployment (e.g. www.creativeautomation.ae /
+  // the Saudi domain). The *.myshopify.com admin domain is never used for
+  // customer-facing links.
+  const _shopHost = shopDomain ? String(shopDomain).replace(/^https?:\/\//, '').replace(/\/$/, '') : null;
+  const STOREFRONT_HOST =
+    process.env.STOREFRONT_HOST ||
+    (_shopHost && !_shopHost.endsWith('.myshopify.com') ? _shopHost : null) ||
+    'www.creativeautomation.ae';
 
   const products = hits.map((hit) => {
     const rawId = hit.objectID || hit.id || '';
@@ -698,11 +897,26 @@ export async function algoliaSearch(query, { first = 10, shopDomain } = {}) {
     return result;
   });
 
-  _cacheSet(cacheKey, products);
+  _cacheSet(cacheKey, products, _confidence);
 
   console.log(
-    `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=${products.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(products[0]?.sku || '')} top_vendor=${JSON.stringify(products[0]?.vendor || '')} reranked=${_reranked}`
+    `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=${products.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(products[0]?.sku || '')} top_vendor=${JSON.stringify(products[0]?.vendor || '')} reranked=${_reranked} confidence=${_confidence}`
   );
 
-  return { products };
+  return { products, confidence: _confidence, topTermRatio: _topRatio, requestedBrand };
 }
+
+// Exported for unit tests only — not part of the public search surface.
+export const __internals = {
+  extractSpecTokens,
+  flattenStrongText,
+  flattenWeakText,
+  scoreHitBySpec,
+  scoreHitByBusinessSignal,
+  contentTerms,
+  strongTermRatio,
+  extractCylinderDims,
+  scoreHitByCylinderDims,
+  brandAppearsInHits,
+  normVendor,
+};
