@@ -21,6 +21,16 @@
  *   - Fallback drops 'context' param that caused "Invalid params" on new tool
  */
 
+// Pre-search paths whose results may be off-target. For these the catalog
+// search tool stays available so Claude can recover / be honest.
+const LOW_CONFIDENCE_PATHS = new Set([
+  'sku_storefront_fallback',
+  'sku_nosep_fallback',
+  'storefront_search_last_resort',
+  'algolia_search_weak',      // relevance floor judged hits off-target
+  'algolia_brand_missing',    // customer asked for a brand we don't carry
+]);
+
 const CATALOG_SEARCH_TOOL_NAMES = new Set([
   "search_shop_catalog",
   "search_catalog",
@@ -332,17 +342,23 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         stream.sendMessage({ type: "product_results", products: smart.products });
         productsSentToFrontend = true;
 
-        const summary = smart.products.slice(0, 6).map((p) => ({
+        const summary = smart.products.slice(0, 8).map((p) => ({
           title: p.title,
           vendor: p.vendor,
           price: p.price,
           sku: p.sku,
         }));
+        const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
         const systemNote =
           `[SYSTEM NOTE — NOT FROM USER] Products have already been pre-found for this query and product cards are ALREADY DISPLAYED. ` +
           `${smart.systemHint} ` +
-          `Do NOT call search_catalog (or any catalog search tool) again — the results are already shown. ` +
-          `Write ONE short conversational reply (1-2 sentences). ` +
+          (isLowConfidence
+            ? `These results may NOT fully match the request. Compare the titles/vendors below with what the customer asked ` +
+              `(brand, bore, stroke, size, output type). Be honest about any mismatch. You may call the catalog search ONCE ` +
+              `with a better query if needed. `
+            : `Do NOT call search_catalog (or any catalog search tool) again — the results are already shown. ` +
+              `If the titles below do not match a spec or brand the customer asked for, say so honestly. `) +
+          `Write ONE short conversational reply (1-3 sentences). ` +
           `Pre-found product summary: ${JSON.stringify(summary)}`;
 
         const lastIdx = conversationHistory.length - 1;
@@ -365,12 +381,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     // fallback, SKU-fuzzy fallbacks) we keep the catalog tools so Claude can
     // re-search and recover if the pre-found results are off-target.
     if (productsSentToFrontend) {
-      const lowConfidencePaths = new Set([
-        'sku_storefront_fallback',
-        'sku_nosep_fallback',
-        'storefront_search_last_resort',
-      ]);
-      if (smartResult && lowConfidencePaths.has(smartResult.searchType)) {
+      if (smartResult && LOW_CONFIDENCE_PATHS.has(smartResult.searchType)) {
         console.log(
           `[Chat] Products pre-found via LOW-CONFIDENCE path (${smartResult.searchType}) — ` +
           `keeping catalog tools available so Claude can recover.`
@@ -378,6 +389,10 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       } else {
         const before = mcpClient.tools.length;
         mcpClient.storefrontTools = (mcpClient.storefrontTools || [])
+          .filter(t => !isCatalogSearchTool(t.name));
+        // Catalog search is advertised by the UCP server now, so it must be
+        // removed there as well or callTool would still route to it.
+        mcpClient.ucpTools = (mcpClient.ucpTools || [])
           .filter(t => !isCatalogSearchTool(t.name));
         mcpClient.tools = (mcpClient.tools || [])
           .filter(t => !isCatalogSearchTool(t.name));
