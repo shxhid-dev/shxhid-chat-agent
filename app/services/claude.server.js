@@ -50,7 +50,7 @@ export function createClaudeService() {
         // Haiku's latency/cost wins matter and Sonnet wouldn't help.
         const apiParams = {
           // v4.1 FIX: Correct versioned model string (was "claude-haiku-4-5" — invalid)
-          model: "claude-haiku-4-5-20251001",
+          model: "claude-sonnet-5",
           max_tokens: 4096,
           system: systemPrompt,
           messages,
