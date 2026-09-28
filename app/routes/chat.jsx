@@ -1,6 +1,36 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v2.3
+ * Chat API Route — v2.4
+ *
+ * CHANGES (v2.4 — Sep 28, 2026):
+ *   ADVISORY MODE (general enquiries — "suggest the right sensor for ...", "solution for ...")
+ *   - services/advisory.server.js identifies advice / troubleshooting enquiries, extracts what the
+ *     customer already said, picks <=3 clarifying questions, computes engineering numbers, and builds
+ *     an [ADVISORY BRIEF] that is placed in the LAST user message (in memory only, never saved).
+ *   - The search pre-pass uses the advisory query (e.g. "inductive proximity sensor 8 mm" for a 5 mm
+ *     gap) so product cards agree with the advice; it is skipped when no product query fits yet.
+ *   - The SYSTEM NOTE, the tool "stop" hint and the zero-result hint no longer force a 1-3 sentence
+ *     reply while advisory mode is active.
+ *   - If Claude fails or returns nothing, a deterministic advisory fallback is streamed instead.
+ *   - Kill switch: ADVISORY_MODE=off.
+ *
+ *   FIXES / HANDLING
+ *   - SKU detector: IP ratings ("IP69K", "IP67/IP69K") and supply specs ("24V-DC", "12-24VDC")
+ *     are no longer treated as product codes.
+ *   - Stored history: JSON.parse result is only accepted if it is an array of content blocks, so
+ *     messages like "123" or "true" no longer break turn order (they caused duplicate user turns).
+ *   - History sent to Claude is capped (CHAT_MAX_HISTORY, default 12) and always starts on a user turn.
+ *   - Tool loop continues only on stop_reason "tool_use" (was: anything but "end_turn").
+ *   - Empty-reply guard: if Claude streams no text, the user still gets an answer.
+ *   - Request validation: invalid JSON -> 400, non-string / empty message -> 400, message length cap
+ *     (CHAT_MAX_MESSAGE_CHARS, default 4000), conversation_id sanitised, safe Origin parsing
+ *     (Origin: "null" used to throw a 500).
+ *   - MCP servers connect in parallel, one failing server no longer blocks the others, and per-server
+ *     tool counts are logged. Kill switch: MCP_PARALLEL_CONNECT=0.
+ *
+ *   OPT-IN HARDENING (defaults keep today's behaviour)
+ *   - APP_PROXY_SIGNATURE_MODE = off | log | enforce   (verifies Shopify app-proxy HMAC signature)
+ *   - ALLOWED_ORIGINS = comma-separated hostnames       (CORS allowlist; unset = reflect any origin)
  *
  * CHANGES (v2.3 — May 1, 2026):
  *   - extractSearchQuery() now supports both schemas (primary fix):
@@ -9,7 +39,6 @@
  *     NEVER falls back to JSON.stringify(toolArgs) — that breaks the relevance gate.
  *   - Added [ImageDebug] log that prints the RAW image fields of the first product
  *     returned by MCP, so the exact field paths are visible in production logs.
- *     This resolves the "images still broken" mystery without guessing.
  *   - Added catalog tool input_schema keys log on connect for diagnostics.
  *
  * CHANGES (v2.2 — May 2026):
@@ -40,6 +69,15 @@ const CATALOG_SEARCH_TOOL_NAMES = new Set([
 function isCatalogSearchTool(toolName) {
   return CATALOG_SEARCH_TOOL_NAMES.has(String(toolName || "").toLowerCase());
 }
+
+// ─── v2.4 tunables (all optional env vars) ─────────────────────────────
+function intEnv(name, fallback) {
+  const n = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const MAX_MESSAGE_CHARS = intEnv("CHAT_MAX_MESSAGE_CHARS", 4000);
+const MAX_HISTORY_MESSAGES = intEnv("CHAT_MAX_HISTORY", 12);
+const ADVISORY_ENABLED = String(process.env.ADVISORY_MODE || "on").toLowerCase() !== "off";
 
 /**
  * Extract the plain-text query string from catalog search tool args.
@@ -83,6 +121,184 @@ function extractSearchQuery(toolArgs) {
   return null;
 }
 
+// ─── Small helpers (v2.4) ──────────────────────────────────────────────
+
+function safeHostname(urlLike) {
+  try {
+    return urlLike ? new URL(urlLike).hostname : null;
+  } catch (e) {
+    return null; // e.g. Origin: "null" from sandboxed iframes
+  }
+}
+
+function normalizeConversationId(id) {
+  if (typeof id === "string" && /^[\w.\-:]{1,128}$/.test(id)) return id;
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return `conv_${uuid || Date.now()}`;
+}
+
+/**
+ * Stored message content is plain text. Only treat it as structured content if it parses to an
+ * array of content blocks; otherwise "123", "true" or "null" would become numbers/booleans and
+ * break the "last message is the current user message" check.
+ */
+function parseStoredContent(raw) {
+  if (typeof raw !== "string") return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.length > 0 &&
+      parsed.every((b) => b && typeof b === "object" && typeof b.type === "string")
+    ) {
+      return parsed;
+    }
+    return raw;
+  } catch (e) {
+    return raw;
+  }
+}
+
+/** Keep the last `max` messages; the API needs the first turn to be a user turn. */
+function capHistory(messages, max) {
+  if (!Array.isArray(messages) || messages.length <= max) return messages;
+  const trimmed = messages.slice(-max);
+  while (trimmed.length > 1 && trimmed[0].role !== "user") trimmed.shift();
+  return trimmed;
+}
+
+/**
+ * Detect SKU-like tokens in a user message.
+ * Returns an array of probable SKU strings found (uppercase, digits+letters, with separators).
+ * Used to annotate the Claude message so it searches the exact code first.
+ */
+function detectSkuTokens(message) {
+  if (!message || typeof message !== "string") return [];
+  const skuRegex = /\b([A-Z0-9]{2,}[-\.\/][A-Z0-9][\w\-\.\/]*|[A-Z]{1,4}\d[\w\-\.\/]{2,}|\d{1,4}[A-Z]{1,5}[\w\-\.\/]{2,})\b/gi;
+  const matches = [];
+  const seen = new Set();
+  let m;
+  while ((m = skuRegex.exec(message)) !== null) {
+    const token = m[1].toUpperCase().replace(/\.$/, "");
+    if (token.length < 4) continue;
+    if (!/\d/.test(token) || !/[A-Z]/i.test(token)) continue;
+    // Skip pure electrical/spec tokens: "24VDC", "18MM", "24V", "100A", "5W"
+    if (/^\d+(?:MM|CM|VDC|VAC|V|A|W|KW|HP)$/i.test(token)) continue;
+    // Skip dimension+unit tokens: "2INCH", "2IN", "3FT", "4FEET" — these are
+    // measurements, not product codes. They are handled by the inch-dimension gate.
+    if (/^\d+(?:\.\d+)?(?:INCH|INCHES|IN|FT|FEET|FOOT|KM)$/i.test(token)) continue;
+    // Skip thread/pipe-standard tokens used as dimensions: "38NPT", "12BSP"
+    if (/^\d+(?:NPT|BSP|BSPP|BSPT)$/i.test(token)) continue;
+    // v2.4: skip ingress-protection ratings ("IP69K", "IP67/IP69K") and supply specs
+    // ("24V-DC", "DC24V", "12-24VDC", "10-30V") — specs, not product codes.
+    if (/^IP\d{2}K?(?:[-\/]IP\d{2}K?)*$/i.test(token)) continue;
+    if (/^\d+(?:\.\d+)?V[-\/]?(?:DC|AC)$/i.test(token)) continue;
+    if (/^(?:DC|AC)[-\/]?\d+(?:\.\d+)?V?$/i.test(token)) continue;
+    if (/^\d+(?:\.\d+)?[-\/]\d+(?:\.\d+)?V(?:DC|AC)?$/i.test(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    matches.push(token);
+  }
+  return matches;
+}
+
+/**
+ * Connect to the three MCP servers. Runs in parallel by default (saves ~1 s per message) and one
+ * failing server no longer stops the others from connecting. MCP_PARALLEL_CONNECT=0 restores the
+ * old one-after-another behaviour.
+ */
+async function connectMcpServers(mcpClient) {
+  const jobs = [
+    // Catalog search now lives on /api/ucp/mcp, not /api/mcp.
+    { name: "ucp", key: "ucp", run: () => mcpClient.connectToUcpCatalogServer() },
+    { name: "storefront", key: "sf", run: () => mcpClient.connectToStorefrontServer() },
+    { name: "customer", key: "cu", run: () => mcpClient.connectToCustomerServer() },
+  ];
+  const out = { ucp: [], sf: [], cu: [] };
+  const record = (job, value) => {
+    out[job.key] = Array.isArray(value) ? value : [];
+  };
+
+  if (process.env.MCP_PARALLEL_CONNECT === "0") {
+    for (const job of jobs) {
+      try {
+        record(job, await job.run());
+      } catch (e) {
+        console.warn(`[Chat] MCP ${job.name} connect failed: ${e.message}`);
+      }
+    }
+    return out;
+  }
+
+  const settled = await Promise.allSettled(jobs.map((job) => Promise.resolve().then(job.run)));
+  settled.forEach((res, i) => {
+    if (res.status === "fulfilled") record(jobs[i], res.value);
+    else console.warn(`[Chat] MCP ${jobs[i].name} connect failed: ${res.reason?.message || res.reason}`);
+  });
+  return out;
+}
+
+// ─── Opt-in hardening (v2.4) ───────────────────────────────────────────
+
+/**
+ * Verify the Shopify app-proxy signature: HMAC-SHA256 (hex) over the sorted "key=value" query
+ * parameters (values of repeated keys joined with ","), concatenated without separators, keyed with
+ * the app's client secret. The body is not signed.
+ */
+async function verifyAppProxySignature(request) {
+  const secret = process.env.SHOPIFY_API_SECRET;
+  if (!secret) return { ok: false, reason: "SHOPIFY_API_SECRET missing" };
+
+  const url = new URL(request.url);
+  const signature = url.searchParams.get("signature");
+  if (!signature) return { ok: false, reason: "no signature param" };
+
+  const grouped = new Map();
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key === "signature") continue;
+    grouped.set(key, grouped.has(key) ? `${grouped.get(key)},${value}` : value);
+  }
+  const message = [...grouped.entries()].map(([k, v]) => `${k}=${v}`).sort().join("");
+
+  const { createHmac, timingSafeEqual } = await import("node:crypto");
+  const digest = createHmac("sha256", secret).update(message).digest("hex");
+  const a = Buffer.from(digest);
+  const b = Buffer.from(signature);
+  const ok = a.length === b.length && timingSafeEqual(a, b);
+  return { ok, reason: ok ? null : "signature mismatch" };
+}
+
+/**
+ * APP_PROXY_SIGNATURE_MODE: "off" (default) | "log" (report, never block) | "enforce" (401).
+ * Roll out as off -> log -> enforce once the logs show no legitimate failures.
+ */
+async function checkAppProxySignature(request) {
+  const mode = String(process.env.APP_PROXY_SIGNATURE_MODE || "off").toLowerCase();
+  if (mode !== "log" && mode !== "enforce") return { allowed: true };
+
+  let ok = false;
+  let reason = "unknown";
+  try {
+    const result = await verifyAppProxySignature(request);
+    ok = result.ok;
+    reason = result.reason;
+  } catch (e) {
+    reason = `error: ${e.message}`;
+  }
+  if (ok) return { allowed: true };
+
+  console.warn(
+    `[Security] App-proxy signature check failed (${reason}) | mode=${mode} | ${request.method} ${new URL(request.url).pathname}`
+  );
+  return { allowed: mode !== "enforce" };
+}
+
+function unauthorizedResponse(request) {
+  return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: getCorsHeaders(request) });
+}
+
+// ─── Routes ────────────────────────────────────────────────────────────
+
 export async function loader({ request }) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: getCorsHeaders(request) });
@@ -91,10 +307,14 @@ export async function loader({ request }) {
   const url = new URL(request.url);
 
   if (url.searchParams.has("history") && url.searchParams.has("conversation_id")) {
+    const sig = await checkAppProxySignature(request);
+    if (!sig.allowed) return unauthorizedResponse(request);
     return handleHistoryRequest(request, url.searchParams.get("conversation_id"));
   }
 
   if (url.searchParams.has("stream") || request.headers.get("Accept")?.includes("text/event-stream")) {
+    const sig = await checkAppProxySignature(request);
+    if (!sig.allowed) return unauthorizedResponse(request);
     return handleChatRequest(request);
   }
 
@@ -108,6 +328,8 @@ export async function action({ request }) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: getCorsHeaders(request) });
   }
+  const sig = await checkAppProxySignature(request);
+  if (!sig.allowed) return unauthorizedResponse(request);
   return handleChatRequest(request);
 }
 
@@ -141,16 +363,26 @@ async function handleHistoryRequest(request, conversationId) {
 
 async function handleChatRequest(request) {
   try {
-    const body = await request.json();
-    const userMessage = body.message;
-    const visitorId = body.visitor_id;
-    const fingerprintId = body.fingerprint_id;
-
-    if (!userMessage) {
-      return new Response(JSON.stringify({ error: "Missing message" }), { status: 400, headers: getCorsHeaders(request) });
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: getCorsHeaders(request) });
     }
 
-    const conversationId = body.conversation_id || `conv_${Date.now()}`;
+    const rawMessage = body?.message;
+    if (typeof rawMessage !== "string" || !rawMessage.trim()) {
+      return new Response(JSON.stringify({ error: "Missing message" }), { status: 400, headers: getCorsHeaders(request) });
+    }
+    let userMessage = rawMessage.trim();
+    if (userMessage.length > MAX_MESSAGE_CHARS) {
+      console.warn(`[Chat] Message truncated from ${userMessage.length} to ${MAX_MESSAGE_CHARS} chars`);
+      userMessage = userMessage.slice(0, MAX_MESSAGE_CHARS);
+    }
+
+    const visitorId = body.visitor_id;
+    const fingerprintId = body.fingerprint_id;
+    const conversationId = normalizeConversationId(body.conversation_id);
     const promptType = body.prompt_type || "standardAssistant";
 
     const dbMod = await import("../db.server");
@@ -170,7 +402,7 @@ async function handleChatRequest(request) {
     const shopFromProxy = reqUrl.searchParams.get("shop");
     const shopFromBody = body.shop_domain || null;
     const origin = request.headers.get("Origin");
-    const shopFromOrigin = origin ? new URL(origin).hostname : null;
+    const shopFromOrigin = safeHostname(origin);
     const shopDomain = shopFromProxy || shopFromBody || shopFromOrigin || process.env.SHOPIFY_STORE_DOMAIN || null;
 
     if (!shopDomain) console.warn("[Chat] Could not resolve shop domain from request");
@@ -193,35 +425,6 @@ async function handleChatRequest(request) {
       status: 500, headers: getCorsHeaders(request)
     });
   }
-}
-
-/**
- * Detect SKU-like tokens in a user message.
- * Returns an array of probable SKU strings found (uppercase, digits+letters, with separators).
- * Used to annotate the Claude message so it searches the exact code first.
- */
-function detectSkuTokens(message) {
-  if (!message || typeof message !== "string") return [];
-  const skuRegex = /\b([A-Z0-9]{2,}[-\.\/][A-Z0-9][\w\-\.\/]*|[A-Z]{1,4}\d[\w\-\.\/]{2,}|\d{1,4}[A-Z]{1,5}[\w\-\.\/]{2,})\b/gi;
-  const matches = [];
-  const seen = new Set();
-  let m;
-  while ((m = skuRegex.exec(message)) !== null) {
-    const token = m[1].toUpperCase().replace(/\.$/, "");
-    if (token.length < 4) continue;
-    if (!/\d/.test(token) || !/[A-Z]/i.test(token)) continue;
-    // Skip pure electrical/spec tokens: "24VDC", "18MM", "24V", "100A", "5W"
-    if (/^\d+(?:MM|CM|VDC|VAC|V|A|W|KW|HP)$/i.test(token)) continue;
-    // Skip dimension+unit tokens: "2INCH", "2IN", "3FT", "4FEET" — these are
-    // measurements, not product codes. They are handled by the inch-dimension gate.
-    if (/^\d+(?:\.\d+)?(?:INCH|INCHES|IN|FT|FEET|FOOT|KM)$/i.test(token)) continue;
-    // Skip thread/pipe-standard tokens used as dimensions: "38NPT", "12BSP"
-    if (/^\d+(?:NPT|BSP|BSPP|BSPT)$/i.test(token)) continue;
-    if (seen.has(token)) continue;
-    seen.add(token);
-    matches.push(token);
-  }
-  return matches;
 }
 
 async function handleChatSession({ request, userMessage, conversationId, promptType, stream, visitorId, fingerprintId, shopDomain, helpers }) {
@@ -252,25 +455,45 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   } catch (e) { console.warn("[Chat] Failed to get customer account URLs:", e.message); }
 
   const mcpClient = new MCPClient(shopDomain, conversationId, null, mcpApiUrl);
+
+  // Hoisted so the catch block can see them (advisory fallback / empty-reply checks).
   let productsSentToFrontend = false;
+  let advisory = null;      // result of analyzeEnquiry(), or null for normal enquiries
+  let advisoryMod = null;   // services/advisory.server.js
+  let fullResponseText = "";
+
+  const getAdvisoryFallback = () => {
+    try {
+      return advisory && advisoryMod?.buildAdvisoryFallback ? advisoryMod.buildAdvisoryFallback(advisory) : "";
+    } catch (e) { return ""; }
+  };
+
+  const sendFallbackText = (text) => {
+    fullResponseText += text;
+    stream.sendMessage({ type: "chunk", chunk: text });
+    stream.sendMessage({ type: "message_complete" });
+    saveMessage(conversationId, "assistant", text, { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
+      .catch((err) => console.error("[Chat] Error saving fallback message:", err.message));
+  };
 
   try {
     let storefrontMcpTools = [], customerMcpTools = [], ucpMcpTools = [];
     try {
+      const connectStart = Date.now();
       const mcpResult = await Promise.race([
-        (async () => {
-          // Catalog search now lives on /api/ucp/mcp, not /api/mcp.
-          const ucp = await mcpClient.connectToUcpCatalogServer();
-          const sf = await mcpClient.connectToStorefrontServer();
-          const cu = await mcpClient.connectToCustomerServer();
-          return { ucp, sf, cu };
-        })(),
+        connectMcpServers(mcpClient),
         new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
       ]);
       if (mcpResult) {
         ucpMcpTools = mcpResult.ucp;
         storefrontMcpTools = mcpResult.sf;
         customerMcpTools = mcpResult.cu;
+        console.log(
+          `[Chat] MCP connect | ucp=${ucpMcpTools.length} storefront=${storefrontMcpTools.length} ` +
+          `customer=${customerMcpTools.length} | ${Date.now() - connectStart}ms`
+        );
+      } else {
+        console.warn("[Chat] MCP connect timed out after 8000ms");
       }
       const allMcpTools = [...ucpMcpTools, ...storefrontMcpTools, ...customerMcpTools];
       console.log(`Connected to MCP: ${allMcpTools.length} tools`);
@@ -293,11 +516,10 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     let conversationHistory = [];
     try {
       const dbMessages = await getConversationHistory(conversationId);
-      conversationHistory = dbMessages.map((dbMessage) => {
-        let content;
-        try { content = JSON.parse(dbMessage.content); } catch (e) { content = dbMessage.content; }
-        return { role: dbMessage.role, content };
-      });
+      conversationHistory = dbMessages.map((dbMessage) => ({
+        role: dbMessage.role,
+        content: parseStoredContent(dbMessage.content),
+      }));
     } catch (historyError) { console.error("[Chat] Failed to get history:", historyError.message); }
 
     const lastMsg = conversationHistory[conversationHistory.length - 1];
@@ -305,10 +527,28 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       conversationHistory.push({ role: "user", content: userMessage });
     }
 
+    const detectedSkus = detectSkuTokens(userMessage);
+
+    // ───────────────────────────────────────────────────────────────────
+    // ADVISORY ANALYSIS (v2.4)
+    // Runs on the raw history BEFORE any annotation. Messages that contain a
+    // product code are never advisory: the SKU path below stays exactly as is.
+    // Any failure here just means "normal enquiry".
+    // ───────────────────────────────────────────────────────────────────
+    if (ADVISORY_ENABLED) {
+      try {
+        advisoryMod = await import("../services/advisory.server.js");
+        advisory = advisoryMod.analyzeEnquiry(userMessage, conversationHistory, { hasSku: detectedSkus.length > 0 });
+        if (advisory) console.log(advisoryMod.formatAdvisoryLog(advisory));
+      } catch (advisoryErr) {
+        console.warn(`[Chat] Advisory analysis failed: ${advisoryErr.message}`);
+        advisory = null;
+      }
+    }
+
     // SKU annotation: if the user message contains a product code / SKU, prepend
     // an explicit instruction so Claude searches the exact code first — not a
     // generic category. This annotation only goes to Claude; DB stores the original.
-    const detectedSkus = detectSkuTokens(userMessage);
     if (detectedSkus.length > 0) {
       const skuList = detectedSkus.slice(0, 3).join('", "');
       const annotation = `[SYSTEM: The user's message contains product code(s): "${skuList}". MANDATORY: Your FIRST search query MUST be the exact code "${detectedSkus[0]}" — no category words, no brand name, no dimensions added. Only broaden the search if the exact code returns zero results.]`;
@@ -328,52 +568,83 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     // full vendor catalog when they ask for "ABB", "Siemens relays", etc.
     // For free-text queries this returns null and the existing MCP flow
     // runs unchanged.
+    //
+    // v2.4: for advisory enquiries the pre-pass searches the ADVICE
+    // (advisory.searchQuery, e.g. "inductive proximity sensor 8 mm"), and is
+    // skipped entirely when no product query fits yet (troubleshooting,
+    // unknown target material...).
     // ───────────────────────────────────────────────────────────────────
     let smartResult = null;
-    try {
-      const { smartSearch } = await import("../services/search-router.server.js");
-      // Pass conversation history so query intelligence can use context
-      // (e.g., "which ones have 4mm range?" uses context "user asked about IFM sensors")
-      const historyForSearch = conversationHistory.slice(-6); // last 3 turns
-      const smart = await smartSearch(userMessage, shopDomain, historyForSearch);
-      if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
-        smartResult = smart;
-        console.log(`[Chat] SmartSearch pre-found ${smart.products.length} products (${smart.searchType})`);
-        stream.sendMessage({ type: "product_results", products: smart.products });
-        productsSentToFrontend = true;
+    let systemNote = null;
 
-        const summary = smart.products.slice(0, 8).map((p) => ({
-          title: p.title,
-          vendor: p.vendor,
-          price: p.price,
-          sku: p.sku,
-        }));
-        const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
-        const systemNote =
-          `[SYSTEM NOTE — NOT FROM USER] Products have already been pre-found for this query and product cards are ALREADY DISPLAYED. ` +
-          `${smart.systemHint} ` +
-          (isLowConfidence
-            ? `These results may NOT fully match the request. Compare the titles/vendors below with what the customer asked ` +
-              `(brand, bore, stroke, size, output type). Be honest about any mismatch. You may call the catalog search ONCE ` +
-              `with a better query if needed. `
-            : `Do NOT call search_catalog (or any catalog search tool) again — the results are already shown. ` +
-              `If the titles below do not match a spec or brand the customer asked for, say so honestly. `) +
-          `Write ONE short conversational reply (1-3 sentences). ` +
-          `Pre-found product summary: ${JSON.stringify(summary)}`;
-
-        const lastIdx = conversationHistory.length - 1;
-        if (
-          conversationHistory[lastIdx]?.role === "user" &&
-          typeof conversationHistory[lastIdx].content === "string"
-        ) {
-          conversationHistory[lastIdx] = {
-            role: "user",
-            content: `${systemNote}\n\nUser message: ${conversationHistory[lastIdx].content}`,
-          };
+    if (advisory?.skipPreSearch) {
+      console.log("[Chat] Advisory: search pre-pass skipped (no product query fits this enquiry yet)");
+    } else {
+      try {
+        const { smartSearch } = await import("../services/search-router.server.js");
+        // Pass conversation history so query intelligence can use context
+        // (e.g., "which ones have 4mm range?" uses context "user asked about IFM sensors")
+        const historyForSearch = conversationHistory.slice(-6); // last 3 turns
+        const searchInput = advisory?.searchQuery || userMessage;
+        if (advisory?.searchQuery) {
+          console.log(`[Chat] Advisory search query: "${advisory.searchQuery}" (customer wrote: "${userMessage.slice(0, 80)}")`);
         }
+        const smart = await smartSearch(searchInput, shopDomain, historyForSearch);
+        if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
+          smartResult = smart;
+          console.log(`[Chat] SmartSearch pre-found ${smart.products.length} products (${smart.searchType})`);
+          stream.sendMessage({ type: "product_results", products: smart.products });
+          productsSentToFrontend = true;
+
+          const summary = smart.products.slice(0, 8).map((p) => ({
+            title: p.title,
+            vendor: p.vendor,
+            price: p.price,
+            sku: p.sku,
+          }));
+          const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
+          const replyInstruction = advisory
+            ? `An [ADVISORY BRIEF] follows below: its REPLY FORMAT overrides the 1-3 sentence limit for this reply. `
+            : `Write ONE short conversational reply (1-3 sentences). `;
+          systemNote =
+            `[SYSTEM NOTE — NOT FROM USER] Products have already been pre-found for this query and product cards are ALREADY DISPLAYED. ` +
+            `${smart.systemHint} ` +
+            (isLowConfidence
+              ? `These results may NOT fully match the request. Compare the titles/vendors below with what the customer asked ` +
+                `(brand, bore, stroke, size, output type). Be honest about any mismatch. You may call the catalog search ONCE ` +
+                `with a better query if needed. `
+              : `Do NOT call search_catalog (or any catalog search tool) again — the results are already shown. ` +
+                `If the titles below do not match a spec or brand the customer asked for, say so honestly. `) +
+            replyInstruction +
+            `Pre-found product summary: ${JSON.stringify(summary)}`;
+        }
+      } catch (smartErr) {
+        console.warn(`[Chat] SmartSearch pre-pass failed: ${smartErr.message}`);
       }
-    } catch (smartErr) {
-      console.warn(`[Chat] SmartSearch pre-pass failed: ${smartErr.message}`);
+    }
+
+    // Compose what Claude sees for the last user turn: SYSTEM NOTE first (the system prompt's
+    // Step 1 keys off that literal prefix), then the ADVISORY BRIEF, then the customer's message.
+    // With neither, the message is left untouched. Nothing here is saved to the DB.
+    let advisoryBrief = "";
+    if (advisory && advisoryMod) {
+      try { advisoryBrief = advisoryMod.buildAdvisoryBrief(advisory); } catch (e) {
+        console.warn(`[Chat] buildAdvisoryBrief failed: ${e.message}`);
+      }
+    }
+    if (systemNote || advisoryBrief) {
+      const lastIdx = conversationHistory.length - 1;
+      if (
+        conversationHistory[lastIdx]?.role === "user" &&
+        typeof conversationHistory[lastIdx].content === "string"
+      ) {
+        conversationHistory[lastIdx] = {
+          role: "user",
+          content: [systemNote, advisoryBrief, `User message: ${conversationHistory[lastIdx].content}`]
+            .filter(Boolean)
+            .join("\n\n"),
+        };
+      }
     }
 
     // Strip catalog-search tools when smartSearch already found products via
@@ -403,12 +674,20 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       }
     }
 
-    let finalMessage = { role: "user", content: userMessage };
-    let fullResponseText = "";
+    // v2.4: cap what is sent to Claude (cost + latency). Advisory analysis above already used the
+    // full history; the last message (with any SYSTEM NOTE / brief) is always kept.
+    if (conversationHistory.length > MAX_HISTORY_MESSAGES) {
+      const before = conversationHistory.length;
+      conversationHistory = capHistory(conversationHistory, MAX_HISTORY_MESSAGES);
+      console.log(`[Chat] History capped ${before} → ${conversationHistory.length} messages`);
+    }
+
+    let finalMessage = null;
+    let stopReason = null;
     let currentAssistantMessage = null;
     let loopCount = 0;
 
-    while (finalMessage.stop_reason !== "end_turn" && loopCount < MAX_TOOL_LOOPS) {
+    while (loopCount < MAX_TOOL_LOOPS) {
       loopCount++;
       currentAssistantMessage = null;
       console.log(`[Chat] Claude call #${loopCount} | history=${conversationHistory.length} messages`);
@@ -490,7 +769,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
               // This tells us exactly what image field paths the MCP actually returns
               // so we can fix extractImageUrl() with the correct field name
               // =====================================================================
-                 try {
+              try {
                 const rawText = toolUseResponse?.content?.[0]?.text;
                 if (rawText) {
                   const rawData = JSON.parse(rawText);
@@ -521,7 +800,9 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
                 const stopHint = JSON.stringify({
                   products: products.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
                   total_count: products.length,
-                  _display_note: `${products.length} product card(s) are now displayed to the user. Do NOT search again. Write one short response acknowledging the results.`,
+                  _display_note: advisory
+                    ? `${products.length} product card(s) are now displayed to the user. Do NOT search again. Now write your reply in the REPLY FORMAT from the ADVISORY BRIEF (it overrides the one-short-response rule).`
+                    : `${products.length} product card(s) are now displayed to the user. Do NOT search again. Write one short response acknowledging the results.`,
                 });
                 if (!Array.isArray(toolUseResponse.content)) toolUseResponse.content = [];
                 toolUseResponse.content = [{ type: "text", text: stopHint }];
@@ -529,7 +810,9 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
                 console.log(`[Search] Zero results for: "${searchQuery}"`);
                 const retryHint = JSON.stringify({
                   products: [], total_count: 0,
-                  _system_hint: `Zero products found for "${searchQuery}". Try a simpler query (2-3 words). If still zero after 2 attempts, tell the user the product may not be in our catalog and offer websales@creativeautomation.ae`,
+                  _system_hint: advisory
+                    ? `Zero products found for "${searchQuery}". Do NOT search again. Write your reply in the REPLY FORMAT from the ADVISORY BRIEF, say no matching products were found in the catalogue for now, and offer websales@creativeautomation.ae.`
+                    : `Zero products found for "${searchQuery}". Try a simpler query (2-3 words). If still zero after 2 attempts, tell the user the product may not be in our catalog and offer websales@creativeautomation.ae`,
                 });
                 if (!Array.isArray(toolUseResponse.content)) toolUseResponse.content = [];
                 toolUseResponse.content = [{ type: "text", text: retryHint }];
@@ -588,10 +871,30 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         currentAssistantMessage = null;
       }
 
-      console.log(`[Chat] Claude call #${loopCount} done | stop_reason=${finalMessage.stop_reason}`);
+      stopReason = finalMessage?.stop_reason ?? null;
+      console.log(`[Chat] Claude call #${loopCount} done | stop_reason=${stopReason}`);
+
+      // Only a tool call means "go round again". end_turn ends the turn; anything else
+      // (max_tokens, refusal...) used to re-call Claude up to 6 times.
+      if (stopReason !== "tool_use") {
+        if (stopReason && stopReason !== "end_turn") console.warn(`[Chat] Unexpected stop_reason=${stopReason}; ending turn`);
+        break;
+      }
     }
 
-    if (loopCount >= MAX_TOOL_LOOPS) console.warn(`[Chat] Hit max tool loop limit (${MAX_TOOL_LOOPS})`);
+    if (loopCount >= MAX_TOOL_LOOPS && stopReason === "tool_use") console.warn(`[Chat] Hit max tool loop limit (${MAX_TOOL_LOOPS})`);
+
+    // Empty-reply guard: never end a turn with nothing to read.
+    if (!fullResponseText.trim()) {
+      const fallback = getAdvisoryFallback();
+      if (fallback) {
+        console.warn("[Chat] Empty reply from Claude — sending advisory fallback");
+        sendFallbackText(fallback);
+      } else if (!productsSentToFrontend) {
+        console.warn("[Chat] Empty reply from Claude and no products — sending generic fallback");
+        sendFallbackText("Sorry, I couldn't put a reply together just now. Please try again, or email websales@creativeautomation.ae and the team will help.");
+      }
+    }
 
     stream.sendMessage({ type: "end_turn" });
     console.log(`[Chat] Response complete | ${Date.now() - startTime}ms`);
@@ -601,7 +904,12 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     const trackingId = visitorId || fingerprintId || conversationId;
     try { ChatEvents.errorOccurred(trackingId, { conversationId, error: error.message }); } catch (e) {}
 
-    if (productsSentToFrontend) {
+    // v2.4: for advisory enquiries the customer still gets the computed guidance.
+    const advisoryFallback = !fullResponseText.trim() ? getAdvisoryFallback() : "";
+    if (advisoryFallback) {
+      sendFallbackText(advisoryFallback);
+      stream.sendMessage({ type: "end_turn" });
+    } else if (productsSentToFrontend) {
       stream.sendMessage({ type: "chunk", chunk: "I found several products matching your request. You can browse them above." });
       stream.sendMessage({ type: "message_complete" });
       stream.sendMessage({ type: "end_turn" });
@@ -643,30 +951,54 @@ async function getCustomerAccountUrls(conversationIdOrDomain, conversationId, db
   }
 }
 
-function getCorsHeaders(request) {
+// ─── CORS / SSE headers ────────────────────────────────────────────────
+
+/**
+ * ALLOWED_ORIGINS unset  -> legacy behaviour: reflect any Origin (with credentials).
+ * ALLOWED_ORIGINS set    -> only listed hostnames (and their subdomains) get CORS headers,
+ *                           e.g. ALLOWED_ORIGINS=creativeautomation.ae,nfejky-ge.myshopify.com
+ * The storefront reaches this route through the same-origin app proxy, so CORS is only needed
+ * for direct calls (e.g. a backend_url override).
+ */
+function isOriginAllowed(origin) {
+  const list = String(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (list.length === 0) return true;
+  const host = safeHostname(origin)?.toLowerCase();
+  return !!host && list.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
+function corsOriginHeaders(request) {
   const origin = request.headers.get("Origin");
-  const allowOrigin = origin || "*";
+  if (!origin) return { "Access-Control-Allow-Origin": "*" };
+  if (!isOriginAllowed(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    Vary: "Origin",
+  };
+}
+
+function getCorsHeaders(request) {
   return {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Accept, X-Shopify-Shop-Id",
     "Access-Control-Max-Age": "86400",
-    ...(origin ? { "Access-Control-Allow-Credentials": "true" } : {}),
+    ...corsOriginHeaders(request),
   };
 }
 
 function getSseHeaders(request) {
-  const origin = request.headers.get("Origin");
-  const allowOrigin = origin || "*";
   return {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
-    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Accept, X-Shopify-Shop-Id",
-    ...(origin ? { "Access-Control-Allow-Credentials": "true" } : {}),
+    ...corsOriginHeaders(request),
   };
 }
