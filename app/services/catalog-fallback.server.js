@@ -1,10 +1,13 @@
-// app/services/catalog-fallback.server.js
+// app/services/catalog-fallback.server.js — v1.1 (29 Sep 2026)
 //
-// Helpers for chat.jsx v2.5 (no dependencies, no network):
+// Helpers for chat.jsx v2.5.1 (no dependencies, no network):
 //   - catalogToolMode(): CATALOG_TOOL_MODE = auto (default) | local | ucp
-//   - ucpBreaker: circuit breaker that skips UCP for UCP_BREAKER_MS after a discovery/profile error
-//   - filterProductsByQueryTerms(): drops low-quality (storefront last-resort) cards that share no
-//     meaningful words with the query ("switchgear" / "FRP" returned 10 unrelated products on 28 Sep)
+//   - ucpBreaker / isUcpDiscoveryError / ucpErrorCode: skip UCP after an agent-profile error
+//   - refineProducts(): cleans a result list before it is shown
+//       · low-quality paths (storefront last resort): keep only products whose title/vendor/SKU
+//         contain ALL meaningful query words ("FRP enclosure" must contain FRP *and* enclosure)
+//       · any path: accessories/spare parts go after main products unless the query asks for them,
+//         and accessoryOnly=true when nothing else was found
 
 export const RELEVANCE_FILTERED_PATHS = new Set(["storefront_search_last_resort"]);
 
@@ -18,13 +21,20 @@ export function catalogToolMode() {
   return m === "local" || m === "ucp" ? m : "auto";
 }
 
-// Shopify rejects UCP calls before running them when the agent profile can't be fetched/validated,
+// ─── UCP errors / circuit breaker ──────────────────────────────────────
+
 // e.g. 422 {"message":"UCP discovery failed","data":{"code":"profile_unreachable"}}
 const RE_UCP_DISCOVERY =
   /UCP discovery failed|profile_(?:unreachable|invalid|too_large|malformed)|negotiation failed/i;
 
 export function isUcpDiscoveryError(text) {
   return RE_UCP_DISCOVERY.test(String(text || ""));
+}
+
+/** Short reason for logs: the string error code inside the JSON (e.g. "profile_unreachable"). */
+export function ucpErrorCode(text) {
+  const m = String(text || "").match(/"code"\s*:\s*"([a-z_]+)"/i);
+  return m ? m[1] : "ucp_discovery_failed";
 }
 
 export function createCircuitBreaker(cooldownMs) {
@@ -52,13 +62,16 @@ export function createCircuitBreaker(cooldownMs) {
 // One breaker per container (module singleton).
 export const ucpBreaker = createCircuitBreaker(intEnv("UCP_BREAKER_MS", 10 * 60 * 1000));
 
+// ─── Query terms / relevance filter ────────────────────────────────────
+
 const STOPWORDS = new Set(
   (
     "a an and or of in on at to for from with by the this that these those it its is are was were be been " +
     "do does did you your we our us i me my have has had can could would should will shall may might " +
-    "please pls hi hello hey thanks thank yes no ok okay " +
+    "please pls kindly hi hello hey dear sir team thanks thank yes no ok okay " +
     "supply supplies supplier sell sells stock stocks carry carries provide available availability " +
     "price prices pricing cost quote quotation buy order get need needs want wants looking look " +
+    "require required requirement urgent urgently project company quantity qty pcs nos uae dubai " +
     "show list find search any some all other more also only like about what which who how where when " +
     "product products item items type types kind brand brands mm"
   ).split(/\s+/)
@@ -85,19 +98,61 @@ function termInHaystack(term, hay) {
 }
 
 /**
- * Keep products whose title/vendor/SKU contain the query terms (1 term: that term;
- * 2+ terms: at least half). With no meaningful terms, nothing is judged and all are kept.
+ * Keep products whose title/vendor/SKU contain ALL meaningful query words.
+ * Only used on last-resort results: Algolia and the Admin title search already found nothing,
+ * so partial matches there are noise ("FRP enclosure" → metal enclosures).
+ * With no meaningful words, nothing is judged and all products are kept.
  */
 export function filterProductsByQueryTerms(products, text) {
   const list = Array.isArray(products) ? products : [];
   const terms = queryTerms(text);
   if (terms.length === 0) return { kept: list, dropped: 0, terms, judged: false };
-  const need = terms.length === 1 ? 1 : Math.ceil(terms.length / 2);
   const kept = list.filter((p) => {
     const hay = `${p?.title || ""} ${p?.vendor || ""} ${p?.sku || ""}`.toLowerCase();
-    let hits = 0;
-    for (const t of terms) if (termInHaystack(t, hay)) hits++;
-    return hits >= need;
+    return terms.every((t) => termInHaystack(t, hay));
   });
   return { kept, dropped: list.length - kept.length, terms, judged: true };
+}
+
+// ─── Accessories ───────────────────────────────────────────────────────
+
+// Catalogue titles such as "Siemens Circuit Breaker Accessories 8WA2867".
+const RE_ACCESSORY =
+  /\b(?:accessor(?:y|ies)|boots?|covers?|brackets?|markers?|labels?|spare\s+parts?|seal\s+kits?|repair\s+kits?|mounting\s+kits?|auxiliary\s+(?:contacts?|switch(?:es)?)|end\s+plates?|shrouds?)\b/i;
+
+export function isAccessoryTitle(title) {
+  return RE_ACCESSORY.test(String(title || ""));
+}
+
+export function queryWantsAccessory(text) {
+  return RE_ACCESSORY.test(String(text || ""));
+}
+
+/**
+ * Clean a result list before showing it.
+ * @returns {{products: Array, dropped: number, terms: string[], accessoryOnly: boolean}}
+ */
+export function refineProducts(products, query, searchType) {
+  let list = Array.isArray(products) ? products : [];
+  let dropped = 0;
+  let terms = [];
+
+  if (list.length && RELEVANCE_FILTERED_PATHS.has(searchType)) {
+    const f = filterProductsByQueryTerms(list, query);
+    list = f.kept;
+    dropped = f.dropped;
+    terms = f.terms;
+  }
+
+  let accessoryOnly = false;
+  if (list.length && !queryWantsAccessory(query)) {
+    const main = list.filter((p) => !isAccessoryTitle(p?.title));
+    const acc = list.filter((p) => isAccessoryTitle(p?.title));
+    if (acc.length) {
+      list = [...main, ...acc];
+      accessoryOnly = main.length === 0;
+    }
+  }
+
+  return { products: list, dropped, terms, accessoryOnly };
 }
