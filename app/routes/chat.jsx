@@ -450,18 +450,26 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   };
 
   // Tool-result hints (shared by the UCP path and the local fallback path).
-  const buildStopHint = (products, lowConfidence = false) =>
-    JSON.stringify({
+  // v2.5.1: flags accessory-only results; the zero-result hint forbids switching product category
+  // or dropping the customer's key qualifier (29 Sep logs: switchgear → circuit breaker accessories,
+  // FRP enclosure → metal enclosures).
+  const buildStopHint = (products, lowConfidence = false) => {
+    const accessoryOnly =
+      !!cf?.isAccessoryTitle && products.length > 0 && products.every((p) => cf.isAccessoryTitle(p?.title));
+    return JSON.stringify({
       products: products.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
       total_count: products.length,
       _display_note:
-        (lowConfidence
-          ? "These results may NOT fully match the request: compare the titles with what the customer asked and be honest about any mismatch. "
-          : "") +
+        (accessoryOnly
+          ? "IMPORTANT: every result is an ACCESSORY or spare part (see the titles), not a main product. If the customer asked for the main product, say plainly that these are accessories and do not present them as the product itself. "
+          : lowConfidence
+            ? "These results may NOT fully match the request: compare the titles with what the customer asked and be honest about any mismatch. "
+            : "") +
         (advisory
           ? `${products.length} product card(s) are now displayed to the user. Do NOT search again. Now write your reply in the REPLY FORMAT from the ADVISORY BRIEF (it overrides the one-short-response rule).`
           : `${products.length} product card(s) are now displayed to the user. Do NOT search again. Write one short response acknowledging the results.`),
     });
+  };
 
   const buildZeroHint = (searchQuery) =>
     JSON.stringify({
@@ -469,7 +477,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       total_count: 0,
       _system_hint: advisory
         ? `Zero products found for "${searchQuery}". Do NOT search again. Write your reply in the REPLY FORMAT from the ADVISORY BRIEF, say no matching products were found in the catalogue for now, and offer websales@creativeautomation.ae.`
-        : `Zero products found for "${searchQuery}". Try a simpler query (2-3 words). If still zero after 2 attempts, tell the user the product may not be in our catalog and offer websales@creativeautomation.ae`,
+        : `Zero products found for "${searchQuery}". You may try ONE more search only for the SAME product with corrected spelling, keeping every key qualifier the customer gave (material, brand, type — e.g. keep "FRP"). Do NOT search for a different product category and do not offer products from other categories as a match. If still zero, tell the customer we don't currently list this item on the website and offer websales@creativeautomation.ae for sourcing or a quote.`,
     });
 
   /** Serve a catalog search from our own pipeline (used when UCP is unavailable). */
@@ -480,16 +488,20 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       const smart = await smartSearch(query, shopDomain, []);
       let products = Array.isArray(smart?.products) ? smart.products : [];
       const searchType = smart?.searchType || "none";
-      if (products.length && cf?.RELEVANCE_FILTERED_PATHS?.has(searchType)) {
-        const f = cf.filterProductsByQueryTerms(products, query);
-        if (f.dropped > 0) {
-          console.log(`[Chat] Relevance filter (${searchType}) dropped ${f.dropped}/${products.length} for "${query}" (terms: ${f.terms.join(",")})`);
+      let accessoryOnly = false;
+      if (products.length && cf?.refineProducts) {
+        const before = products.length;
+        const r = cf.refineProducts(products, query, searchType);
+        if (r.dropped > 0) {
+          console.log(`[Chat] Relevance filter (${searchType}) dropped ${r.dropped}/${before} for "${query}" (terms: ${r.terms.join(",")})`);
         }
-        products = f.kept;
+        if (r.accessoryOnly) console.log(`[Chat] Only accessories found for "${query}" — flagged to Claude`);
+        products = r.products;
+        accessoryOnly = r.accessoryOnly;
       }
       products = products.slice(0, MAX_CARDS);
       console.log(`[Chat] Local catalog search (${reason}) q="${query}" → ${products.length} products (${searchType}) | ${Date.now() - t0}ms`);
-      return { products, searchType, lowConfidence: LOW_CONFIDENCE_PATHS.has(searchType) };
+      return { products, searchType, accessoryOnly, lowConfidence: LOW_CONFIDENCE_PATHS.has(searchType) || accessoryOnly };
     } catch (e) {
       console.warn(`[Chat] Local catalog search failed (${reason}) q="${query}": ${e.message}`);
       return { products: [], searchType: "error", lowConfidence: true };
@@ -624,14 +636,36 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         }
         let smart = await smartSearch(searchInput, shopDomain, historyForSearch);
 
-        if (smart && Array.isArray(smart.products) && smart.products.length > 0 && cf?.RELEVANCE_FILTERED_PATHS?.has(smart.searchType)) {
-          const f = cf.filterProductsByQueryTerms(smart.products, searchInput);
-          if (f.dropped > 0) {
+        // v2.5.1: hide last-resort noise (ALL query terms required) and put accessories last.
+        if (smart && Array.isArray(smart.products) && smart.products.length > 0 && cf?.refineProducts) {
+          const before = smart.products.length;
+          const r = cf.refineProducts(smart.products, searchInput, smart.searchType);
+          if (r.dropped > 0) {
             console.log(
-              `[Chat] Relevance filter (${smart.searchType}) dropped ${f.dropped}/${smart.products.length} pre-found products (terms: ${f.terms.join(",")})`
+              `[Chat] Relevance filter (${smart.searchType}) dropped ${r.dropped}/${before} pre-found products (terms: ${r.terms.join(",")})`
             );
           }
-          smart = f.kept.length > 0 ? { ...smart, products: f.kept } : null;
+          if (r.products.length === 0) {
+            // Everything was noise: tell Claude the catalog has no match, so it doesn't search again
+            // or substitute another category (29 Sep logs: switchgear → circuit breaker accessories).
+            systemNote =
+              `[SYSTEM NOTE — NOT FROM USER] A catalog search for this message found NO matching products (only unrelated items, which were hidden). ` +
+              `Do NOT call the catalog search again for this request, and do not show or suggest products from other categories as a match. ` +
+              `Tell the customer honestly that we don't currently list this item on the website, and offer websales@creativeautomation.ae for sourcing or a quote. ` +
+              (advisory ? `Follow the ADVISORY BRIEF's reply format for the rest of the reply.` : `Reply in 1-3 sentences.`);
+            console.log("[Chat] Pre-pass: no relevant products — no-match note added");
+            smart = null;
+          } else if (r.accessoryOnly) {
+            console.log(`[Chat] Pre-pass: only accessories found for "${searchInput.slice(0, 60)}" — treated as low confidence`);
+            smart = {
+              ...smart,
+              products: r.products,
+              searchType: LOW_CONFIDENCE_PATHS.has(smart.searchType) ? smart.searchType : "algolia_search_weak",
+              systemHint: `${smart.systemHint || ""} All results are ACCESSORIES or spare parts, not the main product: say so plainly.`,
+            };
+          } else {
+            smart = { ...smart, products: r.products };
+          }
         }
 
         if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
@@ -801,7 +835,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
               if (canUseLocal && toolUseResponse?.error) {
                 const errText = errorText(toolUseResponse.error);
                 if (cf.isUcpDiscoveryError(errText)) {
-                  cf.ucpBreaker.trip(errText.slice(0, 160));
+                  cf.ucpBreaker.trip(cf.ucpErrorCode ? cf.ucpErrorCode(errText) : errText.slice(0, 160));
                   console.warn(
                     `[Chat] UCP circuit OPEN for ${Math.round(cf.ucpBreaker.cooldownMs / 60000)} min (agent profile / discovery error). ` +
                     `Fix: set UCP_AGENT_PROFILE to a reachable profile.`
