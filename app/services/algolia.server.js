@@ -1,34 +1,68 @@
 /**
- * Algolia Search Service — v3.1 (Production Fix)
+ * Algolia Search Service — v4.0 (30 Sep 2026)
  *
- * CHANGES (v3.1 — May 2026):
+ * PUBLIC API (backwards compatible with v3.1):
+ *   algoliaSearch(query, opts)         → null | { products, confidence, topTermRatio, requestedBrand }
+ *   algoliaSearchDetailed(query, opts) → { status: 'ok'|'empty'|'error'|'invalid', products,
+ *                                          confidence, topTermRatio, requestedBrand, nbHits }
+ *   isAlgoliaConfigured(), normVendor(), __internals (tests)
  *
- * FIX 1: "undefined" string image — some Algolia records have the literal
- *   string "undefined" (not null) as product_image. Added explicit check:
- *   `hit.product_image !== 'undefined'` to reject this invalid value.
+ *   opts: { first = 10, shopDomain, requestedBrand = null,
+ *           requireHeadNoun = false,      // top hit must show the product noun in title/type/tags
+ *           variantsOnlyIfHigh = false }  // skip Storefront variant lookups for non-high results
  *
- * FIX 2: Result count — changed default `first` from 20 to 10. Sending 20
- *   product cards overwhelms the chat UI. 10 is sufficient for the user to
- *   browse and ask follow-up questions.
+ * v4.0 CHANGES (30 Sep 2026 logs + live catalogue check):
+ *  1. Category-aware rerank. Tags follow "<Vendor> <Leaf category>" ("Siemens Contactors",
+ *     "Siemens Contactor Accessories"). Leaf = the product asked for → +500; a sub-part of it
+ *     (accessories, overload relays, cylinder switches) → -900, unless that was asked for.
+ *  2. Fetch 40, rerank, show 10 (ALGOLIA_RERANK_POOL). v3 reranked only 10 hits, so
+ *     "Siemens contactor" showed 10 accessories.
+ *  3. Category rescue: if the whole pool is sub-parts, one light scan (≤500 hits, no
+ *     descriptions) finds the real products. Recommended index fix: unordered(title).
+ *  4. Accessory penalty tested "accessory" and never matched "Accessories".
+ *  5. Common-word vendors (Delta, Block, Finder, Vega …) become a vendor filter only when
+ *     QueryIntel named them as the brand ("star delta timer", "terminal block").
+ *  6. Vendor stripping keeps the rest of the query intact. v3 lower-cased it and turned
+ *     - . / into spaces ("Siemens 3RT2015-1AB01" → "3rt2015 1ab01", "1.5 mm" → "1 5 mm").
+ *  7. removeWordsIfNoResults 'lastWords' removed the product noun ("polyester enclosure" →
+ *     "polyester" → limit switches). Now 'none'; the router relaxes without losing the noun.
+ *     Override: ALGOLIA_REMOVE_WORDS_IF_NO_RESULTS=lastWords|firstWords|allOptional.
+ *  8. A requested brand that is not a vendor (brand only in titles) gets +300.
+ *  9. Results that are only accessories of what was asked are graded 'low'.
+ * 10. Variant lookups: 6 s timeout + one retry on network errors; only for the shown hits.
+ * 11. Never throws. Any failure → status 'error' (algoliaSearch → null, as before).
  *
- * CONFIRMED field shapes from Algolia dashboard (May 2026):
- *   product_image  → string URL (the image field) — may be "undefined" string for some records
- *   price          → integer in AED (e.g. 4437)
- *   sku            → string at top level
- *   id / objectID  → numeric Shopify product ID
- *   handle         → product handle string
- *   variants       → NOT present in index (product-level index)
- *
- * Since variant IDs are not in the Algolia index, we batch-fetch them
- * from the Storefront API after getting Algolia results.
+ * UNCHANGED from v3.1: record field shapes, "undefined" image guard, AED price (not cents),
+ * spec / cylinder / term scoring, relevance floor, brand_missing verdict, typo policy,
+ * 5-minute LRU cache, [SearchAudit] line (pool/rescued appended).
  */
 
 let _client = null;
 
-// -------- In-process result cache (Improvement 1) ------------------------
-// Map preserves insertion order; we evict the oldest key when full.
-// Keys are JSON({q, filters}) lowercased. TTL 5 min. Empty-result
-// responses are NOT cached.
+// ---------------------------------------------------------------------------
+// Tunables (all optional)
+// ---------------------------------------------------------------------------
+function _intEnv(name, def, min, max) {
+  const n = Number(process.env[name]);
+  if (!Number.isFinite(n) || n <= 0) return def;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+const RERANK_POOL = _intEnv('ALGOLIA_RERANK_POOL', 40, 10, 100);
+const RESCUE_POOL = _intEnv('ALGOLIA_RESCUE_POOL', 500, 100, 1000);
+const RESCUE_TIMEOUT_MS = 3000;
+const VARIANT_LOOKUP_TIMEOUT_MS = 6000;
+const REMOVE_WORDS_POLICY = (() => {
+  const v = String(process.env.ALGOLIA_REMOVE_WORDS_IF_NO_RESULTS || 'none').trim();
+  return ['none', 'lastWords', 'firstWords', 'allOptional'].includes(v) ? v : 'none';
+})();
+const CATEGORY_MATCH_BONUS = 500;
+const CATEGORY_SUBPART_PENALTY = 900;
+const BRAND_TEXT_BOOST = 300;
+const CACHE_VERSION = 4;
+
+// ---------------------------------------------------------------------------
+// In-process result cache (LRU, 5 min, empty results never cached)
+// ---------------------------------------------------------------------------
 const RESULT_CACHE_MAX = 200;
 const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const _resultCache = new Map();
@@ -40,19 +74,23 @@ function _cacheGet(key) {
     _resultCache.delete(key);
     return null;
   }
-  // refresh LRU order
   _resultCache.delete(key);
   _resultCache.set(key, v);
-  return { products: v.products, confidence: v.confidence || 'high' };
+  return {
+    products: v.products,
+    confidence: v.confidence || 'high',
+    topTermRatio: v.topTermRatio ?? null,
+    nbHits: v.nbHits ?? 0,
+  };
 }
 
-function _cacheSet(key, products, confidence) {
-  if (!products || products.length === 0) return;
+function _cacheSet(key, entry) {
+  if (!entry || !Array.isArray(entry.products) || entry.products.length === 0) return;
   if (_resultCache.size >= RESULT_CACHE_MAX) {
     const oldest = _resultCache.keys().next().value;
-    if (oldest) _resultCache.delete(oldest);
+    if (oldest !== undefined) _resultCache.delete(oldest);
   }
-  _resultCache.set(key, { products, confidence: confidence || 'high', at: Date.now() });
+  _resultCache.set(key, { ...entry, at: Date.now() });
 }
 
 const _DEBUG_SEARCH = process.env.DEBUG_SEARCH === '1';
@@ -60,19 +98,29 @@ function _vlog(...args) {
   if (_DEBUG_SEARCH) console.log(...args);
 }
 
+function _withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function getClient() {
   if (_client) return _client;
 
   const appId = process.env.ALGOLIA_APP_ID;
   const apiKey = process.env.ALGOLIA_SEARCH_KEY;
-
   if (!appId || !apiKey) {
     throw new Error('[Algolia] ALGOLIA_APP_ID and ALGOLIA_SEARCH_KEY must be set');
   }
 
   const mod = await import('algoliasearch');
   const algoliasearch = mod.algoliasearch || mod.default;
-
   if (typeof algoliasearch !== 'function') {
     throw new Error(
       `[Algolia] Cannot find constructor. Keys: [${Object.keys(mod).join(', ')}]. Run: npm install algoliasearch`
@@ -88,60 +136,42 @@ export function isAlgoliaConfigured() {
   return !!(process.env.ALGOLIA_APP_ID && process.env.ALGOLIA_SEARCH_KEY);
 }
 
-// -------- Vendor list cache (Bug 3 — brand-aware routing) -----------------
-// Fetched once via Algolia searchForFacetValues on `vendor`, cached 24h.
-// https://www.algolia.com/doc/api-reference/api-methods/search-for-facet-values/
-//
-// Note: `vendor` must be declared as a facetable attribute in the index
-// configuration (Configuration → Facets → vendor as filterOnly). If the
-// facet call returns nothing, we fall back to letting the vendor name
-// remain in the free-text query.
+// ---------------------------------------------------------------------------
+// Vendor list cache (24 h) and routing
+// ---------------------------------------------------------------------------
 const VENDOR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-// Vendor names are compared in a normalised form so "Carlo-gavazzi",
-// "carlo gavazzi" and "CARLO_GAVAZZI" are the same brand.
+
+// "Carlo-gavazzi", "carlo gavazzi" and "CARLO_GAVAZZI" compare equal.
 export function normVendor(v) {
   return String(v || '').toLowerCase().replace(/[-_\/.]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-let _vendorCache = null; // { vendors: Set<string lowercase>, vendorMap: Map<string lowercase, string original>, fetchedAt: number }
+let _vendorCache = null; // { vendors: Set<key>, vendorMap: Map<key, Set<original>>, fetchedAt }
 let _vendorInflight = null;
 
 async function getVendorSet(client, indexName) {
   const now = Date.now();
-  if (_vendorCache && now - _vendorCache.fetchedAt < VENDOR_CACHE_TTL_MS) {
-    return _vendorCache;
-  }
+  if (_vendorCache && now - _vendorCache.fetchedAt < VENDOR_CACHE_TTL_MS) return _vendorCache;
   if (_vendorInflight) return _vendorInflight;
 
   _vendorInflight = (async () => {
     try {
       const vendors = new Set();
       const vendorMap = new Map();
-
       const addVendor = (v) => {
         if (typeof v !== 'string' || !v.trim()) return;
         const key = normVendor(v);
         if (!key) return;
         vendors.add(key);
-        // Keep EVERY original spelling so the filter matches all of them.
         if (!vendorMap.has(key)) vendorMap.set(key, new Set());
         vendorMap.get(key).add(v);
       };
 
-      // PRIMARY: a facet-only search returns up to maxValuesPerFacet (1000)
-      // distinct values. searchForFacetValues caps at maxFacetHits=100, which
-      // silently truncated the vendor list — any brand outside the top 100 by
-      // count could never be routed.
+      // PRIMARY: facet-only search returns up to 1000 distinct vendors.
       let gotAll = false;
       try {
         const facetRes = await client.search({
-          requests: [{
-            indexName,
-            query: '',
-            hitsPerPage: 0,
-            facets: ['vendor'],
-            maxValuesPerFacet: 1000,
-          }],
+          requests: [{ indexName, query: '', hitsPerPage: 0, facets: ['vendor'], maxValuesPerFacet: 1000 }],
         });
         const facetObj = facetRes?.results?.[0]?.facets?.vendor || {};
         for (const v of Object.keys(facetObj)) addVendor(v);
@@ -150,7 +180,7 @@ async function getVendorSet(client, indexName) {
         console.warn(`[Algolia] facet-based vendor fetch failed: ${facetErr.message}`);
       }
 
-      // FALLBACK: searchForFacetValues, still better than nothing.
+      // FALLBACK: searchForFacetValues (capped at 100).
       if (!gotAll) {
         const res = await client.searchForFacetValues({
           indexName,
@@ -165,8 +195,6 @@ async function getVendorSet(client, indexName) {
       return _vendorCache;
     } catch (err) {
       console.warn(`[Algolia] vendor facet fetch failed: ${err.message} — vendor routing disabled this request`);
-      // Cache an empty result for 5 minutes so we don't hammer Algolia
-      // on every search when the facet isn't configured.
       _vendorCache = { vendors: new Set(), vendorMap: new Map(), fetchedAt: now - VENDOR_CACHE_TTL_MS + 5 * 60 * 1000 };
       return _vendorCache;
     } finally {
@@ -176,65 +204,94 @@ async function getVendorSet(client, indexName) {
   return _vendorInflight;
 }
 
-/**
- * Detect vendor tokens in the query and lift them into a `filters`
- * clause. Removes the vendor word(s) from the free-text query so
- * Algolia ranks on the remaining product-type words.
- *
- * Greedy multi-word match (longest first) so "TE Connectivity" wins
- * over "TE" alone.
- */
-async function applyVendorRouting(query, client, indexName) {
-  if (!query || typeof query !== 'string') return { algoliaQuery: query, filters: null, matchedVendors: [] };
-  const { vendors, vendorMap } = await getVendorSet(client, indexName);
-  if (!vendors || vendors.size === 0) return { algoliaQuery: query, filters: null, matchedVendors: [] };
+// Vendor names that are also ordinary words in industrial queries.
+// "star delta timer" (Delta: 1,201 products) and "terminal block" (Block: 1 product) were
+// being filtered to the wrong vendor. These route only when QueryIntel named the brand.
+const AMBIGUOUS_VENDOR_KEYS = new Set([
+  'delta', 'block', 'finder', 'vega', 'telco', 'eta', 'br', 'sip', 'gic', 'hms', 'msa', 'nsf', 'nsk', 'eao',
+]);
 
-  const lower = normVendor(query);
-  // Try to match each vendor (longest first) against the query as a
-  // whole-word substring. Multiple vendors can match (OR them).
-  const sorted = [...vendors].sort((a, b) => b.length - a.length);
-  const matched = [];
-  let stripped = ` ${lower} `;
-  for (const v of sorted) {
-    const re = new RegExp(`\\s${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s`, 'g');
-    if (re.test(stripped)) {
-      for (const orig of (vendorMap.get(v) || [v])) matched.push(orig);
-      stripped = stripped.replace(re, ' ');
-    }
-  }
-  if (matched.length === 0) return { algoliaQuery: query, filters: null, matchedVendors: [] };
-
-  // Escape double quotes inside vendor names for the Algolia filter expr.
-  const filters = matched
-    .map((v) => `vendor:"${v.replace(/"/g, '\\"')}"`)
-    .join(' OR ');
-
-  // Rebuild the query string by mapping the stripped lower-case copy back
-  // through the original (preserve user casing for the remainder).
-  const remainder = stripped.trim().replace(/\s+/g, ' ');
-  // If the user typed brand-only ("ABB"), remainder is empty — pass "" so
-  // Algolia returns all vendor-matching products ranked by tiebreakers.
-  const algoliaQuery = remainder;
-  console.log(
-    `[Algolia] vendor routing: matched=[${matched.join(', ')}] query="${query}" → query="${algoliaQuery}" filters=${filters}`
-  );
-  return { algoliaQuery, filters, matchedVendors: matched };
+function brandConfirms(vendorKey, requestedBrand) {
+  const b = normVendor(requestedBrand);
+  if (!b) return false;
+  if (b === vendorKey) return true;
+  return b.split(' ').includes(vendorKey) || vendorKey.split(' ').includes(b);
 }
 
-/**
- * Fetch first variant IDs for a list of product handles from Storefront API.
- * Returns a Map of handle → { variantId, variantSku }.
- *
- * Implementation note: the previous batched `products(query: handle:"x" OR handle:"y" ...)`
- * path returned zero results in production — Storefront `search` is full-text
- * and does not OR multiple handle predicates. We now fire one `productByHandle`
- * query per handle in parallel; one HTTP round-trip's worth of wall time, but
- * exact and complete.
- */
+function _escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Matches the vendor as whole word(s) in the ORIGINAL text; separators between vendor words
+// may be space - _ / . + & ("Pepperl-Fuchs", "Carlo Gavazzi", "Schmersal GmbH & Co. KG").
+const _vendorPatternCache = new Map();
+function vendorPatterns(key) {
+  let p = _vendorPatternCache.get(key);
+  if (!p) {
+    const body = String(key).split(' ').filter(Boolean).map(_escapeRe).join('[\\s\\-_/.+&]+');
+    const src = `(^|[\\s,;:()"'])${body}(?=$|[\\s,;:()"'?!.])`;
+    p = { test: new RegExp(src, 'i'), replace: new RegExp(src, 'gi') };
+    if (_vendorPatternCache.size > 2000) _vendorPatternCache.clear();
+    _vendorPatternCache.set(key, p);
+  }
+  return p;
+}
+
+// Pure: returns { remainder, matched: [original vendor spellings], skipped: [ambiguous keys] }.
+function routeVendorsInText(query, vendors, vendorMap, requestedBrand) {
+  const sorted = [...vendors].sort((a, b) => b.length - a.length); // "abb jokab" before "abb"
+  const matched = [];
+  const skipped = [];
+  let rem = ` ${String(query ?? '')} `;
+  for (const v of sorted) {
+    if (!v) continue;
+    const { test, replace } = vendorPatterns(v);
+    if (!test.test(rem)) continue;
+    if (AMBIGUOUS_VENDOR_KEYS.has(v) && !brandConfirms(v, requestedBrand)) {
+      skipped.push(v);
+      continue;
+    }
+    for (const orig of (vendorMap.get(v) || [v])) matched.push(orig);
+    rem = rem.replace(replace, '$1 ');
+  }
+  const remainder = rem.replace(/\s+/g, ' ').replace(/^[\s,;:]+|[\s,;:]+$/g, '').trim();
+  return { remainder, matched, skipped };
+}
+
+async function applyVendorRouting(query, client, indexName, requestedBrand = null) {
+  const none = { algoliaQuery: query, filters: null, matchedVendors: [] };
+  if (!query || typeof query !== 'string') return none;
+  try {
+    const { vendors, vendorMap } = await getVendorSet(client, indexName);
+    if (!vendors || vendors.size === 0) return none;
+    const { remainder, matched, skipped } = routeVendorsInText(query, vendors, vendorMap, requestedBrand);
+    if (skipped.length) {
+      console.log(`[Algolia] vendor routing: kept common-word vendor(s) [${skipped.join(', ')}] as text (not named as the brand)`);
+    }
+    if (matched.length === 0) return none;
+    const filters = matched.map((v) => `vendor:"${String(v).replace(/"/g, '\\"')}"`).join(' OR ');
+    console.log(`[Algolia] vendor routing: matched=[${matched.join(', ')}] query="${query}" → query="${remainder}" filters=${filters}`);
+    return { algoliaQuery: remainder, filters, matchedVendors: matched };
+  } catch (err) {
+    console.warn(`[Algolia] vendor routing failed (${err.message}) — searching without a vendor filter`);
+    return none;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Variant IDs (not in the index) — one productByHandle per shown hit, in parallel
+// ---------------------------------------------------------------------------
 async function fetchVariantIdsByHandles(handles, shopDomain) {
-  if (!handles || handles.length === 0) return new Map();
-  const { shopifyStorefrontQuery } = await import('../shopify-storefront.js');
   const variantMap = new Map();
+  if (!handles || handles.length === 0) return variantMap;
+
+  let shopifyStorefrontQuery;
+  try {
+    ({ shopifyStorefrontQuery } = await import('../shopify-storefront.js'));
+  } catch (err) {
+    console.warn(`[Algolia] Storefront client unavailable: ${err.message}`);
+    return variantMap;
+  }
 
   const SINGLE_QUERY = `
     query GetVariantByHandle($handle: String!) {
@@ -246,22 +303,27 @@ async function fetchVariantIdsByHandles(handles, shopDomain) {
       }
     }
   `;
+  const lookupOnce = (handle) =>
+    _withTimeout(
+      shopifyStorefrontQuery({ query: SINGLE_QUERY, variables: { handle }, shopDomain }),
+      VARIANT_LOOKUP_TIMEOUT_MS,
+      'variant lookup'
+    );
 
   await Promise.allSettled(
     handles.filter(Boolean).map(async (handle) => {
       try {
-        const data = await shopifyStorefrontQuery({
-          query: SINGLE_QUERY,
-          variables: { handle },
-          shopDomain,
-        });
-        const product = data?.productByHandle;
-        const firstVariant = product?.variants?.edges?.[0]?.node;
+        let data;
+        try {
+          data = await lookupOnce(handle);
+        } catch (err) {
+          if (/timed out/i.test(err?.message || '')) throw err; // slow → don't double the wait
+          await _sleep(150); // transient "fetch failed" → one retry
+          data = await lookupOnce(handle);
+        }
+        const firstVariant = data?.productByHandle?.variants?.edges?.[0]?.node;
         if (firstVariant) {
-          variantMap.set(handle, {
-            variantId: firstVariant.id,
-            variantSku: firstVariant.sku || null,
-          });
+          variantMap.set(handle, { variantId: firstVariant.id, variantSku: firstVariant.sku || null });
         }
       } catch (err) {
         console.warn(`[Algolia] variant lookup failed for "${handle}": ${err.message}`);
@@ -273,31 +335,22 @@ async function fetchVariantIdsByHandles(handles, shopDomain) {
   return variantMap;
 }
 
-/**
- * Helper: determine if a product_image field value is a valid URL.
- *
- * Some Algolia records store the literal string "undefined" instead of null
- * when the image was missing at sync time. We must reject this value.
- */
+// Some records store the literal string "undefined" as product_image.
 function isValidImageUrl(value) {
   if (!value) return false;
   if (typeof value !== 'string') return false;
-  if (value === 'undefined' || value === 'null') return false; // literal strings
+  if (value === 'undefined' || value === 'null') return false;
   return value.startsWith('http');
 }
 
-/**
- * Extract numeric+unit tokens from a query: "60mm", "60 mm", "24V",
- * "10A", "IP67", "M12". Returns [{ value: 60, unit: "mm", raw: "60mm" }]
- *
- * These are HIGH-SIGNAL tokens. A product whose title/description/SKU
- * matches the EXACT numeric value must rank above a product that
- * only matches the brand/type words.
- */
+// ---------------------------------------------------------------------------
+// Spec / term / business / cylinder scoring (unchanged from v3.1 except accessory regex)
+// ---------------------------------------------------------------------------
+
+// Numeric+unit tokens: "60mm", "60 mm", "24V", "IP67", "M12".
 function extractSpecTokens(query) {
   if (!query || typeof query !== "string") return [];
   const tokens = [];
-  // Numeric+unit: 60mm, 60 mm, 5mm, 24V, 24VDC, 100A, 1000Hz
   const re = /(\d+(?:\.\d+)?)\s*(mm|cm|m|inch|in|"|v|vdc|vac|a|w|kw|hz|khz|°c|c)\b/gi;
   let m;
   while ((m = re.exec(query)) !== null) {
@@ -307,14 +360,11 @@ function extractSpecTokens(query) {
       raw: m[0].toLowerCase(),
     });
   }
-  // IP ratings
   const ipRe = /\bIP(\d{2})\b/gi;
   while ((m = ipRe.exec(query)) !== null) {
     tokens.push({ value: parseInt(m[1]), unit: "ip", raw: `ip${m[1]}` });
   }
-  // M-thread codes (M8, M12, M18, M30) — treat as a categorical match,
-  // not a numeric range, since adjacent sizes (M8 vs M10) are different
-  // products entirely, not "close enough".
+  // M-thread codes are categorical (M8 vs M10 are different products).
   const mRe = /\bM(\d{1,2})\b/g;
   while ((m = mRe.exec(query)) !== null) {
     tokens.push({ value: parseInt(m[1]), unit: "m_thread", raw: `m${m[1]}` });
@@ -322,12 +372,6 @@ function extractSpecTokens(query) {
   return tokens;
 }
 
-/**
- * Build all the textual surfaces of a product that we can match
- * spec tokens against (lowercased, no html). Used by the re-ranker
- * because metafields aren't in the Algolia hit but the values often
- * leak into title/description/tags.
- */
 function _clean(parts) {
   return parts
     .filter(Boolean)
@@ -337,10 +381,7 @@ function _clean(parts) {
     .toLowerCase();
 }
 
-/**
- * STRONG surfaces: structured fields that describe what the product IS.
- * A spec token found here is about the product itself.
- */
+// STRONG surfaces: what the product IS.
 function flattenStrongText(hit) {
   return _clean([
     hit.title,
@@ -353,12 +394,7 @@ function flattenStrongText(hit) {
   ]);
 }
 
-/**
- * WEAK surface: the marketing description. A spec token found ONLY here is
- * unreliable — "M12" in a description is usually the CONNECTOR on an M18
- * sensor, and "hot" in a TI description means hot-swap, not temperature.
- * Matches here earn partial credit, never a full match.
- */
+// WEAK surface: marketing description (partial credit only).
 function flattenWeakText(hit) {
   return _clean([hit.body_html_safe || hit.body_html || ""]);
 }
@@ -367,7 +403,6 @@ function flattenHitText(hit) {
   return _clean([flattenStrongText(hit), flattenWeakText(hit)]);
 }
 
-// Words that carry no product meaning, stripped before term-overlap scoring.
 const STOPWORDS = new Set([
   'a', 'an', 'the', 'for', 'of', 'and', 'or', 'with', 'to', 'in', 'on', 'at',
   'me', 'my', 'we', 'our', 'i', 'you', 'your', 'find', 'need', 'want', 'get',
@@ -386,18 +421,12 @@ function contentTerms(query) {
     .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
 }
 
-/**
- * Fraction of the query's content words that appear in the hit's STRONG
- * surfaces. This is the core relevance signal: a product whose title and
- * type say nothing about what was asked for is not an answer, however
- * enthusiastically Algolia matched a stray word in its description.
- */
+// Fraction of the query's content words found in the hit's STRONG surfaces.
 function strongTermRatio(hit, terms) {
   if (!terms.length) return 1;
   const strong = flattenStrongText(hit);
   let hitCount = 0;
   for (const t of terms) {
-    // Singular/plural tolerance without a stemmer.
     const stem = t.replace(/(ies|es|s)$/, '');
     const pattern = stem.length >= 3 ? stem : t;
     if (strong.includes(pattern)) hitCount++;
@@ -405,37 +434,17 @@ function strongTermRatio(hit, terms) {
   return hitCount / terms.length;
 }
 
-/**
- * Score a hit against the query's spec tokens. EXACT numeric
- * matches earn a large positive score. Wrong numeric values earn a
- * large NEGATIVE score (so a 5mm product never outranks a 60mm
- * product when the user asked for 60mm).
- *
- * The unit-aware regex matches BOTH "60mm" and "60 mm" forms in
- * the product text — critical because the catalog uses the spaced
- * form ("60 mm") and QueryIntel emits the unspaced form ("60mm").
- */
-/**
- * Inventory + accessory-aware rerank. Applied AFTER scoreHitBySpec so a
- * spec-correct product still beats an in-stock-but-wrong-size one.
- *
- * Magnitudes are tuned smaller than the spec scorer (+1000 / -800)
- * so business signals act as a tiebreaker, not an override.
- */
+// v4: matches "Accessory" AND "Accessories" (v3 only matched the singular).
+const ACCESSORY_TITLE_RE = /\baccessor(?:y|ies)\b|\bmounting brackets?\b/;
+const ACCESSORY_TYPE_RE = /\baccessor(?:y|ies)\b/;
+
 function scoreHitByBusinessSignal(hit) {
   let s = 0;
   if (hit.inventory_available === true) s += 200;
   if (typeof hit.inventory_quantity === 'number' && hit.inventory_quantity > 0) s += 50;
-
-  const titleLow = (hit.title || '').toLowerCase();
-  const ptLow = (hit.product_type || '').toLowerCase();
-  if (
-    titleLow.includes('accessory') ||
-    titleLow.includes('mounting bracket') ||
-    ptLow.includes('accessory')
-  ) {
-    s -= 300;
-  }
+  const titleLow = String(hit.title || '').toLowerCase();
+  const ptLow = String(hit.product_type || '').toLowerCase();
+  if (ACCESSORY_TITLE_RE.test(titleLow) || ACCESSORY_TYPE_RE.test(ptLow)) s -= 300;
   return s;
 }
 
@@ -446,21 +455,15 @@ function scoreHitBySpec(hit, specTokens) {
   let score = 0;
 
   for (const tok of specTokens) {
-    // Build a regex that matches the value+unit with optional whitespace.
-    // For unit "m_thread" the pattern is "m12" (no space).
     let pattern;
     if (tok.unit === "m_thread") {
       pattern = new RegExp(`\\bm${tok.value}\\b`, "i");
     } else if (tok.unit === "ip") {
       pattern = new RegExp(`\\bip${tok.value}\\b`, "i");
     } else {
-      pattern = new RegExp(
-        `\\b${tok.value}\\s*${tok.unit}\\b`,
-        "i"
-      );
+      pattern = new RegExp(`\\b${tok.value}\\s*${tok.unit}\\b`, "i");
     }
 
-    // Build the mismatch detector once — used for both branches below.
     function buildMismatchRe() {
       if (tok.unit === "m_thread") return /\bm(\d{1,2})\b/gi;
       if (tok.unit === "ip") return /\bip(\d{2})\b/gi;
@@ -477,30 +480,18 @@ function scoreHitBySpec(hit, specTokens) {
     }
 
     if (pattern.test(strong)) {
-      // The product's own title/type/tags/sku carry this spec. Real match.
       score += 1000;
     } else if (pattern.test(weak)) {
-      // Only the description mentions it. On an M12 query this is usually
-      // an M18 sensor that happens to have an M12 CONNECTOR — partial
-      // credit only, and still penalised below if the strong fields
-      // advertise a conflicting value.
       score += 250;
       if (hasDifferentValue(strong)) score -= 800;
     } else if (hasDifferentValue(strong) || hasDifferentValue(weak)) {
-      // Actively wrong size — user asked 60mm, product is 5mm.
       score -= 800;
     }
   }
   return score;
 }
 
-/**
- * Cylinder dimensions are ROLE-sensitive: "32 mm bore x 100 mm stroke" and
- * "100 mm bore x 32 mm stroke" contain the same numbers, and the generic spec
- * scorer above cannot tell them apart. That is how "100 stroke" returned a
- * 100 mm BORE cylinder and "32 dia 100 stroke" returned 32/300 cylinders.
- * Parse bore and stroke explicitly from the query and from the product title.
- */
+// Bore and stroke are role-sensitive ("32 bore x 100 stroke" ≠ "100 bore x 32 stroke").
 function extractCylinderDims(text) {
   if (!text || typeof text !== 'string') return { bore: null, stroke: null };
   const t = text.toLowerCase();
@@ -526,12 +517,6 @@ function scoreHitByCylinderDims(hit, want) {
   return s;
 }
 
-/**
- * If the customer asked for a brand that we could not route to a vendor
- * filter, check whether ANY hit actually carries that brand. If none does,
- * the results are other brands and must not be presented as the answer
- * ("proximity sensor m18 pnp in riko brand only" returned IFM, twice).
- */
 function brandAppearsInHits(brand, hits) {
   const b = normVendor(brand);
   if (!b) return true;
@@ -542,30 +527,123 @@ function brandAppearsInHits(brand, hits) {
   });
 }
 
-/**
- * Build the typo-policy fields for a single Algolia request.
- *
- * Per https://www.algolia.com/doc/api-reference/api-parameters/typoTolerance/
- * `typoTolerance` is a SCALAR — boolean | "min" | "strict". The
- * `allowTyposOnNumericTokens`, `minWordSizefor1Typo`, and
- * `minWordSizefor2Typos` parameters are SEPARATE top-level request
- * params. Sending them nested under `typoTolerance` produces the
- * `Invalid value for "typoTolerance" parameter, expected min, strict
- * or boolean value` error that was silently emptying Tier 1 results.
- */
+// ---------------------------------------------------------------------------
+// v4: category-aware scoring
+// ---------------------------------------------------------------------------
+const HEAD_STOP = new Set([
+  'the', 'and', 'for', 'with', 'from', 'into', 'your', 'our', 'you', 'any', 'some', 'all',
+  'please', 'pls', 'need', 'want', 'have', 'has', 'supply', 'sell', 'stock', 'carry', 'provide',
+  'offer', 'get', 'show', 'find', 'search', 'looking', 'look', 'price', 'prices', 'quote',
+  'quotation', 'available', 'availability', 'also', 'plus', 'etc', 'such', 'very', 'only', 'just',
+  'mm', 'cm', 'mtr', 'kw', 'hp', 'vac', 'vdc', 'volt', 'volts', 'amp', 'amps', 'hz', 'khz', 'bar',
+  'psi', 'mpa', 'kpa', 'rpm', 'pnp', 'npn', 'nos', 'pcs', 'piece', 'pieces', 'unit', 'units',
+  'qty', 'quantity', 'type', 'series', 'model', 'brand', 'make',
+]);
+const PREP_SPLIT = /\s(?:for|with|to|on|in|from|by|of|at|under|without)\s/i;
+// Leaf-category endings that mean "an accessory of", used for the 'low' verdict.
+const ACCESSORY_LEAF_WORDS = new Set([
+  'accessory', 'bracket', 'cable', 'holder', 'cover', 'kit', 'spare', 'part', 'seal', 'mounting',
+  'label', 'cap', 'adapter', 'connector', 'socket', 'base', 'clip', 'plate', 'frame', 'lock',
+  'reflector', 'screw', 'nut', 'washer', 'gasket', 'fitting',
+]);
+
+function singular(word) {
+  const w = String(word ?? '').toLowerCase();
+  if (w.length > 4 && w.endsWith('ies')) return `${w.slice(0, -3)}y`;
+  if (/(?:ss|us|is)$/.test(w)) return w;
+  if (/(?:ch|sh|x|z)es$/.test(w)) return w.slice(0, -2);
+  if (w.length > 3 && w.endsWith('s')) return w.slice(0, -1);
+  return w;
+}
+
+// Product noun = last content word before any preposition.
+function headNounOf(query) {
+  const firstPart = ` ${String(query ?? '').toLowerCase()} `.split(PREP_SPLIT)[0];
+  const toks = firstPart
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => /^[a-z][a-z-]*[a-z]$/.test(t) && t.length >= 3 && !HEAD_STOP.has(t));
+  return toks.length ? singular(toks[toks.length - 1]) : null;
+}
+
+function queryWordSet(query) {
+  return new Set(String(query ?? '').toLowerCase().split(/[^a-z-]+/).filter(Boolean).map(singular));
+}
+
+// Fallback for "<Vendor> <Category> <SKU>" titles without a vendor tag.
+function titleCategoryAfterVendor(title, vKey) {
+  const words = String(title ?? '').trim().split(/\s+/).filter(Boolean);
+  let acc = '';
+  let start = -1;
+  for (let k = 0; k < words.length && k < 6; k++) {
+    acc = normVendor(`${acc} ${words[k]}`);
+    if (acc === vKey) { start = k + 1; break; }
+    if (!vKey.startsWith(acc)) break;
+  }
+  if (start < 0) return null;
+  const cat = [];
+  for (const w of words.slice(start)) {
+    if (/\d/.test(w)) break;
+    const clean = w.toLowerCase().replace(/[^a-z&-]/g, '');
+    if (!clean) break;
+    cat.push(clean);
+  }
+  return cat.length ? cat.join(' ') : null;
+}
+
+// "Siemens Contactor Accessories" (vendor Siemens) → "contactor accessories".
+function leafCategory(hit) {
+  const vKey = normVendor(hit?.vendor);
+  if (!vKey) return null;
+  const tags = Array.isArray(hit?.tags) ? hit.tags : typeof hit?.tags === 'string' ? hit.tags.split(',') : [];
+  for (const raw of tags) {
+    const t = normVendor(raw);
+    if (t.startsWith(`${vKey} `) && t.length > vKey.length + 3) return t.slice(vKey.length + 1);
+  }
+  return titleCategoryAfterVendor(hit?.title, vKey);
+}
+
+function leafWords(hit) {
+  const leaf = leafCategory(hit);
+  return leaf ? leaf.split(/[\s&,/]+/).filter(Boolean).map(singular) : [];
+}
+
+function scoreHitByCategory(hit, head, qWords) {
+  if (!head) return 0;
+  if (head === normVendor(hit?.vendor)) return 0;
+  const words = leafWords(hit);
+  if (!words.length) return 0;
+  const last = words[words.length - 1];
+  if (last === head) return CATEGORY_MATCH_BONUS;
+  if (words.includes(head) && !(qWords && qWords.has(last))) return -CATEGORY_SUBPART_PENALTY;
+  return 0;
+}
+
+function categoryScoreForQuery(hit, query) {
+  return scoreHitByCategory(hit, headNounOf(query), queryWordSet(query));
+}
+
+function strongHasHead(hit, head) {
+  if (!head) return true;
+  const stem = head.length > 4 && head.endsWith('y') ? head.slice(0, -1) : head;
+  return flattenStrongText(hit).includes(stem);
+}
+
+// Brand the customer named that is not a vendor filter (e.g. only in house-vendor titles).
+function scoreHitByBrandText(hit, requestedBrand, brandRouted) {
+  if (!requestedBrand || brandRouted) return 0;
+  return brandAppearsInHits(requestedBrand, [hit]) ? BRAND_TEXT_BOOST : 0;
+}
+
+// typoTolerance must be a SCALAR; the other typo options are top-level params.
 function buildTypoPolicy({ looksLikeSku, hasNumericSpec }) {
-  // SKU paths: turn typo tolerance off entirely.
   if (looksLikeSku) {
     return {
       typoTolerance: false,
       allowTyposOnNumericTokens: false,
-      // Even when typoTolerance flips to true elsewhere, SKUs and vendor
-      // names must never be typo-matched. "PS4607" can't become "PS4608"
-      // and "SICK" can't become "SIEMENS" by edit distance.
       disableTypoToleranceOnAttributes: ['sku', 'vendor'],
     };
   }
-  // Numeric-spec queries: keep typoTolerance for words but lock numbers.
   if (hasNumericSpec) {
     return {
       typoTolerance: true,
@@ -575,162 +653,268 @@ function buildTypoPolicy({ looksLikeSku, hasNumericSpec }) {
       disableTypoToleranceOnAttributes: ['sku', 'vendor'],
     };
   }
-  // Plain text queries: default typoTolerance, still protect sku/vendor.
   return {
     typoTolerance: true,
     disableTypoToleranceOnAttributes: ['sku', 'vendor'],
   };
 }
 
-export async function algoliaSearch(query, { first = 10, shopDomain, requestedBrand = null } = {}) {
-  if (!query || typeof query !== 'string') return null;
-  const trimmed = query.trim();
-  if (!trimmed) return null;
+// ---------------------------------------------------------------------------
+// Hit → card
+// ---------------------------------------------------------------------------
+const FULL_ATTRS = [
+  'objectID', 'id', 'title', 'handle', 'vendor',
+  'product_type', 'tags', 'body_html', 'body_html_safe',
+  'price', 'variants_min_price', 'variants_max_price', 'currency_code',
+  'product_image', 'image', 'featured_image', 'images',
+  'variants', 'sku', 'named_tags',
+  'inventory_available', 'inventory_quantity',
+];
+const LIGHT_ATTRS = FULL_ATTRS.filter((a) => a !== 'body_html' && a !== 'body_html_safe');
 
-  // Detect if this looks like a SKU/part code — if so, search EXACTLY as-is
-  const looksLikeSku = /^[A-Z0-9]{2,}[-\.][A-Z0-9][-A-Z0-9\.\/]{2,}$/i.test(trimmed) ||
-    (/^[A-Z]{2,}\d{2,}/.test(trimmed) && trimmed.length >= 5 && trimmed.length <= 20);
+function resolveStorefrontHost(shopDomain) {
+  const envHost = process.env.STOREFRONT_HOST
+    ? String(process.env.STOREFRONT_HOST).replace(/^https?:\/\//, '').replace(/\/+$/, '')
+    : null;
+  const shopHost = shopDomain ? String(shopDomain).replace(/^https?:\/\//, '').replace(/\/+$/, '') : null;
+  return envHost || (shopHost && !shopHost.endsWith('.myshopify.com') ? shopHost : null) || 'www.creativeautomation.ae';
+}
 
-  if (looksLikeSku) {
-    _vlog(`[Algolia] SKU query detected — searching exact: "${trimmed}"`);
+function hitToProduct(hit, variantMap, host, quiet = false) {
+  const rawId = hit.objectID || hit.id || '';
+  const productId = String(rawId).startsWith('gid://') ? rawId : `gid://shopify/Product/${rawId}`;
+
+  const imageUrl =
+    (isValidImageUrl(hit.product_image) ? hit.product_image : null) ||
+    (hit.image && typeof hit.image === 'object' && isValidImageUrl(hit.image.src) ? hit.image.src : null) ||
+    (isValidImageUrl(hit.image) ? hit.image : null) ||
+    (isValidImageUrl(hit.featured_image) ? hit.featured_image : null) ||
+    (Array.isArray(hit.images) && isValidImageUrl(hit.images[0]) ? hit.images[0] : null) ||
+    null;
+
+  // PRICE: plain AED amount (e.g. 4437), NOT cents
+  const rawPrice = hit.variants_min_price ?? hit.price ?? null;
+  const currency = hit.currency_code || 'AED';
+  const parsed = rawPrice != null ? parseFloat(String(rawPrice)) : NaN;
+  const price = Number.isFinite(parsed) ? `${parsed.toFixed(2)} ${currency}` : null;
+
+  const algoliaVariant = Array.isArray(hit.variants) ? hit.variants[0] : null;
+  const algoliaVariantRawId = algoliaVariant?.id;
+  const algoliaVariantId =
+    algoliaVariantRawId != null
+      ? String(algoliaVariantRawId).startsWith('gid://')
+        ? String(algoliaVariantRawId)
+        : `gid://shopify/ProductVariant/${algoliaVariantRawId}`
+      : null;
+  const variantInfo = hit.handle ? variantMap.get(hit.handle) : null;
+  const variantId = algoliaVariantId || variantInfo?.variantId || null;
+  const variantSku = algoliaVariant?.sku || variantInfo?.variantSku || hit.sku || null;
+
+  const rawDesc = hit.body_html_safe || hit.body_html || '';
+  const description =
+    typeof rawDesc === 'string' ? rawDesc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+
+  if (!quiet) {
+    if (!imageUrl) console.warn(`[Algolia] No image for "${hit.title}" — product_image=${hit.product_image}`);
+    if (!variantId) console.warn(`[Algolia] No variant_id for "${hit.title}" handle="${hit.handle}"`);
   }
 
-  const indexName = process.env.ALGOLIA_INDEX_NAME || 'shopify_products';
-  _vlog(`[Algolia] Searching: "${trimmed}" in "${indexName}"`);
+  return {
+    id: productId,
+    title: hit.title || 'Untitled Product',
+    handle: hit.handle || null,
+    vendor: hit.vendor || null,
+    image_url: imageUrl,
+    url: hit.handle ? `https://${host}/products/${hit.handle}` : null,
+    price,
+    description,
+    variant_id: variantId,
+    merchandise_id: variantId,
+    sku: variantSku,
+  };
+}
 
-  const _t0 = Date.now();
-  const _specTokensForLog = extractSpecTokens(trimmed);
-  _vlog(
-    `[Algolia] OUTGOING query="${trimmed}" first=${first} typoTolerance=${
-      looksLikeSku ? "off (sku)" : _specTokensForLog.length > 0 ? "numeric-locked" : "on"
-    }`
-  );
+// ---------------------------------------------------------------------------
+// Main search
+// ---------------------------------------------------------------------------
+export async function algoliaSearchDetailed(query, options = {}) {
+  const t0 = Date.now();
+  const opts = options && typeof options === 'object' ? options : {};
+  const requestedBrand = opts.requestedBrand || null;
+  const base = { status: 'invalid', products: [], confidence: 'none', topTermRatio: 0, requestedBrand, nbHits: 0 };
 
-  let client;
   try {
-    client = await getClient();
-  } catch (err) {
-    console.error(`[Algolia] Client init failed: ${err.message}`);
-    return null;
-  }
+    if (!query || typeof query !== 'string') return base;
+    const trimmed = query.trim();
+    if (!trimmed) return base;
 
-  // Build the Algolia request. typoTolerance must be a SCALAR — see
-  // buildTypoPolicy() for the previous-nested-object bug history.
-  const hasNumericSpec = _specTokensForLog.length > 0;
-  const typoFields = buildTypoPolicy({ looksLikeSku, hasNumericSpec });
+    const firstRaw = Number(opts.first);
+    const firstN = Number.isFinite(firstRaw) && firstRaw >= 1 ? Math.min(50, Math.floor(firstRaw)) : 10;
+    const shopDomain = opts.shopDomain;
+    const requireHeadNoun = opts.requireHeadNoun === true;
+    const variantsOnlyIfHigh = opts.variantsOnlyIfHigh === true;
 
-  // Vendor filter routing (Bug 3): if the query contains a known vendor
-  // token, lift it out into `filters` and strip from the free-text query.
-  const { algoliaQuery: queryForAlgolia, filters, matchedVendors = [] } = await applyVendorRouting(
-    trimmed,
-    client,
-    indexName
-  );
+    const looksLikeSku =
+      /^[A-Z0-9]{2,}[-\.][A-Z0-9][-A-Z0-9\.\/]{2,}$/i.test(trimmed) ||
+      (/^[A-Z]{2,}\d{2,}/.test(trimmed) && trimmed.length >= 5 && trimmed.length <= 20);
+    if (looksLikeSku) _vlog(`[Algolia] SKU query detected — searching exact: "${trimmed}"`);
 
-  // Result cache lookup keyed on the final outgoing query + filters.
-  const cacheKey = JSON.stringify({
-    q: queryForAlgolia.toLowerCase().replace(/\s+/g, ' '),
-    f: filters || '',
-    b: requestedBrand ? normVendor(requestedBrand) : '',
-    first,
-  });
-  const cached = _cacheGet(cacheKey);
-  if (cached) {
-    console.log(
-      `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia_cache filters=${JSON.stringify(filters || '')} n=${cached.products.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(cached.products[0]?.sku || '')} top_vendor=${JSON.stringify(cached.products[0]?.vendor || '')} reranked=false confidence=${cached.confidence}`
+    const indexName = process.env.ALGOLIA_INDEX_NAME || 'shopify_products';
+    const specTokens = extractSpecTokens(trimmed);
+    const hasNumericSpec = specTokens.length > 0;
+    _vlog(
+      `[Algolia] OUTGOING query="${trimmed}" first=${firstN} typoTolerance=${
+        looksLikeSku ? 'off (sku)' : hasNumericSpec ? 'numeric-locked' : 'on'
+      }`
     );
-    return { products: cached.products, confidence: cached.confidence, requestedBrand };
-  }
 
-  // For non-SKU, non-numeric queries, let Algolia broaden by trimming
-  // tail words when zero hits — safer than the home-grown plural/main-noun
-  // retry loop. https://www.algolia.com/doc/api-reference/api-parameters/removeWordsIfNoResults/
-  const removeWordsPolicy =
-    !looksLikeSku && !hasNumericSpec ? { removeWordsIfNoResults: 'lastWords' } : {};
-
-  let hits = [];
-  try {
-    const response = await client.search({
-      requests: [{
-        indexName,
-        query: queryForAlgolia,
-        hitsPerPage: first,
-        attributesToRetrieve: [
-          'objectID', 'id', 'title', 'handle', 'vendor',
-          'product_type', 'tags', 'body_html', 'body_html_safe',
-          'price', 'variants_min_price', 'variants_max_price', 'currency_code',
-          'product_image', 'image', 'featured_image', 'images',
-          'variants', 'sku', 'named_tags',
-          'inventory_available', 'inventory_quantity',
-        ],
-        ...(looksLikeSku ? { optionalWords: [] } : {}),
-        ...(filters ? { filters } : {}),
-        ...typoFields,
-        ...removeWordsPolicy,
-      }],
-    });
-    hits = response.results?.[0]?.hits || [];
-  } catch (searchErr) {
-    const msg = searchErr.message || '';
-    if (
-      msg.includes('does not exist') ||
-      msg.includes('Index not found') ||
-      searchErr.status === 404
-    ) {
-      console.warn(
-        `[Algolia] Index "${indexName}" not found. ` +
-        `Sync at dashboard.algolia.com → Data Sources → Integrations → Shopify`
-      );
-      return null;
+    let client;
+    try {
+      client = await getClient();
+    } catch (err) {
+      console.error(`[Algolia] Client init failed: ${err.message}`);
+      return { ...base, status: 'error', confidence: 'error' };
     }
-    console.error(`[Algolia] Search error: ${msg}`);
-    return null;
-  }
 
-  // Post-Algolia re-rank. Spec score floats EXACT numeric matches and sinks
-  // numeric mismatches; business-signal score is a smaller tiebreaker for
-  // in-stock products and a penalty for accessory/mounting-bracket records.
-  const specTokens = extractSpecTokens(trimmed);
-  const cylWant = extractCylinderDims(trimmed);
-  const terms = contentTerms(queryForAlgolia || trimmed);
-  let _reranked = false;
-  let _confidence = 'high';
-  let _topRatio = 1;
-  if (hits.length > 0) {
+    const typoFields = buildTypoPolicy({ looksLikeSku, hasNumericSpec });
+    const routing = await applyVendorRouting(trimmed, client, indexName, requestedBrand);
+    const outgoingQuery = typeof routing.algoliaQuery === 'string' ? routing.algoliaQuery : trimmed;
+    const filters = routing.filters || null;
+    const matchedVendors = Array.isArray(routing.matchedVendors) ? routing.matchedVendors : [];
+    const brandRouted =
+      !!requestedBrand &&
+      matchedVendors.some(
+        (v) => normVendor(v) === normVendor(requestedBrand) || normVendor(v).includes(normVendor(requestedBrand))
+      );
+
+    const cacheKey = JSON.stringify({
+      v: CACHE_VERSION,
+      q: outgoingQuery.toLowerCase().replace(/\s+/g, ' '),
+      f: filters || '',
+      b: requestedBrand ? normVendor(requestedBrand) : '',
+      first: firstN,
+      h: requireHeadNoun ? 1 : 0,
+    });
+    const cached = _cacheGet(cacheKey);
+    if (cached) {
+      console.log(
+        `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia_cache filters=${JSON.stringify(filters || '')} n=${cached.products.length} latency_ms=${Date.now() - t0} top_sku=${JSON.stringify(cached.products[0]?.sku || '')} top_vendor=${JSON.stringify(cached.products[0]?.vendor || '')} reranked=false confidence=${cached.confidence}`
+      );
+      return {
+        status: 'ok',
+        products: cached.products,
+        confidence: cached.confidence,
+        topTermRatio: cached.topTermRatio,
+        requestedBrand,
+        nbHits: cached.nbHits,
+      };
+    }
+
+    const pool = looksLikeSku ? firstN : Math.max(firstN, RERANK_POOL);
+    const baseParams = {
+      indexName,
+      query: outgoingQuery,
+      attributesToHighlight: [],
+      attributesToSnippet: [],
+      removeWordsIfNoResults: !looksLikeSku && !hasNumericSpec ? REMOVE_WORDS_POLICY : 'none',
+      ...(looksLikeSku ? { optionalWords: [] } : {}),
+      ...(filters ? { filters } : {}),
+      ...typoFields,
+    };
+
+    let hits = [];
+    let nbHits = 0;
+    try {
+      const response = await client.search({
+        requests: [{ ...baseParams, hitsPerPage: pool, attributesToRetrieve: FULL_ATTRS }],
+      });
+      const r0 = response?.results?.[0] || {};
+      hits = Array.isArray(r0.hits) ? r0.hits : [];
+      nbHits = Number(r0.nbHits) || hits.length;
+    } catch (searchErr) {
+      const msg = searchErr?.message || '';
+      if (msg.includes('does not exist') || msg.includes('Index not found') || searchErr?.status === 404) {
+        console.warn(
+          `[Algolia] Index "${indexName}" not found. Sync at dashboard.algolia.com → Data Sources → Integrations → Shopify`
+        );
+      } else {
+        console.error(`[Algolia] Search error: ${msg}`);
+      }
+      return { ...base, status: 'error', confidence: 'error' };
+    }
+
+    if (hits.length === 0) {
+      console.log(
+        `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=0 latency_ms=${Date.now() - t0} top_sku="" top_vendor="" reranked=false`
+      );
+      return { ...base, status: 'empty', confidence: 'none', nbHits: 0 };
+    }
+
+    // ---- Rerank ----------------------------------------------------------
+    const cylWant = extractCylinderDims(trimmed);
+    const terms = contentTerms(outgoingQuery || trimmed);
+    const head = looksLikeSku ? null : headNounOf(outgoingQuery);
+    const qWords = queryWordSet(outgoingQuery);
+
+    const scoreOne = (h, idx) => {
+      try {
+        const spec = specTokens.length ? scoreHitBySpec(h, specTokens) : 0;
+        const biz = scoreHitByBusinessSignal(h);
+        const ratio = strongTermRatio(h, terms);
+        const term = Math.round(400 * ratio);
+        const dim = scoreHitByCylinderDims(h, cylWant);
+        const cat = scoreHitByCategory(h, head, qWords);
+        const brand = scoreHitByBrandText(h, requestedBrand, brandRouted);
+        const lw = cat < 0 ? leafWords(h) : [];
+        return {
+          hit: h, idx, spec, biz, term, dim, cat, brand, ratio,
+          leafLast: lw.length ? lw[lw.length - 1] : null,
+          score: spec + biz + term + dim + cat + brand,
+        };
+      } catch (err) {
+        _vlog(`[Algolia] scoring failed for sku=${h?.sku}: ${err.message}`);
+        return { hit: h, idx, spec: 0, biz: 0, term: 0, dim: 0, cat: 0, brand: 0, ratio: 0, leafLast: null, score: -1e6 };
+      }
+    };
+    const scored = hits.map(scoreOne);
+
+    // ---- Category rescue: the pool holds only sub-parts of what was asked ----
+    let rescued = 0;
+    if (head && nbHits > hits.length && !scored.some((s) => s.cat > 0) && scored.some((s) => s.cat < 0)) {
+      try {
+        const res = await _withTimeout(
+          client.search({ requests: [{ ...baseParams, hitsPerPage: RESCUE_POOL, attributesToRetrieve: LIGHT_ATTRS }] }),
+          RESCUE_TIMEOUT_MS,
+          'category rescue'
+        );
+        const scanned = Array.isArray(res?.results?.[0]?.hits) ? res.results[0].hits : [];
+        const seen = new Set(hits.map((h) => String(h.objectID ?? h.id)));
+        const extra = scanned
+          .filter((h) => !seen.has(String(h.objectID ?? h.id)) && scoreHitByCategory(h, head, qWords) > 0)
+          .slice(0, pool);
+        extra.forEach((h, i) => scored.push(scoreOne(h, hits.length + i)));
+        rescued = extra.length;
+        console.log(
+          `[Algolia] category rescue for "${head}": top ${hits.length} were all sub-parts; scanned ${scanned.length}, added ${rescued}`
+        );
+      } catch (err) {
+        console.warn(`[Algolia] category rescue skipped: ${err.message}`);
+      }
+    }
+
     const originalTop3 = hits.slice(0, 3).map((h) => h.sku);
-    const scored = hits.map((h, idx) => {
-      const spec = specTokens.length ? scoreHitBySpec(h, specTokens) : 0;
-      const biz = scoreHitByBusinessSignal(h);
-      // Term score rewards products whose STRUCTURED fields actually talk
-      // about what was asked for, so a description-only keyword hit can no
-      // longer outrank a genuine product-type match.
-      const ratio = strongTermRatio(h, terms);
-      const term = Math.round(400 * ratio);
-      const dim = scoreHitByCylinderDims(h, cylWant);
-      return { hit: h, idx, spec, biz, term, dim, ratio, score: spec + biz + term + dim };
-    });
+    scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.idx - b.idx));
+    const finalScored = scored.slice(0, firstN);
+    const finalHits = finalScored.map((s) => s.hit);
+    const newTop3 = finalHits.slice(0, 3).map((h) => h.sku);
+    const reranked = JSON.stringify(originalTop3) !== JSON.stringify(newTop3);
 
-    scored.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.idx - b.idx; // Algolia's order as tiebreak
-    });
-
-    hits = scored.map((s) => s.hit);
-    const newTop3 = hits.slice(0, 3).map((h) => h.sku);
-    _reranked = JSON.stringify(originalTop3) !== JSON.stringify(newTop3);
-
-    // ---- RELEVANCE FLOOR --------------------------------------------
-    // Previously ANY non-empty Algolia response was treated as a
-    // high-confidence answer, which is how "hot cylinders" returned
-    // Texas Instruments hot-swap controllers AND stripped the catalog
-    // tools so Claude could not recover. Now we grade the top hit.
-    const top = scored[0];
-    _topRatio = top?.ratio ?? 0;
+    // ---- Relevance floor ---------------------------------------------------
+    const top = finalScored[0];
+    const topTermRatio = top?.ratio ?? 0;
     const reasons = [];
-
-    // A vendor filter is itself strong evidence, so brand-only queries
-    // ("Bonfiglioli worm gearbox") are exempt from the term-overlap test.
-    if (!filters && terms.length > 0 && _topRatio === 0) {
+    // A vendor filter is itself strong evidence, so vendor-filtered queries keep v3's exemption.
+    if (!filters && terms.length > 0 && topTermRatio === 0) {
       reasons.push('no query term appears in any structured field of the top hit');
     }
     if (specTokens.length > 0 && (top?.spec ?? 0) <= 0) {
@@ -739,171 +923,92 @@ export async function algoliaSearch(query, { first = 10, shopDomain, requestedBr
     if ((cylWant.bore != null || cylWant.stroke != null) && (top?.dim ?? 0) < 0) {
       reasons.push('no cylinder matched the requested bore/stroke');
     }
-    // Brand requested but not stocked / not routable → special verdict.
-    if (
-      requestedBrand &&
-      !matchedVendors.some((v) => normVendor(v) === normVendor(requestedBrand) || normVendor(v).includes(normVendor(requestedBrand))) &&
-      !brandAppearsInHits(requestedBrand, hits)
-    ) {
-      _confidence = 'brand_missing';
-      console.warn(`[Algolia] BRAND MISSING: "${requestedBrand}" requested but no hit carries it (top_vendor=${top?.hit?.vendor || '?'})`);
+    if (head && top && top.cat < 0 && top.leafLast && ACCESSORY_LEAF_WORDS.has(top.leafLast)) {
+      reasons.push(`only accessories of "${head}" found`);
+    }
+    if (requireHeadNoun && head && top && !strongHasHead(top.hit, head)) {
+      reasons.push(`product noun "${head}" is not in the top hit's title/type/tags`);
+    }
+
+    let confidence = 'high';
+    if (requestedBrand && !brandRouted && !brandAppearsInHits(requestedBrand, finalHits)) {
+      confidence = 'brand_missing';
+      console.warn(
+        `[Algolia] BRAND MISSING: "${requestedBrand}" requested but no hit carries it (top_vendor=${top?.hit?.vendor || '?'})`
+      );
     } else if (reasons.length > 0) {
-      _confidence = 'low';
+      confidence = 'low';
       console.warn(
         `[Algolia] LOW CONFIDENCE for "${trimmed}": ${reasons.join('; ')} ` +
-        `(top_sku=${top?.hit?.sku || '?'} ratio=${_topRatio.toFixed(2)} spec=${top?.spec ?? 0})`
+          `(top_sku=${top?.hit?.sku || '?'} ratio=${Number(topTermRatio).toFixed(2)} spec=${top?.spec ?? 0})`
       );
     }
 
     if (specTokens.length > 0) {
       console.log(`[Algolia] spec tokens detected: ${JSON.stringify(specTokens)}`);
     }
-    if (_reranked) {
-      // Track each top-3 movement explicitly so audits can confirm WHY a
-      // demoted product is no longer rank 1.
+    if (reranked) {
       for (let i = 0; i < newTop3.length; i++) {
         const sku = newTop3[i];
         const prev = originalTop3.indexOf(sku);
         if (prev !== -1 && prev !== i) {
-          console.log(
-            `[Algolia] Business-signal rerank moved sku=${sku} from pos=${prev + 1} → pos=${i + 1}`
-          );
+          console.log(`[Algolia] Business-signal rerank moved sku=${sku} from pos=${prev + 1} → pos=${i + 1}`);
         }
       }
     }
-    if (specTokens.length > 0 || _reranked || _confidence !== 'high') {
+    if (specTokens.length > 0 || reranked || confidence !== 'high' || rescued > 0) {
       console.log(`[Algolia] post-rerank top 5:`);
-      scored.slice(0, 5).forEach((s, i) => {
+      finalScored.slice(0, 5).forEach((s, i) => {
         console.log(
-          `  ${i + 1}. score=${s.score} (spec=${s.spec} biz=${s.biz} term=${s.term} dim=${s.dim} ratio=${s.ratio.toFixed(2)}) sku=${s.hit.sku} title="${(s.hit.title || "").slice(0, 80)}"`
+          `  ${i + 1}. score=${s.score} (spec=${s.spec} biz=${s.biz} term=${s.term} dim=${s.dim} cat=${s.cat} brand=${s.brand} ratio=${Number(s.ratio).toFixed(2)}) sku=${s.hit.sku} title="${String(s.hit.title || '').slice(0, 80)}"`
         );
       });
     }
-  }
 
-  if (hits.length === 0) {
+    if (_DEBUG_SEARCH) {
+      console.log(`[AlgoliaDiag] ranked list (${finalHits.length} of ${scored.length} scored) for query="${trimmed}":`);
+      finalHits.forEach((h, i) => {
+        const price = h.variants_min_price ?? h.price ?? '?';
+        console.log(`  ${i + 1}. sku=${h.sku || '?'} price=${price} title="${String(h.title || '').slice(0, 90)}"`);
+      });
+      const h0 = finalHits[0];
+      console.log(`[AlgoliaDiag] hit[0] product_image="${String(h0?.product_image || '').substring(0, 80)}"`);
+      console.log(`[AlgoliaDiag] hit[0] objectID=${h0?.objectID} id=${h0?.id} has_variants=${Array.isArray(h0?.variants) ? h0.variants.length : 'none'}`);
+    }
+
+    // ---- Variant IDs (only for the shown hits) ------------------------------
+    const skipVariants = variantsOnlyIfHigh && confidence !== 'high';
+    const needsLookup = skipVariants
+      ? []
+      : finalHits.filter((h) => h.handle && !(Array.isArray(h.variants) && h.variants[0]?.id)).map((h) => h.handle);
+    const variantMap = needsLookup.length > 0 ? await fetchVariantIdsByHandles(needsLookup, shopDomain) : new Map();
+
+    const host = resolveStorefrontHost(shopDomain);
+    const products = finalHits.map((hit) => hitToProduct(hit, variantMap, host, skipVariants));
+
+    if (!skipVariants) _cacheSet(cacheKey, { products, confidence, topTermRatio, nbHits });
+
     console.log(
-      `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=0 latency_ms=${Date.now() - _t0} top_sku="" top_vendor="" reranked=false`
+      `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=${products.length} latency_ms=${Date.now() - t0} top_sku=${JSON.stringify(products[0]?.sku || '')} top_vendor=${JSON.stringify(products[0]?.vendor || '')} reranked=${reranked} confidence=${confidence} pool=${hits.length} rescued=${rescued}`
     );
-    return null;
+
+    return { status: 'ok', products, confidence, topTermRatio, requestedBrand, nbHits };
+  } catch (err) {
+    console.error(`[Algolia] unexpected error for "${query}": ${err?.stack || err}`);
+    return { ...base, status: 'error', confidence: 'error' };
   }
+}
 
-  _vlog(`[Algolia] ${hits.length} results for "${trimmed}"`);
-
-  // Verbose ranked list is opt-in via DEBUG_SEARCH=1 to keep production logs lean.
-  if (_DEBUG_SEARCH && hits.length > 0) {
-    console.log(`[AlgoliaDiag] full ranked list (${hits.length} hits) for query="${trimmed}":`);
-    hits.forEach((h, i) => {
-      const price = h.variants_min_price ?? h.price ?? "?";
-      console.log(
-        `  ${i + 1}. sku=${h.sku || "?"} price=${price} title="${(h.title || "").slice(0, 90)}"`
-      );
-    });
-    const h = hits[0];
-    console.log(`[AlgoliaDiag] hit[0] product_image="${(h.product_image || "").substring(0, 80)}"`);
-    console.log(`[AlgoliaDiag] hit[0] objectID=${h.objectID} id=${h.id} has_variants=${Array.isArray(h.variants) ? h.variants.length : "none"}`);
-  }
-
-  // Short-circuit: only call Storefront for hits that don't already carry
-  // a usable variant id from Algolia. Most hits in this index are
-  // product-level (no variants[]), but some have it — skip the round trip
-  // when we can. Skipping the lookup entirely also avoids the 10x token
-  // mint storm that motivated Bug 2.
-  const needsLookup = hits
-    .filter((h) => h.handle && !(Array.isArray(h.variants) && h.variants[0]?.id))
-    .map((h) => h.handle);
-  const variantMap = needsLookup.length > 0
-    ? await fetchVariantIdsByHandles(needsLookup, shopDomain)
-    : new Map();
-
-  // Was hardcoded to the UAE store, which sent Saudi-store customers to the
-  // wrong country's product pages. Prefer an explicit env var, then the shop
-  // domain this request was made for.
-  // Set STOREFRONT_HOST per deployment (e.g. www.creativeautomation.ae /
-  // the Saudi domain). The *.myshopify.com admin domain is never used for
-  // customer-facing links.
-  const _shopHost = shopDomain ? String(shopDomain).replace(/^https?:\/\//, '').replace(/\/$/, '') : null;
-  const STOREFRONT_HOST =
-    process.env.STOREFRONT_HOST ||
-    (_shopHost && !_shopHost.endsWith('.myshopify.com') ? _shopHost : null) ||
-    'www.creativeautomation.ae';
-
-  const products = hits.map((hit) => {
-    const rawId = hit.objectID || hit.id || '';
-    const productId = String(rawId).startsWith('gid://')
-      ? rawId
-      : `gid://shopify/Product/${rawId}`;
-
-    // IMAGE (v3.1 FIX): Reject literal string "undefined" or "null" in addition to
-    // falsy values. Some Algolia records have product_image = "undefined" (string).
-    const imageUrl =
-      (isValidImageUrl(hit.product_image) ? hit.product_image : null) ||
-      (hit.image && typeof hit.image === 'object' && isValidImageUrl(hit.image.src)
-        ? hit.image.src : null) ||
-      (isValidImageUrl(hit.image) ? hit.image : null) ||
-      (isValidImageUrl(hit.featured_image) ? hit.featured_image : null) ||
-      (Array.isArray(hit.images) && isValidImageUrl(hit.images[0]) ? hit.images[0] : null) ||
-      null;
-
-    // PRICE: integer in AED (e.g. 4437), NOT cents
-    const rawPrice = hit.variants_min_price ?? hit.price ?? null;
-    const currency = hit.currency_code || 'AED';
-    const price = rawPrice != null
-      ? `${parseFloat(String(rawPrice)).toFixed(2)} ${currency}`
-      : null;
-
-    // VARIANT ID: prefer Algolia's own variant if present, else Storefront lookup.
-    const algoliaVariant = Array.isArray(hit.variants) ? hit.variants[0] : null;
-    const algoliaVariantRawId = algoliaVariant?.id;
-    const algoliaVariantId = algoliaVariantRawId != null
-      ? (String(algoliaVariantRawId).startsWith('gid://')
-          ? String(algoliaVariantRawId)
-          : `gid://shopify/ProductVariant/${algoliaVariantRawId}`)
-      : null;
-    const variantInfo = hit.handle ? variantMap.get(hit.handle) : null;
-    const variantId = algoliaVariantId || variantInfo?.variantId || null;
-    const variantSku =
-      algoliaVariant?.sku || variantInfo?.variantSku || hit.sku || null;
-
-    // DESCRIPTION
-    const rawDesc = hit.body_html_safe || hit.body_html || '';
-    const description = typeof rawDesc === 'string'
-      ? rawDesc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500)
-      : '';
-
-    const result = {
-      id: productId,
-      title: hit.title || 'Untitled Product',
-      handle: hit.handle || null,
-      vendor: hit.vendor || null,
-      image_url: imageUrl,
-      url: hit.handle
-        ? `https://${STOREFRONT_HOST}/products/${hit.handle}`
-        : null,
-      price,
-      description,
-      variant_id: variantId,
-      merchandise_id: variantId,
-      sku: variantSku,
-    };
-
-    if (!imageUrl) {
-      console.warn(`[Algolia] No image for "${hit.title}" — product_image=${hit.product_image}`);
-    }
-    if (!variantId) {
-      console.warn(`[Algolia] No variant_id for "${hit.title}" handle="${hit.handle}"`);
-    }
-
-    return result;
-  });
-
-  _cacheSet(cacheKey, products, _confidence);
-
-  console.log(
-    `[SearchAudit] q=${JSON.stringify(trimmed)} tier=algolia filters=${JSON.stringify(filters || '')} n=${products.length} latency_ms=${Date.now() - _t0} top_sku=${JSON.stringify(products[0]?.sku || '')} top_vendor=${JSON.stringify(products[0]?.vendor || '')} reranked=${_reranked} confidence=${_confidence}`
-  );
-
-  return { products, confidence: _confidence, topTermRatio: _topRatio, requestedBrand };
+// v3-compatible wrapper: null when nothing usable.
+export async function algoliaSearch(query, options = {}) {
+  const r = await algoliaSearchDetailed(query, options);
+  if (!r || r.status !== 'ok' || !Array.isArray(r.products) || r.products.length === 0) return null;
+  return {
+    products: r.products,
+    confidence: r.confidence,
+    topTermRatio: r.topTermRatio,
+    requestedBrand: r.requestedBrand,
+  };
 }
 
 // Exported for unit tests only — not part of the public search surface.
@@ -911,6 +1016,7 @@ export const __internals = {
   extractSpecTokens,
   flattenStrongText,
   flattenWeakText,
+  flattenHitText,
   scoreHitBySpec,
   scoreHitByBusinessSignal,
   contentTerms,
@@ -919,4 +1025,84 @@ export const __internals = {
   scoreHitByCylinderDims,
   brandAppearsInHits,
   normVendor,
+  // v4
+  singular,
+  headNounOf,
+  leafCategory,
+  scoreHitByCategory,
+  categoryScoreForQuery,
+  routeVendorsInText,
+  AMBIGUOUS_VENDOR_KEYS,
 };
+
+// ---------------------------------------------------------------------------
+// Boot self-test with real catalogue records (logs only, never throws)
+// ---------------------------------------------------------------------------
+(function selfTestRerank() {
+  try {
+    const main = {
+      title: '3RT2015-1AB01-1AA0 - Siemens 3-Pole Contactor, 24 V Coil (7A)', vendor: 'Siemens',
+      tags: ['Automation & Control Gear', 'Contactors', 'Contactors & Auxiliary Contacts', 'Electrical Automation & Cables', 'Siemens Contactors'],
+    };
+    const acc = {
+      title: 'Siemens Contactor Accessories 3RT2934-5NB31', vendor: 'Siemens',
+      tags: ['Automation & Control Gear', 'Contactor Accessories', 'Contactors & Auxiliary Contacts', 'Electrical Automation & Cables', 'Siemens Contactor Accessories'],
+    };
+    const olr = {
+      title: '3RT2035-1AC20 - Siemens 3RT2 Contactor Overload Relay, 60000 mA 41000 mA (3P)', vendor: 'Siemens',
+      tags: ['Automation & Control Gear', 'Contactor Overload Relays', 'Contactors & Auxiliary Contacts', 'Electrical Automation & Cables', 'Siemens Contactor Overload Relays'],
+    };
+    const etaCb = {
+      title: 'Eta Electronic Circuit Breakers ESX10-TB-101-DC24V-12A-E', vendor: 'Eta',
+      tags: ['Circuit Breakers', 'Electrical Automation & Cables', 'Electronic Circuit Breakers', 'Eta Electronic Circuit Breakers', 'Fuses & Circuit Breakers'],
+    };
+    const eatonAcc = {
+      title: 'Eaton Circuit Breaker Accessories 29364', vendor: 'Eaton',
+      tags: ['Circuit Breaker Accessories', 'Circuit Breakers', 'Eaton Circuit Breaker Accessories', 'Electrical Automation & Cables', 'Fuses & Circuit Breakers'],
+    };
+    const smcNoTags = { title: 'Smc Pneumatic Cylinder Switches D-Z73', vendor: 'SMC' };
+    const vendors = new Set(['siemens', 'delta', 'block', 'abb']);
+    const vmap = new Map([
+      ['siemens', new Set(['Siemens'])],
+      ['delta', new Set(['Delta'])],
+      ['block', new Set(['Block'])],
+      ['abb', new Set(['ABB', 'Abb'])],
+    ]);
+
+    const cases = [
+      ['main contactor ranks up', () => categoryScoreForQuery(main, 'contactor'), CATEGORY_MATCH_BONUS],
+      ['contactor accessories sink', () => categoryScoreForQuery(acc, 'contactor'), -CATEGORY_SUBPART_PENALTY],
+      ['overload relays sink for "contactor"', () => categoryScoreForQuery(olr, 'contactor'), -CATEGORY_SUBPART_PENALTY],
+      ['breaker ranks up', () => categoryScoreForQuery(etaCb, 'circuit breaker'), CATEGORY_MATCH_BONUS],
+      ['breaker accessories sink', () => categoryScoreForQuery(eatonAcc, 'circuit breaker'), -CATEGORY_SUBPART_PENALTY],
+      ['cylinder switches sink (title fallback)', () => categoryScoreForQuery(smcNoTags, 'pneumatic cylinder'), -CATEGORY_SUBPART_PENALTY],
+      ['asking for accessories flips it', () => categoryScoreForQuery(acc, 'contactor accessories'), CATEGORY_MATCH_BONUS],
+      ['accessory penalty covers the plural', () => scoreHitByBusinessSignal({ title: 'Siemens Contactor Accessories 3RT2934-5NB31' }), -300],
+      ['head noun before a preposition', () => headNounOf('variable frequency drive for pump'), 'drive'],
+      ['"star delta timer" keeps Delta as text', () => routeVendorsInText('star delta timer', vendors, vmap, null).matched.length, 0],
+      ['"terminal block" keeps Block as text', () => routeVendorsInText('terminal block', vendors, vmap, null).matched.length, 0],
+      ['Delta routes when named as the brand', () => routeVendorsInText('delta vfd', vendors, vmap, 'Delta').remainder, 'vfd'],
+      ['vendor strip keeps SKU punctuation', () => routeVendorsInText('Siemens 3RT2015-1AB01 contactor', vendors, vmap, 'Siemens').remainder, '3RT2015-1AB01 contactor'],
+      ['brand-only query', () => routeVendorsInText('ABB', vendors, vmap, 'ABB').remainder, ''],
+    ];
+
+    const failures = [];
+    for (const [name, fn, expected] of cases) {
+      try {
+        const got = fn();
+        if (JSON.stringify(got) !== JSON.stringify(expected)) {
+          failures.push(`  FAIL ${name}: got ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`);
+        }
+      } catch (err) {
+        failures.push(`  FAIL ${name}: threw ${err.message}`);
+      }
+    }
+    if (failures.length) {
+      console.error(`[Algolia] v4.0 rerank self-test FAILED:\n${failures.join('\n')}`);
+    } else {
+      console.log(`[Algolia] v4.0 rerank self-test passed (${cases.length} cases)`);
+    }
+  } catch (err) {
+    console.error(`[Algolia] v4.0 rerank self-test crashed: ${err.message}`);
+  }
+})();
