@@ -1,60 +1,65 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v2.5
+ * Chat API Route — v2.6 (1 Oct 2026)
  *
- * CHANGES (v2.5 — Sep 29, 2026) — fixes from the 28 Sep production logs:
- *   - UCP search_catalog failed with 422 "UCP discovery failed / profile_unreachable" because the
- *     agent profile URL sent in meta.ucp-agent.profile is not reachable. Now:
- *       · Claude's catalog searches fall back to the local pipeline (smartSearch: QueryIntel →
- *         Algolia → Admin → Storefront) when UCP fails.
- *       · A circuit breaker (services/catalog-fallback.server.js) skips UCP for UCP_BREAKER_MS
- *         (default 10 min) after a discovery/profile error, so searches stop burning ~4 s on retries.
- *       · While the breaker is open, the other UCP tools (cart/checkout/order/lookup) are hidden
- *         from Claude, because they fail the same way.
- *       · CATALOG_TOOL_MODE = auto (default) | local | ucp.
- *     Root-cause fix: host the agent profile (routes/ucp.agent-profile[.]json.jsx) and point
- *     UCP_AGENT_PROFILE at it.
- *   - Storefront last-resort results with no query-term overlap are no longer shown as cards
- *     ("switchgear" and "FRP" returned 10 unrelated products). Applies to the pre-pass and to
- *     the local fallback.
+ * CHANGES (v2.6) — from the 30 Sep logs and the router v6 / Algolia v4 release:
+ *   1. Relevance filter uses the router's corrected query (smart.effectiveQuery) instead of the raw
+ *      customer text. 30 Sep: the typo "switchgare" dropped 10/10 cards.
+ *   2. Router-guarded result types (algolia_category / algolia_multi / algolia_relaxed) skip the term
+ *      filter. The router already requires the product noun in each title; a term filter on
+ *      "switchgear" would hide every breaker/contactor card.
+ *   3. The "only accessories" downgrade is skipped when the customer asked for accessories.
+ *   4. catalog-fallback.server.js is optional: breaker, discovery-error and accessory checks have
+ *      inline fallbacks, and every call into it is try/catch-wrapped.
+ *   5. CATALOG_TOOL_MODE now defaults to "local": Claude's search_catalog runs through the tuned
+ *      local pipeline (smartSearch). "auto" = UCP first, local on failure (v2.5). "ucp" = UCP only.
+ *      When served locally, Claude sees a clean search_catalog schema (no UCP "meta" field).
+ *   6. If MCP returned no catalog tool (UCP down / connect timeout), a local search_catalog tool is
+ *      injected so Claude can still search.
+ *   7. Router hints (category mix, "we don't list the FRP version", …) now also reach Claude on the
+ *      tool path (_search_note), not just in the pre-pass SYSTEM NOTE.
+ *   8. Parallel catalog searches in one Claude response share one product grid (merged,
+ *      interleaved, ≤10) instead of the second grid replacing the first.
+ *   9. Per-turn search memo (identical queries reuse the result) and a per-turn search cap
+ *      (CHAT_MAX_CATALOG_SEARCHES, default 3).
+ *  10. All tool results for one assistant message go into ONE user message, and every tool_use
+ *      always gets a tool_result, even if the handler crashes.
+ *  11. Turn budget (CHAT_TURN_BUDGET_MS, default 60000): no new Claude call after it.
+ *  12. Empty-reply guard also covers "cards shown, but no text".
+ *  13. Defensive: SSE sends never throw; missing tool arrays, empty tool responses and invalid
+ *      history conversation_ids are handled; [ImageDebug] logs only with DEBUG_IMAGES=1.
  *
- * CHANGES (v2.4 — Sep 28, 2026):
- *   ADVISORY MODE (general enquiries — "suggest the right sensor for ...", "solution for ...")
- *   - services/advisory.server.js builds an [ADVISORY BRIEF] placed in the LAST user message
- *     (in memory only, never saved); the pre-pass searches the advisory query or is skipped;
- *     reply-length hints yield to the brief; deterministic fallback if Claude fails.
- *     Kill switch: ADVISORY_MODE=off.
- *   FIXES / HANDLING
- *   - SKU detector ignores IP ratings and supply specs; stored history parsed safely; history
- *     capped (CHAT_MAX_HISTORY, default 12); tool loop continues only on "tool_use"; empty-reply
- *     guard; request validation (400s, message cap, conversation_id sanitised, Origin "null");
- *     MCP servers connect in parallel (MCP_PARALLEL_CONNECT=0 to disable).
- *   OPT-IN HARDENING
- *   - APP_PROXY_SIGNATURE_MODE = off | log | enforce; ALLOWED_ORIGINS = CORS allowlist.
- *
- * CHANGES (v2.3 — May 1, 2026):
- *   - extractSearchQuery() supports { query } and { catalog: { query } }; never JSON.stringify.
- *   - [ImageDebug] log of raw MCP image fields; catalog tool input_schema keys log.
- *
- * CHANGES (v2.2 / v2.1 — April–May 2026):
- *   - Accept both legacy search_shop_catalog and current search_catalog.
+ * CHANGES (v2.5 / v2.5.1 — 29 Sep 2026):
+ *   - UCP circuit breaker + local fallback for search_catalog; hide other UCP tools while the
+ *     breaker is open; Storefront last-resort term filter; accessory-only flag; zero-result hint
+ *     keeps the customer's qualifiers.
+ * CHANGES (v2.4 — 28 Sep 2026):
+ *   - Advisory mode (kill switch ADVISORY_MODE=off); SKU detector skips IP ratings, supply specs and
+ *     M-thread sizes; safe stored-history parsing; history cap; tool loop only on "tool_use";
+ *     empty-reply guard; request validation; parallel MCP connect; APP_PROXY_SIGNATURE_MODE;
+ *     ALLOWED_ORIGINS.
+ * CHANGES (v2.1–v2.3):
+ *   - search_catalog + legacy search_shop_catalog; extractSearchQuery never JSON.stringify.
  */
 
-// Pre-search paths whose results may be off-target. For these the catalog
-// search tool stays available so Claude can recover / be honest.
+const CHAT_VERSION = "2.6";
+
+// Pre-search paths whose results may be off-target. For these the catalog search tool stays
+// available so Claude can recover / be honest. Router v6 types algolia_category, algolia_multi
+// and algolia_relaxed are HIGH on purpose (not listed).
 const LOW_CONFIDENCE_PATHS = new Set([
-  'sku_storefront_fallback',
-  'sku_nosep_fallback',
-  'storefront_search_last_resort',
-  'algolia_search_weak',      // relevance floor judged hits off-target
-  'algolia_brand_missing',    // customer asked for a brand we don't carry
+  "sku_storefront_fallback",
+  "sku_nosep_fallback",
+  "storefront_search_last_resort",
+  "algolia_search_weak",   // relevance floor judged hits off-target
+  "algolia_brand_missing", // customer asked for a brand we don't carry
 ]);
 
-const CATALOG_SEARCH_TOOL_NAMES = new Set([
-  "search_shop_catalog",
-  "search_catalog",
-  "search_products",
-]);
+// Router v6 already guarantees relevance for these (product noun in every title it keeps,
+// per-item honesty hints). The chat-side term filter must not run on them.
+const ROUTER_GUARDED_TYPES = new Set(["algolia_category", "algolia_multi", "algolia_relaxed"]);
+
+const CATALOG_SEARCH_TOOL_NAMES = new Set(["search_shop_catalog", "search_catalog", "search_products"]);
 
 function isCatalogSearchTool(toolName) {
   return CATALOG_SEARCH_TOOL_NAMES.has(String(toolName || "").toLowerCase());
@@ -67,8 +72,159 @@ function intEnv(name, fallback) {
 }
 const MAX_MESSAGE_CHARS = intEnv("CHAT_MAX_MESSAGE_CHARS", 4000);
 const MAX_HISTORY_MESSAGES = intEnv("CHAT_MAX_HISTORY", 12);
+const MAX_CATALOG_SEARCHES = intEnv("CHAT_MAX_CATALOG_SEARCHES", 3);
+const TURN_BUDGET_MS = intEnv("CHAT_TURN_BUDGET_MS", 60000);
 const ADVISORY_ENABLED = String(process.env.ADVISORY_MODE || "on").toLowerCase() !== "off";
+const DEBUG_IMAGES = process.env.DEBUG_IMAGES === "1";
 const MAX_CARDS = 10;
+const MAX_TOOL_LOOPS = 6;
+const SALES_EMAIL = "websales@creativeautomation.ae";
+
+/**
+ * CATALOG_TOOL_MODE:
+ *   local (default) — Claude's catalog searches run through smartSearch (router v6 + Algolia v4).
+ *   auto            — UCP first; local on UCP failure; circuit breaker after discovery errors.
+ *   ucp             — UCP only (no local fallback).
+ */
+function catalogToolMode() {
+  const raw = String(process.env.CATALOG_TOOL_MODE || "").trim().toLowerCase();
+  return raw === "auto" || raw === "ucp" || raw === "local" ? raw : "local";
+}
+
+// The customer explicitly asked for accessories / spares → don't flag accessory-only results.
+const ACCESSORY_QUERY_RE =
+  /\b(accessor(?:y|ies)|spares?|spare\s+parts?|brackets?|mounting|kits?|seals?|cables?|connectors?|sockets?|holders?|covers?)\b/i;
+const ACCESSORY_TITLE_RE = /\baccessor(?:y|ies)\b|\bspare\s+parts?\b|\bmounting\s+brackets?\b/i;
+
+// Clean catalog tool for local serving (no UCP "meta" argument to confuse Claude).
+const LOCAL_CATALOG_TOOL = {
+  name: "search_catalog",
+  description:
+    "Search the Creative Automation product catalogue. Pass a short product query (2-6 words, keep sizes, " +
+    "brand and type), or an exact part number on its own.",
+  input_schema: {
+    type: "object",
+    properties: {
+      catalog: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Product query or exact part number" },
+        },
+        required: ["query"],
+      },
+    },
+    required: ["catalog"],
+  },
+};
+
+// ─── catalog-fallback.server.js (optional) + inline fallbacks ───────────
+
+// Used when catalog-fallback.server.js is missing or doesn't export a usable breaker.
+const inlineUcpBreaker = {
+  openUntil: 0,
+  reason: null,
+  cooldownMs: intEnv("UCP_BREAKER_MS", 10 * 60 * 1000),
+  isOpen() {
+    return Date.now() < this.openUntil;
+  },
+  trip(reason) {
+    this.openUntil = Date.now() + this.cooldownMs;
+    this.reason = reason || "discovery error";
+  },
+};
+
+let _cfModule; // undefined = not loaded yet; null = unavailable
+async function loadCatalogFallback() {
+  if (_cfModule !== undefined) return _cfModule;
+  try {
+    _cfModule = await import("../services/catalog-fallback.server.js");
+  } catch (e) {
+    console.warn(`[Chat] catalog-fallback module unavailable (${e.message}) — using inline fallbacks`);
+    _cfModule = null;
+  }
+  return _cfModule;
+}
+
+function ucpBreaker(cf) {
+  const b = cf?.ucpBreaker;
+  return b && typeof b.isOpen === "function" && typeof b.trip === "function" ? b : inlineUcpBreaker;
+}
+function breakerIsOpen(cf) {
+  try {
+    return !!ucpBreaker(cf).isOpen();
+  } catch (e) {
+    return false;
+  }
+}
+function breakerTrip(cf, reason) {
+  try {
+    ucpBreaker(cf).trip(reason);
+  } catch (e) {
+    console.warn(`[Chat] breaker trip failed: ${e.message}`);
+  }
+}
+function breakerInfo(cf) {
+  const b = ucpBreaker(cf);
+  return {
+    reason: b.reason || "discovery error",
+    minutes: Math.max(1, Math.round((Number(b.cooldownMs) || 600000) / 60000)),
+  };
+}
+function isUcpDiscoveryError(cf, text) {
+  try {
+    if (typeof cf?.isUcpDiscoveryError === "function" && cf.isUcpDiscoveryError(text)) return true;
+  } catch (e) { /* fall through to the inline check */ }
+  return /profile_unreachable|UCP discovery failed|"code"\s*:\s*-32001|agent profile/i.test(String(text || ""));
+}
+function ucpErrorCode(cf, text) {
+  try {
+    if (typeof cf?.ucpErrorCode === "function") {
+      const c = cf.ucpErrorCode(text);
+      if (c) return String(c);
+    }
+  } catch (e) { /* fall through */ }
+  const m = /"code"\s*:\s*"([a-z_]+)"/i.exec(String(text || ""));
+  return m ? m[1] : String(text || "").slice(0, 160);
+}
+function isAccessoryTitle(cf, title) {
+  try {
+    if (typeof cf?.isAccessoryTitle === "function") return !!cf.isAccessoryTitle(title);
+  } catch (e) { /* fall through */ }
+  return ACCESSORY_TITLE_RE.test(String(title || ""));
+}
+
+/**
+ * Term filter + accessory check. Never throws; on any problem the products are returned unchanged.
+ *   query      — the CORRECTED query (router effectiveQuery), not the raw customer text
+ *   searchType — router result type; router-guarded types skip the term filter
+ */
+function refineSafely(cf, products, query, searchType) {
+  const list = Array.isArray(products) ? products : [];
+  const asksAccessories = ACCESSORY_QUERY_RE.test(String(query || ""));
+  const out = {
+    products: list,
+    dropped: 0,
+    terms: [],
+    accessoryOnly: !asksAccessories && list.length > 0 && list.every((p) => isAccessoryTitle(cf, p?.title)),
+  };
+  if (!list.length) return out;
+  if (ROUTER_GUARDED_TYPES.has(searchType) || typeof cf?.refineProducts !== "function") return out;
+  try {
+    const r = cf.refineProducts(list, query, searchType);
+    if (!r || !Array.isArray(r.products)) return out;
+    return {
+      products: r.products,
+      dropped: Number(r.dropped) || Math.max(0, list.length - r.products.length),
+      terms: Array.isArray(r.terms) ? r.terms : [],
+      accessoryOnly: !asksAccessories && !!r.accessoryOnly,
+    };
+  } catch (e) {
+    console.warn(`[Chat] refineProducts failed (${e.message}) — keeping results unfiltered`);
+    return out;
+  }
+}
+
+// ─── Small helpers ─────────────────────────────────────────────────────
 
 /**
  * Extract the plain-text query string from catalog search tool args.
@@ -78,25 +234,13 @@ const MAX_CARDS = 10;
  */
 function extractSearchQuery(toolArgs) {
   if (!toolArgs) return null;
-  if (toolArgs?.catalog?.query && typeof toolArgs.catalog.query === "string") {
-    return toolArgs.catalog.query.trim() || null;
-  }
-  if (toolArgs?.query && typeof toolArgs.query === "string") {
-    return toolArgs.query.trim() || null;
-  }
-  if (toolArgs?.searchQuery && typeof toolArgs.searchQuery === "string") {
-    return toolArgs.searchQuery.trim() || null;
-  }
-  if (toolArgs?.q && typeof toolArgs.q === "string") {
-    return toolArgs.q.trim() || null;
-  }
-  if (typeof toolArgs === "string") {
-    return toolArgs.trim() || null;
-  }
+  if (toolArgs?.catalog?.query && typeof toolArgs.catalog.query === "string") return toolArgs.catalog.query.trim() || null;
+  if (toolArgs?.query && typeof toolArgs.query === "string") return toolArgs.query.trim() || null;
+  if (toolArgs?.searchQuery && typeof toolArgs.searchQuery === "string") return toolArgs.searchQuery.trim() || null;
+  if (toolArgs?.q && typeof toolArgs.q === "string") return toolArgs.q.trim() || null;
+  if (typeof toolArgs === "string") return toolArgs.trim() || null;
   return null; // NEVER JSON.stringify
 }
-
-// ─── Small helpers ─────────────────────────────────────────────────────
 
 function safeHostname(urlLike) {
   try {
@@ -106,8 +250,10 @@ function safeHostname(urlLike) {
   }
 }
 
+const CONVERSATION_ID_RE = /^[\w.\-:]{1,128}$/;
+
 function normalizeConversationId(id) {
-  if (typeof id === "string" && /^[\w.\-:]{1,128}$/.test(id)) return id;
+  if (typeof id === "string" && CONVERSATION_ID_RE.test(id)) return id;
   const uuid = globalThis.crypto?.randomUUID?.();
   return `conv_${uuid || Date.now()}`;
 }
@@ -140,8 +286,46 @@ function capHistory(messages, max) {
 
 function errorText(err) {
   if (!err) return "";
-  const parts = [err.message, typeof err.data === "string" ? err.data : err.data ? JSON.stringify(err.data) : ""];
-  return parts.filter(Boolean).join(" ");
+  const data = typeof err.data === "string" ? err.data : err.data ? JSON.stringify(err.data) : "";
+  return [err.message, data].filter(Boolean).join(" ");
+}
+
+function normQueryKey(q) {
+  return String(q || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function productKey(p) {
+  return p?.id || p?.handle || p?.title || null;
+}
+
+function dedupeProducts(list) {
+  const seen = new Set();
+  const out = [];
+  for (const p of Array.isArray(list) ? list : []) {
+    const k = productKey(p);
+    if (!p || !k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(p);
+  }
+  return out;
+}
+
+/** Merge two result lists fairly (a1, b1, a2, b2, …), de-duplicated, capped. */
+function interleaveProducts(a, b, max) {
+  const out = [];
+  const seen = new Set();
+  const add = (p) => {
+    const k = productKey(p);
+    if (!p || !k || seen.has(k) || out.length >= max) return;
+    seen.add(k);
+    out.push(p);
+  };
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len && out.length < max; i++) {
+    add(a[i]);
+    add(b[i]);
+  }
+  return out;
 }
 
 /**
@@ -158,18 +342,18 @@ function detectSkuTokens(message) {
     const token = m[1].toUpperCase().replace(/\.$/, "");
     if (token.length < 4) continue;
     if (!/\d/.test(token) || !/[A-Z]/i.test(token)) continue;
-    // Skip pure electrical/spec tokens: "24VDC", "18MM", "24V", "100A", "5W"
+    // Pure electrical/spec tokens: "24VDC", "18MM", "24V", "100A", "5W"
     if (/^\d+(?:MM|CM|VDC|VAC|V|A|W|KW|HP)$/i.test(token)) continue;
-    // Skip dimension+unit tokens: "2INCH", "2IN", "3FT", "4FEET"
+    // Dimension+unit tokens: "2INCH", "2IN", "3FT", "4FEET"
     if (/^\d+(?:\.\d+)?(?:INCH|INCHES|IN|FT|FEET|FOOT|KM)$/i.test(token)) continue;
-    // Skip thread/pipe-standard tokens used as dimensions: "38NPT", "12BSP"
+    // Thread/pipe-standard tokens used as dimensions: "38NPT", "12BSP"
     if (/^\d+(?:NPT|BSP|BSPP|BSPT)$/i.test(token)) continue;
-    // Skip IP ratings ("IP69K", "IP67/IP69K") and supply specs ("24V-DC", "DC24V", "12-24VDC")
+    // IP ratings ("IP69K", "IP67/IP69K") and supply specs ("24V-DC", "DC24V", "12-24VDC")
     if (/^IP\d{2}K?(?:[-\/]IP\d{2}K?)*$/i.test(token)) continue;
     if (/^\d+(?:\.\d+)?V[-\/]?(?:DC|AC)$/i.test(token)) continue;
     if (/^(?:DC|AC)[-\/]?\d+(?:\.\d+)?V?$/i.test(token)) continue;
     if (/^\d+(?:\.\d+)?[-\/]\d+(?:\.\d+)?V(?:DC|AC)?$/i.test(token)) continue;
-    // Skip thread/body sizes ("M12X1", "M18X1.5")
+    // Thread/body sizes ("M12X1", "M18X1.5")
     if (/^M\d{1,2}X\d+(?:\.\d+)?$/i.test(token)) continue;
     if (seen.has(token)) continue;
     seen.add(token);
@@ -280,7 +464,14 @@ export async function loader({ request }) {
   if (url.searchParams.has("history") && url.searchParams.has("conversation_id")) {
     const sig = await checkAppProxySignature(request);
     if (!sig.allowed) return unauthorizedResponse(request);
-    return handleHistoryRequest(request, url.searchParams.get("conversation_id"));
+    const convId = url.searchParams.get("conversation_id");
+    if (!CONVERSATION_ID_RE.test(convId || "")) {
+      return new Response(JSON.stringify({ messages: [], error: "Invalid conversation_id" }), {
+        status: 400,
+        headers: getCorsHeaders(request),
+      });
+    }
+    return handleHistoryRequest(request, convId);
   }
 
   if (url.searchParams.has("stream") || request.headers.get("Accept")?.includes("text/event-stream")) {
@@ -289,10 +480,10 @@ export async function loader({ request }) {
     return handleChatRequest(request);
   }
 
-  return new Response(
-    JSON.stringify({ status: "ok", message: "Chat API is running" }),
-    { status: 200, headers: getCorsHeaders(request) }
-  );
+  return new Response(JSON.stringify({ status: "ok", message: "Chat API is running", version: CHAT_VERSION }), {
+    status: 200,
+    headers: getCorsHeaders(request),
+  });
 }
 
 export async function action({ request }) {
@@ -309,7 +500,7 @@ async function handleHistoryRequest(request, conversationId) {
     const dbMod = await import("../db.server");
     const messages = await dbMod.getConversationHistory(conversationId);
 
-    const cleanedMessages = messages.map((msg) => {
+    const cleanedMessages = (Array.isArray(messages) ? messages : []).map((msg) => {
       let parsedContent = msg.content;
       try {
         const parsed = JSON.parse(msg.content);
@@ -321,13 +512,13 @@ async function handleHistoryRequest(request, conversationId) {
     });
 
     return new Response(JSON.stringify({ messages: cleanedMessages }), {
-      headers: { ...getCorsHeaders(request), "Content-Type": "application/json" }
+      headers: { ...getCorsHeaders(request), "Content-Type": "application/json" },
     });
   } catch (error) {
     console.error("Error fetching history:", error);
-    return new Response(JSON.stringify({ messages: [], error: error.message }), {
+    return new Response(JSON.stringify({ messages: [], error: "Could not load history" }), {
       status: 500,
-      headers: { ...getCorsHeaders(request), "Content-Type": "application/json" }
+      headers: { ...getCorsHeaders(request), "Content-Type": "application/json" },
     });
   }
 }
@@ -354,7 +545,7 @@ async function handleChatRequest(request) {
     const visitorId = body.visitor_id;
     const fingerprintId = body.fingerprint_id;
     const conversationId = normalizeConversationId(body.conversation_id);
-    const promptType = body.prompt_type || "standardAssistant";
+    const promptType = typeof body.prompt_type === "string" && body.prompt_type ? body.prompt_type : "standardAssistant";
 
     const dbMod = await import("../db.server");
     const { saveMessage, getConversationHistory, storeCustomerAccountUrls, getCustomerAccountUrls: getCustomerAccountUrlsFromDb } = dbMod;
@@ -379,7 +570,7 @@ async function handleChatRequest(request) {
     if (!shopDomain) console.warn("[Chat] Could not resolve shop domain from request");
 
     const trackingId = visitorId || fingerprintId || conversationId;
-    try { ChatEvents.messageSent(trackingId, { conversationId, shopDomain, messageLength: userMessage.length }); } catch (e) {}
+    try { ChatEvents?.messageSent?.(trackingId, { conversationId, shopDomain, messageLength: userMessage.length }); } catch (e) {}
 
     const responseStream = createSseStream(async (stream) => {
       await handleChatSession({
@@ -392,123 +583,208 @@ async function handleChatRequest(request) {
     return new Response(responseStream, { headers: getSseHeaders(request) });
   } catch (error) {
     console.error("Error in chat request handler:", error);
-    return new Response(JSON.stringify({ error: "Internal server error", message: error.message }), {
-      status: 500, headers: getCorsHeaders(request)
+    return new Response(JSON.stringify({ error: "Internal server error" }), {
+      status: 500,
+      headers: getCorsHeaders(request),
     });
   }
 }
 
 async function handleChatSession({ request, userMessage, conversationId, promptType, stream, visitorId, fingerprintId, shopDomain, helpers }) {
   const startTime = Date.now();
-  const MAX_TOOL_LOOPS = 6;
-
   const { saveMessage, getConversationHistory, getCustomerAccountUrlsFromDb, storeCustomerAccountUrls, ChatEvents, createClaudeService, createToolService, MCPClient } = helpers;
 
-  stream.sendMessage({ type: "id", conversation_id: conversationId });
-  console.log(`[Chat] New request | conversation=${conversationId} | shop=${shopDomain}`);
+  // SSE sends must never throw (the client may have gone away).
+  const send = (msg) => {
+    try {
+      stream.sendMessage(msg);
+    } catch (e) { /* client disconnected */ }
+  };
+  const track = (fn, data) => {
+    try { ChatEvents?.[fn]?.(visitorId || fingerprintId || conversationId, data); } catch (e) {}
+  };
+
+  send({ type: "id", conversation_id: conversationId });
+  console.log(`[Chat] New request | conversation=${conversationId} | shop=${shopDomain} | v${CHAT_VERSION}`);
 
   if (!process.env.ANTHROPIC_API_KEY) {
     console.error("[Chat] ANTHROPIC_API_KEY missing");
-    stream.sendMessage({ type: "error", error: "Anthropic API key not configured." });
+    send({ type: "error", error: "Anthropic API key not configured." });
     return;
   }
 
-  const claudeService = createClaudeService();
-  const toolService = createToolService();
-
-  let mcpApiUrl = null;
-  try {
-    const urlResult = await Promise.race([
-      getCustomerAccountUrls(shopDomain, conversationId, { getCustomerAccountUrlsFromDb, storeCustomerAccountUrls }),
-      new Promise((resolve) => setTimeout(() => resolve({ mcpApiUrl: null }), 5000)),
-    ]);
-    mcpApiUrl = urlResult.mcpApiUrl;
-  } catch (e) { console.warn("[Chat] Failed to get customer account URLs:", e.message); }
-
-  const mcpClient = new MCPClient(shopDomain, conversationId, null, mcpApiUrl);
-
-  // Hoisted so the catch block can see them.
+  // ── Per-turn state (hoisted so the catch block can see it) ──────────
   let productsSentToFrontend = false;
-  let advisory = null;      // result of analyzeEnquiry(), or null for normal enquiries
+  let advisory = null;      // analyzeEnquiry() result, or null for normal enquiries
   let advisoryMod = null;   // services/advisory.server.js
-  let cf = null;            // services/catalog-fallback.server.js
-  let catalogMode = "auto";
   let fullResponseText = "";
+  let loopCount = 0;        // 0 = pre-pass, 1..n = Claude calls
+  let catalogSearches = 0;
+  let localCatalogTool = false; // Claude's search_catalog is served locally this turn
+  let gridLoop = -1;            // loop that produced the products currently shown
+  let gridProducts = [];
+  const localSearchMemo = new Map();
+
+  const cf = await loadCatalogFallback();
+  const catalogMode = catalogToolMode();
 
   const getAdvisoryFallback = () => {
     try {
       return advisory && advisoryMod?.buildAdvisoryFallback ? advisoryMod.buildAdvisoryFallback(advisory) : "";
-    } catch (e) { return ""; }
+    } catch (e) {
+      return "";
+    }
   };
 
   const sendFallbackText = (text) => {
     fullResponseText += text;
-    stream.sendMessage({ type: "chunk", chunk: text });
-    stream.sendMessage({ type: "message_complete" });
-    saveMessage(conversationId, "assistant", text, { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
-      .catch((err) => console.error("[Chat] Error saving fallback message:", err.message));
+    send({ type: "chunk", chunk: text });
+    send({ type: "message_complete" });
+    Promise.resolve(
+      saveMessage(conversationId, "assistant", text, { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
+    ).catch((err) => console.error("[Chat] Error saving fallback message:", err?.message));
   };
 
-  // Tool-result hints (shared by the UCP path and the local fallback path).
-  // v2.5.1: flags accessory-only results; the zero-result hint forbids switching product category
-  // or dropping the customer's key qualifier (29 Sep logs: switchgear → circuit breaker accessories,
-  // FRP enclosure → metal enclosures).
-  const buildStopHint = (products, lowConfidence = false) => {
-    const accessoryOnly =
-      !!cf?.isAccessoryTitle && products.length > 0 && products.every((p) => cf.isAccessoryTitle(p?.title));
-    return JSON.stringify({
-      products: products.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
-      total_count: products.length,
+  /**
+   * Show product cards. Searches made inside the same Claude response (parallel tool calls) are
+   * merged into one grid; a later Claude call or the pre-pass replaces it.
+   */
+  const showProducts = (products, { merge = false } = {}) => {
+    const list = dedupeProducts(products);
+    if (!list.length) return [];
+    const shown =
+      merge && gridLoop === loopCount && gridProducts.length
+        ? interleaveProducts(gridProducts, list, MAX_CARDS)
+        : list.slice(0, MAX_CARDS);
+    gridLoop = loopCount;
+    gridProducts = shown;
+    send({ type: "product_results", products: shown });
+    productsSentToFrontend = true;
+    return shown;
+  };
+
+  // ── Tool-result hints (shared by the UCP path and the local path) ───
+  const buildStopHint = (shown, { lowConfidence = false, accessoryOnly = false, searchNote = "" } = {}) =>
+    JSON.stringify({
+      products: shown.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
+      total_count: shown.length,
+      ...(searchNote ? { _search_note: String(searchNote).slice(0, 800) } : {}),
       _display_note:
         (accessoryOnly
           ? "IMPORTANT: every result is an ACCESSORY or spare part (see the titles), not a main product. If the customer asked for the main product, say plainly that these are accessories and do not present them as the product itself. "
           : lowConfidence
             ? "These results may NOT fully match the request: compare the titles with what the customer asked and be honest about any mismatch. "
             : "") +
+        (searchNote ? "Follow _search_note: it says exactly what these cards are. " : "") +
         (advisory
-          ? `${products.length} product card(s) are now displayed to the user. Do NOT search again. Now write your reply in the REPLY FORMAT from the ADVISORY BRIEF (it overrides the one-short-response rule).`
-          : `${products.length} product card(s) are now displayed to the user. Do NOT search again. Write one short response acknowledging the results.`),
+          ? `${shown.length} product card(s) are now displayed to the user. Do NOT search again. Now write your reply in the REPLY FORMAT from the ADVISORY BRIEF (it overrides the one-short-response rule).`
+          : `${shown.length} product card(s) are now displayed to the user. Do NOT search again. Write one short response acknowledging the results.`),
     });
-  };
 
   const buildZeroHint = (searchQuery) =>
     JSON.stringify({
       products: [],
       total_count: 0,
       _system_hint: advisory
-        ? `Zero products found for "${searchQuery}". Do NOT search again. Write your reply in the REPLY FORMAT from the ADVISORY BRIEF, say no matching products were found in the catalogue for now, and offer websales@creativeautomation.ae.`
-        : `Zero products found for "${searchQuery}". You may try ONE more search only for the SAME product with corrected spelling, keeping every key qualifier the customer gave (material, brand, type — e.g. keep "FRP"). Do NOT search for a different product category and do not offer products from other categories as a match. If still zero, tell the customer we don't currently list this item on the website and offer websales@creativeautomation.ae for sourcing or a quote.`,
+        ? `Zero products found for "${searchQuery}". Do NOT search again. Write your reply in the REPLY FORMAT from the ADVISORY BRIEF, say no matching products were found in the catalogue for now, and offer ${SALES_EMAIL}.`
+        : `Zero products found for "${searchQuery}". You may try ONE more search only for the SAME product with corrected spelling, keeping every key qualifier the customer gave (material, brand, type — e.g. keep "FRP"). Do NOT search for a different product category and do not offer products from other categories as a match. If still zero, tell the customer we don't currently list this item on the website (never that we don't supply it) and offer ${SALES_EMAIL} for sourcing or a quote.`,
     });
 
-  /** Serve a catalog search from our own pipeline (used when UCP is unavailable). */
-  const runLocalCatalogSearch = async (query, reason) => {
-    const t0 = Date.now();
-    try {
-      const { smartSearch } = await import("../services/search-router.server.js");
-      const smart = await smartSearch(query, shopDomain, []);
-      let products = Array.isArray(smart?.products) ? smart.products : [];
-      const searchType = smart?.searchType || "none";
-      let accessoryOnly = false;
-      if (products.length && cf?.refineProducts) {
-        const before = products.length;
-        const r = cf.refineProducts(products, query, searchType);
-        if (r.dropped > 0) {
-          console.log(`[Chat] Relevance filter (${searchType}) dropped ${r.dropped}/${before} for "${query}" (terms: ${r.terms.join(",")})`);
+  const buildLimitHint = () =>
+    JSON.stringify({
+      products: [],
+      total_count: 0,
+      _system_hint: `Search limit reached for this message. Do NOT search again. Answer with what is already shown; for anything not found, say it isn't listed on the website and offer ${SALES_EMAIL}.`,
+    });
+
+  /** Serve a catalog search from our own pipeline. Identical queries in one turn share the result. */
+  const runLocalCatalogSearch = (query, reason) => {
+    const key = normQueryKey(query);
+    if (localSearchMemo.has(key)) {
+      console.log(`[Chat] Local catalog search memo hit for "${query}"`);
+      return localSearchMemo.get(key);
+    }
+    const job = (async () => {
+      const t0 = Date.now();
+      try {
+        const { smartSearch } = await import("../services/search-router.server.js");
+        const smart = await smartSearch(query, shopDomain, []);
+        const searchType = smart?.searchType || "none";
+        const effective = smart?.effectiveQuery || smart?.query || query;
+        let products = Array.isArray(smart?.products) ? smart.products : [];
+        let accessoryOnly = false;
+        if (products.length) {
+          const before = products.length;
+          const r = refineSafely(cf, products, effective, searchType);
+          if (r.dropped > 0) {
+            console.log(`[Chat] Relevance filter (${searchType}) dropped ${r.dropped}/${before} for "${effective}" (terms: ${r.terms.join(",")})`);
+          }
+          if (r.accessoryOnly) console.log(`[Chat] Only accessories found for "${query}" — flagged to Claude`);
+          products = r.products;
+          accessoryOnly = r.accessoryOnly;
         }
-        if (r.accessoryOnly) console.log(`[Chat] Only accessories found for "${query}" — flagged to Claude`);
-        products = r.products;
-        accessoryOnly = r.accessoryOnly;
+        products = products.slice(0, MAX_CARDS);
+        console.log(`[Chat] Local catalog search (${reason}) q="${query}" → ${products.length} products (${searchType}) | ${Date.now() - t0}ms`);
+        return {
+          products,
+          searchType,
+          accessoryOnly,
+          lowConfidence: LOW_CONFIDENCE_PATHS.has(searchType) || accessoryOnly,
+          searchNote: products.length ? smart?.systemHint || "" : "",
+        };
+      } catch (e) {
+        console.warn(`[Chat] Local catalog search failed (${reason}) q="${query}": ${e.message}`);
+        return { products: [], searchType: "error", accessoryOnly: false, lowConfidence: true, searchNote: "" };
       }
-      products = products.slice(0, MAX_CARDS);
-      console.log(`[Chat] Local catalog search (${reason}) q="${query}" → ${products.length} products (${searchType}) | ${Date.now() - t0}ms`);
-      return { products, searchType, accessoryOnly, lowConfidence: LOW_CONFIDENCE_PATHS.has(searchType) || accessoryOnly };
-    } catch (e) {
-      console.warn(`[Chat] Local catalog search failed (${reason}) q="${query}": ${e.message}`);
-      return { products: [], searchType: "error", lowConfidence: true };
+    })();
+    localSearchMemo.set(key, job);
+    return job;
+  };
+
+  let conversationHistory = [];
+  let currentAssistantMessage = null;
+
+  // Push the pending assistant message (with its tool_use blocks) before any tool_result.
+  const flushAssistant = () => {
+    if (currentAssistantMessage) {
+      conversationHistory.push({ role: currentAssistantMessage.role, content: currentAssistantMessage.content });
+      currentAssistantMessage = null;
+    }
+  };
+  // All tool_results answering one assistant message go into ONE user message.
+  const pushToolResult = (block) => {
+    const last = conversationHistory[conversationHistory.length - 1];
+    if (
+      last &&
+      last.role === "user" &&
+      Array.isArray(last.content) &&
+      last.content.length > 0 &&
+      last.content.every((b) => b?.type === "tool_result")
+    ) {
+      last.content.push(block);
+    } else {
+      conversationHistory.push({ role: "user", content: [block] });
     }
   };
 
   try {
+    // ── Customer account URLs (5 s cap) ─────────────────────────────
+    let mcpApiUrl = null;
+    try {
+      const urlResult = await Promise.race([
+        getCustomerAccountUrls(shopDomain, conversationId, { getCustomerAccountUrlsFromDb, storeCustomerAccountUrls }),
+        new Promise((resolve) => setTimeout(() => resolve({ mcpApiUrl: null }), 5000)),
+      ]);
+      mcpApiUrl = urlResult?.mcpApiUrl || null;
+    } catch (e) {
+      console.warn("[Chat] Failed to get customer account URLs:", e.message);
+    }
+
+    const claudeService = createClaudeService();
+    const toolService = createToolService();
+    const mcpClient = new MCPClient(shopDomain, conversationId, null, mcpApiUrl);
+
+    // ── MCP connect (parallel, 8 s cap) ─────────────────────────────
     let storefrontMcpTools = [], customerMcpTools = [], ucpMcpTools = [];
     try {
       const connectStart = Date.now();
@@ -527,62 +803,63 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       } else {
         console.warn("[Chat] MCP connect timed out after 8000ms");
       }
-      const allMcpTools = [...ucpMcpTools, ...storefrontMcpTools, ...customerMcpTools];
-      console.log(`Connected to MCP: ${allMcpTools.length} tools`);
-
-      const catalogTool = allMcpTools.find((t) => isCatalogSearchTool(t.name));
-      if (catalogTool) {
-        console.log(`[Chat] MCP catalog-search tool: "${catalogTool.name}"`);
-        console.log(`[Chat] catalog tool input_schema keys: [${Object.keys(catalogTool.input_schema?.properties || {}).join(", ")}]`);
-      } else {
-        console.warn(`[Chat] WARNING: No catalog-search tool found. Available: ${allMcpTools.map((t) => t.name).join(", ")}`);
-      }
     } catch (error) {
       console.warn("[Chat] MCP connection failed:", error.message);
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // CATALOG FALLBACK (v2.5): local search + UCP circuit breaker.
-    // If the module fails to load, everything behaves as v2.4.
-    // ───────────────────────────────────────────────────────────────────
-    try {
-      cf = await import("../services/catalog-fallback.server.js");
-      catalogMode = cf.catalogToolMode();
-    } catch (e) {
-      console.warn(`[Chat] catalog-fallback module unavailable: ${e.message}`);
-      cf = null;
+    // Tool arrays must always be arrays from here on.
+    mcpClient.tools = Array.isArray(mcpClient.tools) ? mcpClient.tools : [];
+    mcpClient.ucpTools = Array.isArray(mcpClient.ucpTools) ? mcpClient.ucpTools : [];
+    mcpClient.storefrontTools = Array.isArray(mcpClient.storefrontTools) ? mcpClient.storefrontTools : [];
+    console.log(`Connected to MCP: ${mcpClient.tools.length} tools`);
+
+    const mcpCatalogTool = mcpClient.tools.find((t) => isCatalogSearchTool(t?.name));
+    if (mcpCatalogTool) {
+      console.log(`[Chat] MCP catalog-search tool: "${mcpCatalogTool.name}"`);
+      console.log(`[Chat] catalog tool input_schema keys: [${Object.keys(mcpCatalogTool.input_schema?.properties || {}).join(", ")}]`);
     }
 
-    if (cf && catalogMode !== "ucp" && cf.ucpBreaker.isOpen()) {
-      // UCP rejects every call while the agent profile is broken: hide the non-search UCP tools
-      // so Claude doesn't try carts/checkout/lookup. Catalog search is served locally.
-      const otherNames = new Set([...storefrontMcpTools, ...customerMcpTools].map((t) => t.name));
+    // ── Catalog serving decision ────────────────────────────────────
+    const ucpOpen = breakerIsOpen(cf);
+    if (catalogMode !== "ucp" && ucpOpen) {
+      // UCP rejects every call while the agent profile is broken: hide the non-search UCP tools.
+      const otherNames = new Set([...storefrontMcpTools, ...customerMcpTools].map((t) => t?.name));
       const hidden = new Set(
-        (mcpClient.ucpTools || [])
-          .filter((t) => !isCatalogSearchTool(t.name) && !otherNames.has(t.name))
-          .map((t) => t.name)
+        mcpClient.ucpTools.filter((t) => !isCatalogSearchTool(t?.name) && !otherNames.has(t?.name)).map((t) => t.name)
       );
       if (hidden.size > 0) {
-        mcpClient.ucpTools = (mcpClient.ucpTools || []).filter((t) => !hidden.has(t.name));
-        mcpClient.tools = (mcpClient.tools || []).filter((t) => !hidden.has(t.name));
-        console.warn(
-          `[Chat] UCP circuit open (${cf.ucpBreaker.reason || "discovery error"}) — catalog search served locally; hid ${hidden.size} other UCP tools`
-        );
+        mcpClient.ucpTools = mcpClient.ucpTools.filter((t) => !hidden.has(t?.name));
+        mcpClient.tools = mcpClient.tools.filter((t) => !hidden.has(t?.name));
+        console.warn(`[Chat] UCP circuit open (${breakerInfo(cf).reason}) — catalog search served locally; hid ${hidden.size} other UCP tools`);
       }
     }
+    if (catalogMode !== "ucp" && (catalogMode === "local" || ucpOpen || !mcpCatalogTool)) {
+      // Serve search_catalog locally with a clean schema (replaces the UCP definition, if any).
+      mcpClient.tools = [...mcpClient.tools.filter((t) => !isCatalogSearchTool(t?.name)), LOCAL_CATALOG_TOOL];
+      localCatalogTool = true;
+      console.log(
+        `[Chat] search_catalog served locally (${catalogMode === "local" ? "CATALOG_TOOL_MODE=local" : ucpOpen ? "UCP circuit open" : "no catalog tool from MCP"})`
+      );
+    } else if (!mcpCatalogTool) {
+      console.warn(`[Chat] WARNING: No catalog-search tool available (CATALOG_TOOL_MODE=ucp). Tools: ${mcpClient.tools.map((t) => t?.name).join(", ")}`);
+    }
 
-    try { await saveMessage(conversationId, "user", userMessage, { shopDomain, visitorId }); } catch (dbError) {
+    // ── Save + load history ─────────────────────────────────────────
+    try {
+      await saveMessage(conversationId, "user", userMessage, { shopDomain, visitorId });
+    } catch (dbError) {
       console.error("[Chat] Failed to save user message:", dbError.message);
     }
 
-    let conversationHistory = [];
     try {
       const dbMessages = await getConversationHistory(conversationId);
-      conversationHistory = dbMessages.map((dbMessage) => ({
-        role: dbMessage.role,
-        content: parseStoredContent(dbMessage.content),
+      conversationHistory = (Array.isArray(dbMessages) ? dbMessages : []).map((m) => ({
+        role: m.role,
+        content: parseStoredContent(m.content),
       }));
-    } catch (historyError) { console.error("[Chat] Failed to get history:", historyError.message); }
+    } catch (historyError) {
+      console.error("[Chat] Failed to get history:", historyError.message);
+    }
 
     const lastMsg = conversationHistory[conversationHistory.length - 1];
     if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== userMessage) {
@@ -591,9 +868,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
 
     const detectedSkus = detectSkuTokens(userMessage);
 
-    // ───────────────────────────────────────────────────────────────────
-    // ADVISORY ANALYSIS (v2.4) — on the raw history, before any annotation.
-    // ───────────────────────────────────────────────────────────────────
+    // ── Advisory analysis (raw history, before any annotation) ──────
     if (ADVISORY_ENABLED) {
       try {
         advisoryMod = await import("../services/advisory.server.js");
@@ -605,7 +880,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       }
     }
 
-    // SKU annotation: only goes to Claude; DB stores the original.
+    // ── SKU annotation (Claude only; the DB keeps the original) ─────
     if (detectedSkus.length > 0) {
       const skuList = detectedSkus.slice(0, 3).join('", "');
       const annotation = `[SYSTEM: The user's message contains product code(s): "${skuList}". MANDATORY: Your FIRST search query MUST be the exact code "${detectedSkus[0]}" — no category words, no brand name, no dimensions added. Only broaden the search if the exact code returns zero results.]`;
@@ -616,11 +891,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       console.log(`[Chat] SKU annotation injected: ${detectedSkus.join(", ")}`);
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // SMART SEARCH PRE-PASS
-    // Advisory enquiries search the ADVICE (advisory.searchQuery) or skip the pre-pass.
-    // v2.5: storefront last-resort cards with no query-term overlap are dropped.
-    // ───────────────────────────────────────────────────────────────────
+    // ── Smart-search pre-pass ───────────────────────────────────────
     let smartResult = null;
     let systemNote = null;
 
@@ -629,34 +900,31 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     } else {
       try {
         const { smartSearch } = await import("../services/search-router.server.js");
-        const historyForSearch = conversationHistory.slice(-6); // last 3 turns
+        const historyForSearch = conversationHistory.slice(-6);
         const searchInput = advisory?.searchQuery || userMessage;
         if (advisory?.searchQuery) {
           console.log(`[Chat] Advisory search query: "${advisory.searchQuery}" (customer wrote: "${userMessage.slice(0, 80)}")`);
         }
         let smart = await smartSearch(searchInput, shopDomain, historyForSearch);
 
-        // v2.5.1: hide last-resort noise (ALL query terms required) and put accessories last.
-        if (smart && Array.isArray(smart.products) && smart.products.length > 0 && cf?.refineProducts) {
+        if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
+          // v2.6: filter with the router's CORRECTED query, never the raw (possibly misspelled) text.
+          const effective = smart.effectiveQuery || smart.query || searchInput;
           const before = smart.products.length;
-          const r = cf.refineProducts(smart.products, searchInput, smart.searchType);
+          const r = refineSafely(cf, smart.products, effective, smart.searchType);
           if (r.dropped > 0) {
-            console.log(
-              `[Chat] Relevance filter (${smart.searchType}) dropped ${r.dropped}/${before} pre-found products (terms: ${r.terms.join(",")})`
-            );
+            console.log(`[Chat] Relevance filter (${smart.searchType}) dropped ${r.dropped}/${before} pre-found products (terms: ${r.terms.join(",")})`);
           }
           if (r.products.length === 0) {
-            // Everything was noise: tell Claude the catalog has no match, so it doesn't search again
-            // or substitute another category (29 Sep logs: switchgear → circuit breaker accessories).
             systemNote =
               `[SYSTEM NOTE — NOT FROM USER] A catalog search for this message found NO matching products (only unrelated items, which were hidden). ` +
               `Do NOT call the catalog search again for this request, and do not show or suggest products from other categories as a match. ` +
-              `Tell the customer honestly that we don't currently list this item on the website, and offer websales@creativeautomation.ae for sourcing or a quote. ` +
+              `Tell the customer honestly that we don't currently list this item on the website (never that we don't supply it), and offer ${SALES_EMAIL} for sourcing or a quote. ` +
               (advisory ? `Follow the ADVISORY BRIEF's reply format for the rest of the reply.` : `Reply in 1-3 sentences.`);
             console.log("[Chat] Pre-pass: no relevant products — no-match note added");
             smart = null;
           } else if (r.accessoryOnly) {
-            console.log(`[Chat] Pre-pass: only accessories found for "${searchInput.slice(0, 60)}" — treated as low confidence`);
+            console.log(`[Chat] Pre-pass: only accessories found for "${String(searchInput).slice(0, 60)}" — treated as low confidence`);
             smart = {
               ...smart,
               products: r.products,
@@ -669,24 +937,18 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         }
 
         if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
-          smartResult = smart;
-          console.log(`[Chat] SmartSearch pre-found ${smart.products.length} products (${smart.searchType})`);
-          stream.sendMessage({ type: "product_results", products: smart.products });
-          productsSentToFrontend = true;
+          const shown = showProducts(smart.products);
+          smartResult = { ...smart, products: shown };
+          console.log(`[Chat] SmartSearch pre-found ${shown.length} products (${smart.searchType})`);
 
-          const summary = smart.products.slice(0, 8).map((p) => ({
-            title: p.title,
-            vendor: p.vendor,
-            price: p.price,
-            sku: p.sku,
-          }));
+          const summary = shown.slice(0, 8).map((p) => ({ title: p.title, vendor: p.vendor, price: p.price, sku: p.sku }));
           const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
           const replyInstruction = advisory
             ? `An [ADVISORY BRIEF] follows below: its REPLY FORMAT overrides the 1-3 sentence limit for this reply. `
             : `Write ONE short conversational reply (1-3 sentences). `;
           systemNote =
             `[SYSTEM NOTE — NOT FROM USER] Products have already been pre-found for this query and product cards are ALREADY DISPLAYED. ` +
-            `${smart.systemHint} ` +
+            `${smart.systemHint || ""} ` +
             (isLowConfidence
               ? `These results may NOT fully match the request. Compare the titles/vendors below with what the customer asked ` +
                 `(brand, bore, stroke, size, output type). Be honest about any mismatch. You may call the catalog search ONCE ` +
@@ -701,47 +963,35 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       }
     }
 
-    // Compose the last user turn: SYSTEM NOTE first, then ADVISORY BRIEF, then the message.
+    // ── Compose the last user turn: SYSTEM NOTE → ADVISORY BRIEF → message ──
     let advisoryBrief = "";
     if (advisory && advisoryMod) {
-      try { advisoryBrief = advisoryMod.buildAdvisoryBrief(advisory); } catch (e) {
+      try {
+        advisoryBrief = advisoryMod.buildAdvisoryBrief(advisory);
+      } catch (e) {
         console.warn(`[Chat] buildAdvisoryBrief failed: ${e.message}`);
       }
     }
     if (systemNote || advisoryBrief) {
       const lastIdx = conversationHistory.length - 1;
-      if (
-        conversationHistory[lastIdx]?.role === "user" &&
-        typeof conversationHistory[lastIdx].content === "string"
-      ) {
+      if (conversationHistory[lastIdx]?.role === "user" && typeof conversationHistory[lastIdx].content === "string") {
         conversationHistory[lastIdx] = {
           role: "user",
-          content: [systemNote, advisoryBrief, `User message: ${conversationHistory[lastIdx].content}`]
-            .filter(Boolean)
-            .join("\n\n"),
+          content: [systemNote, advisoryBrief, `User message: ${conversationHistory[lastIdx].content}`].filter(Boolean).join("\n\n"),
         };
       }
     }
 
-    // Strip catalog-search tools after a HIGH-CONFIDENCE pre-pass.
-    if (productsSentToFrontend) {
-      if (smartResult && LOW_CONFIDENCE_PATHS.has(smartResult.searchType)) {
-        console.log(
-          `[Chat] Products pre-found via LOW-CONFIDENCE path (${smartResult.searchType}) — ` +
-          `keeping catalog tools available so Claude can recover.`
-        );
+    // ── Strip catalog-search tools after a HIGH-CONFIDENCE pre-pass ─
+    if (smartResult) {
+      if (LOW_CONFIDENCE_PATHS.has(smartResult.searchType)) {
+        console.log(`[Chat] Products pre-found via LOW-CONFIDENCE path (${smartResult.searchType}) — keeping catalog tools available so Claude can recover.`);
       } else {
         const before = mcpClient.tools.length;
-        mcpClient.storefrontTools = (mcpClient.storefrontTools || [])
-          .filter(t => !isCatalogSearchTool(t.name));
-        mcpClient.ucpTools = (mcpClient.ucpTools || [])
-          .filter(t => !isCatalogSearchTool(t.name));
-        mcpClient.tools = (mcpClient.tools || [])
-          .filter(t => !isCatalogSearchTool(t.name));
-        console.log(
-          `[Chat] Products pre-found via HIGH-CONFIDENCE path (${smartResult?.searchType || 'unknown'}) — ` +
-          `stripped catalog tools (${before} → ${mcpClient.tools.length} tools).`
-        );
+        mcpClient.storefrontTools = mcpClient.storefrontTools.filter((t) => !isCatalogSearchTool(t?.name));
+        mcpClient.ucpTools = mcpClient.ucpTools.filter((t) => !isCatalogSearchTool(t?.name));
+        mcpClient.tools = mcpClient.tools.filter((t) => !isCatalogSearchTool(t?.name));
+        console.log(`[Chat] Products pre-found via HIGH-CONFIDENCE path (${smartResult.searchType || "unknown"}) — stripped catalog tools (${before} → ${mcpClient.tools.length} tools).`);
       }
     }
 
@@ -751,12 +1001,15 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       console.log(`[Chat] History capped ${before} → ${conversationHistory.length} messages`);
     }
 
+    // ── Claude loop ─────────────────────────────────────────────────
     let finalMessage = null;
     let stopReason = null;
-    let currentAssistantMessage = null;
-    let loopCount = 0;
 
     while (loopCount < MAX_TOOL_LOOPS) {
+      if (loopCount > 0 && Date.now() - startTime > TURN_BUDGET_MS) {
+        console.warn(`[Chat] Turn budget ${TURN_BUDGET_MS}ms exceeded after ${loopCount} Claude call(s) — ending turn`);
+        break;
+      }
       loopCount++;
       currentAssistantMessage = null;
       console.log(`[Chat] Claude call #${loopCount} | history=${conversationHistory.length} messages`);
@@ -765,185 +1018,209 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         { messages: conversationHistory, promptType, tools: mcpClient.tools },
         {
           onText: (textDelta) => {
+            if (typeof textDelta !== "string") return;
             fullResponseText += textDelta;
-            stream.sendMessage({ type: "chunk", chunk: textDelta });
+            send({ type: "chunk", chunk: textDelta });
           },
 
           onMessage: async (message) => {
             currentAssistantMessage = message;
             let textContent = "";
-            if (Array.isArray(message.content)) {
-              textContent = message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
-            } else { textContent = message.content; }
-
+            if (Array.isArray(message?.content)) {
+              textContent = message.content.filter((b) => b?.type === "text").map((b) => b.text).join("\n\n");
+            } else if (typeof message?.content === "string") {
+              textContent = message.content;
+            }
             const responseTime = Date.now() - startTime;
             if (textContent.trim()) {
-              saveMessage(conversationId, message.role, textContent, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
-                .catch((err) => console.error("[Chat] Error saving assistant message:", err.message));
+              Promise.resolve(
+                saveMessage(conversationId, message.role, textContent, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
+              ).catch((err) => console.error("[Chat] Error saving assistant message:", err?.message));
             }
-
-            const trackingId = visitorId || fingerprintId || conversationId;
-            try { ChatEvents.messageReceived(trackingId, { conversationId, responseTimeMs: responseTime, contentLength: textContent.length }); } catch (e) {}
-            stream.sendMessage({ type: "message_complete" });
+            track("messageReceived", { conversationId, responseTimeMs: responseTime, contentLength: textContent.length });
+            send({ type: "message_complete" });
           },
 
           onToolUse: async (content) => {
-            const toolName = content.name;
-            const toolArgs = content.input;
-            const toolUseId = content.id;
+            const toolName = content?.name;
+            const toolArgs = content?.input;
+            const toolUseId = content?.id;
+            let resultPushed = false;
 
-            console.log(`[Chat] Tool use: ${toolName} (id=${toolUseId})`);
+            try {
+              flushAssistant();
+              console.log(`[Chat] Tool use: ${toolName} (id=${toolUseId})`);
 
-            const thinkingStates = {
-              "search_shop_catalog": "Searching products...",
-              "search_catalog": "Searching products...",
-              "search_products": "Searching products...",
-              "update_cart": "Adding to cart...",
-              "get_cart": "Checking availability...",
-              "get_product": "Looking up product...",
-              "get_product_details": "Looking up product details...",
-            };
-            stream.sendMessage({ type: "thinking_state", state: thinkingStates[toolName] || "Thinking..." });
-            stream.sendMessage({ type: "tool_use", tool_name: toolName });
+              const thinkingStates = {
+                search_shop_catalog: "Searching products...",
+                search_catalog: "Searching products...",
+                search_products: "Searching products...",
+                update_cart: "Adding to cart...",
+                get_cart: "Checking availability...",
+                get_product: "Looking up product...",
+                get_product_details: "Looking up product details...",
+              };
+              send({ type: "thinking_state", state: thinkingStates[toolName] || "Thinking..." });
+              send({ type: "tool_use", tool_name: toolName });
+              track("toolCalled", { conversationId, toolName, toolArgs });
 
-            const trackingId = visitorId || fingerprintId || conversationId;
-            try { ChatEvents.toolCalled(trackingId, { conversationId, toolName, toolArgs }); } catch (e) {}
-
-            const isCatalogSearch = isCatalogSearchTool(toolName);
-            // Extract the real query from toolArgs — never JSON.stringify (v2.3).
-            const searchQuery = isCatalogSearch ? extractSearchQuery(toolArgs) : null;
-            if (isCatalogSearch) {
-              if (!searchQuery) console.warn(`[Chat] Could not extract searchQuery from toolArgs: ${JSON.stringify(toolArgs)}`);
-              else console.log(`[Chat] Extracted searchQuery: "${searchQuery}"`);
-            }
-
-            let toolUseResponse = null;
-            let localResult = null;
-            const canUseLocal = isCatalogSearch && !!searchQuery && !!cf && catalogMode !== "ucp";
-
-            if (canUseLocal && (catalogMode === "local" || cf.ucpBreaker.isOpen())) {
-              // UCP skipped entirely: forced local mode, or the circuit is open.
-              localResult = await runLocalCatalogSearch(searchQuery, catalogMode === "local" ? "mode_local" : "ucp_circuit_open");
-            } else {
-              try {
-                toolUseResponse = await mcpClient.callTool(toolName, toolArgs);
-              } catch (toolError) {
-                console.error(`[Chat] Tool call failed: ${toolName}`, toolError.message, "args:", JSON.stringify(toolArgs));
-                toolUseResponse = { error: { type: "tool_error", message: toolError.message, data: toolError.message } };
+              const isCatalogSearch = isCatalogSearchTool(toolName);
+              const searchQuery = isCatalogSearch ? extractSearchQuery(toolArgs) : null; // never JSON.stringify
+              if (isCatalogSearch) {
+                catalogSearches++;
+                if (!searchQuery) console.warn(`[Chat] Could not extract searchQuery from toolArgs: ${JSON.stringify(toolArgs)}`);
+                else console.log(`[Chat] Extracted searchQuery: "${searchQuery}"`);
               }
 
-              if (canUseLocal && toolUseResponse?.error) {
-                const errText = errorText(toolUseResponse.error);
-                if (cf.isUcpDiscoveryError(errText)) {
-                  cf.ucpBreaker.trip(cf.ucpErrorCode ? cf.ucpErrorCode(errText) : errText.slice(0, 160));
-                  console.warn(
-                    `[Chat] UCP circuit OPEN for ${Math.round(cf.ucpBreaker.cooldownMs / 60000)} min (agent profile / discovery error). ` +
-                    `Fix: set UCP_AGENT_PROFILE to a reachable profile.`
-                  );
-                }
-                console.warn(`[Chat] UCP catalog search failed — falling back to local search for "${searchQuery}"`);
-                localResult = await runLocalCatalogSearch(searchQuery, "ucp_error");
-              }
-            }
+              let toolUseResponse = null;
+              let localResult = null;
+              const canUseLocal = isCatalogSearch && !!searchQuery && catalogMode !== "ucp";
 
-            if (localResult) {
-              const products = localResult.products;
-              let hintText;
-              if (products.length > 0) {
-                console.log(`[Search] Sending ${products.length} products to frontend for: "${searchQuery}" (local)`);
-                stream.sendMessage({ type: "product_results", products });
-                productsSentToFrontend = true;
-                hintText = buildStopHint(products, localResult.lowConfidence);
+              if (isCatalogSearch && catalogSearches > MAX_CATALOG_SEARCHES) {
+                console.warn(`[Chat] Catalog search limit (${MAX_CATALOG_SEARCHES}) reached — not searching "${searchQuery}"`);
+                toolUseResponse = { content: [{ type: "text", text: buildLimitHint() }] };
+              } else if (isCatalogSearch && !searchQuery) {
+                toolUseResponse = {
+                  content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                      products: [],
+                      total_count: 0,
+                      _system_hint: 'No query was given. Call search_catalog with {"catalog":{"query":"<2-6 word product query or exact part number>"}}.',
+                    }),
+                  }],
+                };
+              } else if (canUseLocal && (localCatalogTool || breakerIsOpen(cf))) {
+                const reason = catalogMode === "local" ? "mode_local" : breakerIsOpen(cf) ? "ucp_circuit_open" : "local_tool";
+                localResult = await runLocalCatalogSearch(searchQuery, reason);
               } else {
-                console.log(`[Search] Zero results for: "${searchQuery}" (local)`);
-                hintText = buildZeroHint(searchQuery);
+                try {
+                  toolUseResponse = await mcpClient.callTool(toolName, toolArgs);
+                } catch (toolError) {
+                  console.error(`[Chat] Tool call failed: ${toolName}`, toolError?.message, "args:", JSON.stringify(toolArgs));
+                  toolUseResponse = { error: { type: "tool_error", message: toolError?.message, data: toolError?.message } };
+                }
+                if (!toolUseResponse || typeof toolUseResponse !== "object") {
+                  toolUseResponse = { error: { type: "tool_error", message: "Empty tool response", data: "Empty tool response" } };
+                }
+
+                if (canUseLocal && toolUseResponse.error) {
+                  const errText = errorText(toolUseResponse.error);
+                  if (isUcpDiscoveryError(cf, errText)) {
+                    breakerTrip(cf, ucpErrorCode(cf, errText));
+                    console.warn(
+                      `[Chat] UCP circuit OPEN for ${breakerInfo(cf).minutes} min (agent profile / discovery error). Fix: set UCP_AGENT_PROFILE to a reachable profile.`
+                    );
+                  }
+                  console.warn(`[Chat] UCP catalog search failed — falling back to local search for "${searchQuery}"`);
+                  localResult = await runLocalCatalogSearch(searchQuery, "ucp_error");
+                }
               }
-              toolUseResponse = { content: [{ type: "text", text: hintText }] };
-            } else if (isCatalogSearch && !toolUseResponse.error) {
-              // v2.3 IMAGE DEBUG: log raw product fields from the MCP response.
-              try {
-                const rawText = toolUseResponse?.content?.[0]?.text;
-                if (rawText) {
-                  const rawData = JSON.parse(rawText);
-                  const firstProduct = (rawData?.products || rawData?.items || rawData?.results || [])[0];
-                  if (firstProduct) {
-                    const media0 = Array.isArray(firstProduct.media) && firstProduct.media[0]
-                      ? JSON.stringify(firstProduct.media[0]).substring(0, 500)
-                      : "none";
-                    console.log(`[ImageDebug] First product keys: [${Object.keys(firstProduct).join(", ")}]`);
-                    console.log(`[ImageDebug] media[0] FULL: ${media0}`);
-                    console.log(`[ImageDebug] image_url: ${firstProduct.image_url || "absent"}`);
-                    console.log(`[ImageDebug] featured_image: ${typeof firstProduct.featured_image === 'object' ? JSON.stringify(firstProduct.featured_image) : (firstProduct.featured_image || "absent")}`);
+
+              if (localResult) {
+                let hintText;
+                if (localResult.products.length > 0) {
+                  const shown = showProducts(localResult.products, { merge: true });
+                  console.log(`[Search] Sending ${shown.length} products to frontend for: "${searchQuery}" (local)`);
+                  hintText = buildStopHint(shown, {
+                    lowConfidence: localResult.lowConfidence,
+                    accessoryOnly: localResult.accessoryOnly,
+                    searchNote: localResult.searchNote,
+                  });
+                } else {
+                  console.log(`[Search] Zero results for: "${searchQuery}" (local)`);
+                  hintText = buildZeroHint(searchQuery);
+                }
+                toolUseResponse = { content: [{ type: "text", text: hintText }] };
+              } else if (isCatalogSearch && searchQuery && toolUseResponse && !toolUseResponse.error && catalogSearches <= MAX_CATALOG_SEARCHES) {
+                // UCP path (CATALOG_TOOL_MODE=ucp, or auto with a healthy UCP).
+                if (DEBUG_IMAGES) {
+                  try {
+                    const rawText = toolUseResponse?.content?.[0]?.text;
+                    const rawData = rawText ? JSON.parse(rawText) : null;
+                    const firstProduct = (rawData?.products || rawData?.items || rawData?.results || [])[0];
+                    if (firstProduct) {
+                      console.log(`[ImageDebug] First product keys: [${Object.keys(firstProduct).join(", ")}]`);
+                      console.log(`[ImageDebug] media[0]: ${Array.isArray(firstProduct.media) && firstProduct.media[0] ? JSON.stringify(firstProduct.media[0]).substring(0, 500) : "none"}`);
+                    }
+                  } catch (debugErr) {
+                    console.warn("[ImageDebug] Could not parse product for debug:", debugErr.message);
                   }
                 }
-              } catch (debugErr) {
-                console.warn("[ImageDebug] Could not parse product for debug:", debugErr.message);
-              }
 
-              const products = toolService.processProductSearchResult(toolUseResponse, shopDomain, userMessage, searchQuery);
-
-              if (products && products.length > 0) {
-                console.log(`[Search] Sending ${products.length} products to frontend for: "${searchQuery}"`);
-                stream.sendMessage({ type: "product_results", products });
-                productsSentToFrontend = true;
-                toolUseResponse.content = [{ type: "text", text: buildStopHint(products) }];
-              } else {
-                console.log(`[Search] Zero results for: "${searchQuery}"`);
-                toolUseResponse.content = [{ type: "text", text: buildZeroHint(searchQuery) }];
-              }
-            }
-
-            if (toolName === "update_cart" && !toolUseResponse.error) {
-              const { processCartUpdateResult } = toolService;
-              const { checkoutUrl, cart } = processCartUpdateResult(toolUseResponse);
-              if (checkoutUrl) {
-                stream.sendMessage({ type: "cart_updated", checkout_url: checkoutUrl, cart });
-              } else {
-                console.warn("[Chat] update_cart succeeded but no checkout URL found");
-              }
-            }
-
-            if (currentAssistantMessage) {
-              conversationHistory.push({ role: currentAssistantMessage.role, content: currentAssistantMessage.content });
-              currentAssistantMessage = null;
-            }
-
-            if (toolUseResponse.error) {
-              conversationHistory.push({
-                role: "user",
-                content: [{ type: "tool_result", tool_use_id: toolUseId, content: JSON.stringify({ error: toolUseResponse.error.data || toolUseResponse.error }), is_error: true }],
-              });
-              stream.sendMessage({ type: "tool_error", tool_name: toolName, error: toolUseResponse.error.data || toolUseResponse.error });
-            } else {
-              let toolResultContent;
-              try {
-                if (Array.isArray(toolUseResponse.content)) {
-                  toolResultContent = toolUseResponse.content.filter((c) => c && c.type === "text" && c.text).map((c) => c.text).join("\n") || "No content returned";
-                } else if (typeof toolUseResponse.content === "string") {
-                  toolResultContent = toolUseResponse.content;
-                } else {
-                  toolResultContent = JSON.stringify(toolUseResponse.content ?? "No content returned");
+                let products = [];
+                try {
+                  products = toolService.processProductSearchResult(toolUseResponse, shopDomain, userMessage, searchQuery) || [];
+                } catch (e) {
+                  console.warn(`[Chat] processProductSearchResult failed: ${e.message}`);
                 }
-              } catch (e) { toolResultContent = "Tool returned data successfully"; }
+                if (products.length > 0) {
+                  const r = refineSafely(cf, products, searchQuery, "ucp_search");
+                  const shown = showProducts(r.products.length ? r.products : products, { merge: true });
+                  console.log(`[Search] Sending ${shown.length} products to frontend for: "${searchQuery}"`);
+                  toolUseResponse.content = [{ type: "text", text: buildStopHint(shown, { accessoryOnly: r.accessoryOnly }) }];
+                } else {
+                  console.log(`[Search] Zero results for: "${searchQuery}"`);
+                  toolUseResponse.content = [{ type: "text", text: buildZeroHint(searchQuery) }];
+                }
+              }
 
-              conversationHistory.push({ role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: toolResultContent }] });
+              if (toolName === "update_cart" && toolUseResponse && !toolUseResponse.error) {
+                try {
+                  const { checkoutUrl, cart } = toolService.processCartUpdateResult(toolUseResponse) || {};
+                  if (checkoutUrl) send({ type: "cart_updated", checkout_url: checkoutUrl, cart });
+                  else console.warn("[Chat] update_cart succeeded but no checkout URL found");
+                } catch (e) {
+                  console.warn(`[Chat] processCartUpdateResult failed: ${e.message}`);
+                }
+              }
+
+              flushAssistant();
+              if (toolUseResponse?.error) {
+                const errPayload = toolUseResponse.error.data || toolUseResponse.error;
+                pushToolResult({ type: "tool_result", tool_use_id: toolUseId, content: JSON.stringify({ error: errPayload }), is_error: true });
+                resultPushed = true;
+                send({ type: "tool_error", tool_name: toolName, error: errPayload });
+              } else {
+                let toolResultContent;
+                try {
+                  if (Array.isArray(toolUseResponse?.content)) {
+                    toolResultContent =
+                      toolUseResponse.content.filter((c) => c && c.type === "text" && c.text).map((c) => c.text).join("\n") || "No content returned";
+                  } else if (typeof toolUseResponse?.content === "string") {
+                    toolResultContent = toolUseResponse.content;
+                  } else {
+                    toolResultContent = JSON.stringify(toolUseResponse?.content ?? "No content returned");
+                  }
+                } catch (e) {
+                  toolResultContent = "Tool returned data successfully";
+                }
+                pushToolResult({ type: "tool_result", tool_use_id: toolUseId, content: toolResultContent });
+                resultPushed = true;
+              }
+              send({ type: "new_message" });
+            } catch (handlerErr) {
+              // Every tool_use MUST get a tool_result, or the next Claude call fails.
+              console.error(`[Chat] onToolUse crashed for ${toolName}: ${handlerErr?.message}`);
+              if (!resultPushed) {
+                flushAssistant();
+                pushToolResult({
+                  type: "tool_result",
+                  tool_use_id: toolUseId,
+                  content: JSON.stringify({ error: "The tool failed. Do not retry it; answer with what you have or offer " + SALES_EMAIL + "." }),
+                  is_error: true,
+                });
+              }
             }
-
-            stream.sendMessage({ type: "new_message" });
           },
 
           onContentBlock: (contentBlock) => {
-            if (contentBlock.type === "text") {
-              stream.sendMessage({ type: "content_block_complete", content_block: contentBlock });
-            }
+            if (contentBlock?.type === "text") send({ type: "content_block_complete", content_block: contentBlock });
           },
         }
       );
 
-      if (currentAssistantMessage) {
-        conversationHistory.push({ role: currentAssistantMessage.role, content: currentAssistantMessage.content });
-        currentAssistantMessage = null;
-      }
+      flushAssistant();
 
       stopReason = finalMessage?.stop_reason ?? null;
       console.log(`[Chat] Claude call #${loopCount} done | stop_reason=${stopReason}`);
@@ -956,36 +1233,38 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
 
     if (loopCount >= MAX_TOOL_LOOPS && stopReason === "tool_use") console.warn(`[Chat] Hit max tool loop limit (${MAX_TOOL_LOOPS})`);
 
-    // Empty-reply guard: never end a turn with nothing to read.
+    // ── Empty-reply guard: never end a turn with nothing to read ────
     if (!fullResponseText.trim()) {
       const fallback = getAdvisoryFallback();
       if (fallback) {
         console.warn("[Chat] Empty reply from Claude — sending advisory fallback");
         sendFallbackText(fallback);
-      } else if (!productsSentToFrontend) {
+      } else if (productsSentToFrontend) {
+        console.warn("[Chat] Empty reply from Claude but cards are shown — sending short fallback");
+        sendFallbackText(`Here are the closest matches I found — tap a card for details. For anything not listed, email ${SALES_EMAIL} and the team will help.`);
+      } else {
         console.warn("[Chat] Empty reply from Claude and no products — sending generic fallback");
-        sendFallbackText("Sorry, I couldn't put a reply together just now. Please try again, or email websales@creativeautomation.ae and the team will help.");
+        sendFallbackText(`Sorry, I couldn't put a reply together just now. Please try again, or email ${SALES_EMAIL} and the team will help.`);
       }
     }
 
-    stream.sendMessage({ type: "end_turn" });
-    console.log(`[Chat] Response complete | ${Date.now() - startTime}ms`);
-
+    send({ type: "end_turn" });
+    console.log(`[Chat] Response complete | ${Date.now() - startTime}ms | claude_calls=${loopCount} catalog_searches=${catalogSearches}`);
   } catch (error) {
-    console.error("[Chat] Error in chat session:", error.message);
-    const trackingId = visitorId || fingerprintId || conversationId;
-    try { ChatEvents.errorOccurred(trackingId, { conversationId, error: error.message }); } catch (e) {}
+    console.error("[Chat] Error in chat session:", error?.message);
+    track("errorOccurred", { conversationId, error: error?.message });
 
     const advisoryFallback = !fullResponseText.trim() ? getAdvisoryFallback() : "";
     if (advisoryFallback) {
       sendFallbackText(advisoryFallback);
-      stream.sendMessage({ type: "end_turn" });
-    } else if (productsSentToFrontend) {
-      stream.sendMessage({ type: "chunk", chunk: "I found several products matching your request. You can browse them above." });
-      stream.sendMessage({ type: "message_complete" });
-      stream.sendMessage({ type: "end_turn" });
+      send({ type: "end_turn" });
+    } else if (productsSentToFrontend && !fullResponseText.trim()) {
+      sendFallbackText("I found several products matching your request. You can browse them above.");
+      send({ type: "end_turn" });
+    } else if (fullResponseText.trim()) {
+      send({ type: "end_turn" });
     } else {
-      stream.sendMessage({ type: "error", error: "Failed to get response. Please try again." });
+      send({ type: "error", error: "Failed to get response. Please try again." });
     }
   }
 }
@@ -1000,7 +1279,10 @@ async function getCustomerAccountUrls(conversationIdOrDomain, conversationId, db
     const fetchWithTimeout = (url, ms = 4000) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), ms);
-      return fetch(url, { signal: controller.signal }).then((r) => { clearTimeout(timer); return r.json(); }).catch(() => ({}));
+      return fetch(url, { signal: controller.signal })
+        .then((r) => r.json())
+        .catch(() => ({}))
+        .finally(() => clearTimeout(timer));
     };
 
     const [mcpResponse, openidResponse] = await Promise.all([
@@ -1009,12 +1291,12 @@ async function getCustomerAccountUrls(conversationIdOrDomain, conversationId, db
     ]);
 
     const response = {
-      mcpApiUrl: mcpResponse.mcp_api || null,
-      authorizationUrl: openidResponse.authorization_endpoint || null,
-      tokenUrl: openidResponse.token_endpoint || null,
+      mcpApiUrl: mcpResponse?.mcp_api || null,
+      authorizationUrl: openidResponse?.authorization_endpoint || null,
+      tokenUrl: openidResponse?.token_endpoint || null,
     };
 
-    await dbHelpers.storeCustomerAccountUrls({ conversationId, ...response }).catch((e) => console.warn("Failed to store URLs:", e));
+    await Promise.resolve(dbHelpers.storeCustomerAccountUrls({ conversationId, ...response })).catch((e) => console.warn("Failed to store URLs:", e));
     return response;
   } catch (error) {
     console.error("Error getting customer MCP API URL:", error);
