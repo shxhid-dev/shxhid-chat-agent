@@ -6,6 +6,12 @@
  * - Email capture via built-in overlay
  * - SSE streaming with thinking indicators
  *
+ * v4.1 — Oct 5, 2026 — ADD TO CART FIX
+ *   Add to Cart now uses the store's own cart (/cart/add.js), so the item shows
+ *   in the theme cart icon, cart drawer and /cart page. Previously it created a
+ *   separate Storefront API cart that only the chat's checkout link could see.
+ *   The backend /api/cart cart is kept as a fallback; "Go to Cart" opens /cart.
+ *
  * v4.0 — May 7, 2026 — CRITICAL RENDERING FIX
  *
  * ROOT CAUSE OF "CARDS NOT RENDERING" BUG:
@@ -90,6 +96,11 @@
       chatHistory: JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]'),
       cartId: sessionStorage.getItem('shopAiCartId') || null,
       checkoutUrl: sessionStorage.getItem('shopAiCheckoutUrl') || null,
+      // 'native'   = item went into the store's own cart (/cart/add.js) — same
+      //              cart as the theme cart icon, cart drawer and /cart page.
+      // 'headless' = fallback Storefront API cart created by the backend; only
+      //              reachable through its checkoutUrl (/cart/c/...).
+      cartMode: sessionStorage.getItem('shopAiCartMode') || null,
       selectedProduct: null,
       selectedProductModal: null,
       isCartUpdating: false,
@@ -134,7 +145,7 @@
       this.restoreState();
       this.exposeAPI();
 
-      console.log('ShopAIChat v4.0 initialized');
+      console.log('ShopAIChat v4.1 initialized');
     },
 
     bindEvents() {
@@ -806,56 +817,202 @@
       }
 
       try {
-        const cartApiUrl = window.shopChatConfig?.cartUrl ||
-          (window.shopChatConfig?.apiUrl || '/chat').replace('/chat', '/api/cart');
+        let added = false;
 
-        const response = await fetch(cartApiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            variantId,
-            quantity: 1,
-            cartId: this.state.cartId,
-            conversationId: this.state.conversationId,
-            shop_domain: window.shopChatConfig?.shopDomain || ''
-          })
+        // 1) Store's own cart. The backend /api/cart creates a separate
+        //    Storefront API cart that the theme never sees (cart icon stays 0,
+        //    /cart page is empty), so the native Ajax Cart API comes first.
+        const numericVariantId = this.toNumericVariantId(variantId);
+        if (numericVariantId) {
+          try {
+            await this.addToNativeCart(numericVariantId, 1);
+            this.setCartMode('native');
+            added = true;
+            this.refreshThemeCart();
+          } catch (nativeErr) {
+            // 422 = Shopify refused the item (sold out, qty limit…). The
+            // headless cart would refuse it too, so show the reason instead.
+            if (nativeErr.status === 422) {
+              throw Object.assign(new Error(nativeErr.message), { userMessage: nativeErr.message });
+            }
+            console.warn('Native cart add failed, falling back to app cart:', nativeErr);
+          }
+        }
+
+        // 2) Fallback: backend Storefront API cart (pages without the Online
+        //    Store cart, e.g. a headless/custom page).
+        if (!added) {
+          const data = await this.addToHeadlessCart(variantId, 1);
+          this.updateCheckoutState(data.checkoutUrl, data.cartId);
+          this.setCartMode('headless');
+        }
+
+        this.state.addedByProductId[productId] = true;
+        sessionStorage.setItem('shopAiAddedByProductId', JSON.stringify(this.state.addedByProductId));
+
+        document.querySelectorAll(`[data-product-id="${productId}"]`).forEach(btn => {
+          if (btn.dataset.productAction === 'add-to-cart') {
+            btn.textContent = 'Go to Cart';
+            btn.dataset.productAction = 'go-to-cart';
+            btn.disabled = false;
+          }
         });
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-
-        if (data.status === 'success' && data.checkoutUrl && data.cartId) {
-          this.state.addedByProductId[productId] = true;
-          sessionStorage.setItem('shopAiAddedByProductId', JSON.stringify(this.state.addedByProductId));
-
-          this.updateCheckoutState(data.checkoutUrl, data.cartId);
-
-          document.querySelectorAll(`[data-product-id="${productId}"]`).forEach(btn => {
-            if (btn.dataset.productAction === 'add-to-cart') {
-              btn.textContent = 'Go to Cart';
-              btn.dataset.productAction = 'go-to-cart';
-              btn.disabled = false;
-            }
-          });
-
-          this.addMessage('Added to cart! 🎉', 'assistant');
-        } else {
-          throw new Error(data.message || 'Failed to add to cart');
-        }
+        this.addMessage('Added to cart! 🎉 Tap **Go to Cart** to view your cart and check out.', 'assistant');
       } catch (err) {
         console.error('❌ Add to cart error:', err);
         if (button) {
           button.textContent = 'Add to Cart';
           button.disabled = false;
         }
-        this.addMessage('Could not add to cart. Please try again.', 'assistant');
+        this.addMessage(
+          err.userMessage
+            ? `Could not add to cart: ${err.userMessage}`
+            : 'Could not add to cart. Please try again.',
+          'assistant'
+        );
       } finally {
         this.state.isCartUpdating = false;
       }
     },
 
+    // "gid://shopify/ProductVariant/123" → "123" (the Ajax Cart API needs the numeric ID)
+    toNumericVariantId(variantId) {
+      const match = String(variantId || '').match(/(\d+)\s*$/);
+      return match ? match[1] : null;
+    },
+
+    getStoreRoot() {
+      let root = window.shopChatConfig?.rootUrl || window.Shopify?.routes?.root || '/';
+      if (!root.endsWith('/')) root += '/';
+      return root;
+    },
+
+    getCartPageUrl() {
+      return window.shopChatConfig?.cartPageUrl || `${this.getStoreRoot()}cart`;
+    },
+
+    async addToNativeCart(numericVariantId, quantity) {
+      const url = window.shopChatConfig?.cartAddUrl
+        ? `${window.shopChatConfig.cartAddUrl}.js`
+        : `${this.getStoreRoot()}cart/add.js`;
+
+      const response = await fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ items: [{ id: Number(numericVariantId), quantity }] }),
+      });
+
+      let data = null;
+      try { data = await response.json(); } catch (_) { /* non-JSON (e.g. 404 page) */ }
+
+      if (!response.ok || !data || data.status) {
+        const message = (data && (data.description || data.message)) || `HTTP ${response.status}`;
+        const error = new Error(message);
+        error.status = (data && data.status) || response.status;
+        throw error;
+      }
+      return data;
+    },
+
+    async addToHeadlessCart(variantId, quantity) {
+      const cartApiUrl = window.shopChatConfig?.cartUrl ||
+        (window.shopChatConfig?.apiUrl || '/chat').replace('/chat', '/api/cart');
+
+      const response = await fetch(cartApiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          variantId,
+          quantity,
+          cartId: this.state.cartMode === 'headless' ? this.state.cartId : null,
+          conversationId: this.state.conversationId,
+          shop_domain: window.shopChatConfig?.shopDomain || ''
+        })
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const data = await response.json();
+      if (data.status !== 'success' || !data.checkoutUrl || !data.cartId) {
+        throw new Error(data.message || 'Failed to add to cart');
+      }
+      return data;
+    },
+
+    setCartMode(mode) {
+      this.state.cartMode = mode;
+      sessionStorage.setItem('shopAiCartMode', mode);
+    },
+
+    // Best-effort: update the theme's cart icon count / drawer without a reload.
+    async refreshThemeCart() {
+      try {
+        const root = this.getStoreRoot();
+
+        // Dawn-family themes: re-render the cart icon bubble and cart drawer sections.
+        const sectionsRes = await fetch(`${root}?sections=cart-icon-bubble,cart-drawer`, {
+          credentials: 'same-origin',
+        });
+        if (sectionsRes.ok) {
+          const sections = await sectionsRes.json().catch(() => null);
+          if (sections) this.applyThemeSections(sections);
+        }
+
+        // Generic count badges used by many themes.
+        const cartRes = await fetch(`${root}cart.js`, {
+          credentials: 'same-origin',
+          headers: { 'Accept': 'application/json' },
+        });
+        const cart = cartRes.ok ? await cartRes.json().catch(() => null) : null;
+        if (cart && typeof cart.item_count === 'number') {
+          document.querySelectorAll('[data-cart-count], .cart-count, .cart-count-bubble span[aria-hidden="true"]')
+            .forEach(el => { el.textContent = String(cart.item_count); });
+        }
+
+        // Notify the theme (Dawn pub/sub + common custom events).
+        // Dawn declares PUB_SUB_EVENTS with `const`, so it is a global binding
+        // but not a window property.
+        const pubSubEvents = typeof PUB_SUB_EVENTS !== 'undefined' ? PUB_SUB_EVENTS : window.PUB_SUB_EVENTS;
+        if (typeof window.publish === 'function' && pubSubEvents?.cartUpdate) {
+          window.publish(pubSubEvents.cartUpdate, { source: 'shop-ai-chat', cartData: cart });
+        }
+        document.dispatchEvent(new CustomEvent('cart:refresh', { bubbles: true, detail: { cart } }));
+        document.dispatchEvent(new CustomEvent('cart:updated', { bubbles: true, detail: { cart } }));
+      } catch (err) {
+        console.warn('Theme cart refresh skipped:', err);
+      }
+    },
+
+    applyThemeSections(sections) {
+      const parse = (html) => new DOMParser().parseFromString(html, 'text/html');
+
+      if (sections['cart-icon-bubble']) {
+        const target = document.getElementById('cart-icon-bubble');
+        const source = parse(sections['cart-icon-bubble']).querySelector('.shopify-section');
+        if (target && source) target.innerHTML = source.innerHTML;
+      }
+
+      if (sections['cart-drawer']) {
+        const target = document.getElementById('CartDrawer');
+        const source = parse(sections['cart-drawer']).getElementById('CartDrawer');
+        if (target && source) {
+          target.innerHTML = source.innerHTML;
+          target.closest('cart-drawer')?.classList.remove('is-empty');
+        }
+      }
+    },
+
     handleGoToCart() {
+      if (this.state.cartMode === 'native') {
+        window.location.href = this.getCartPageUrl();
+        return;
+      }
       this.openCheckout();
     },
 
@@ -913,6 +1070,7 @@
       this.state.cartId = null;
       this.state.checkoutUrl = null;
       this.state.lastCheckoutUrlShown = null;
+      this.state.cartMode = null;
       this.state.conversationId = null;
       this.state.isFirstMessage = true;
       this.state.productDataMap.clear();
@@ -920,6 +1078,7 @@
       sessionStorage.removeItem('shopAiConversationId');
       sessionStorage.removeItem('shopAiCartId');
       sessionStorage.removeItem('shopAiCheckoutUrl');
+      sessionStorage.removeItem('shopAiCartMode');
       sessionStorage.removeItem('shopAiAddedByProductId');
 
       if (this.elements.messages) {
