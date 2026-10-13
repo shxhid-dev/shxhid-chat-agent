@@ -1,1239 +1,924 @@
-/**
- * Shopify Chat Agent - Production Ready
- * - Product carousel with click-to-open modal
- * - Auto-expand textarea with smooth placeholder fade
- * - Chat history with conversation loading
- * - Email capture via built-in overlay
- * - SSE streaming with thinking indicators
- *
- * v4.1 — Oct 5, 2026 — ADD TO CART FIX
- *   Add to Cart now uses the store's own cart (/cart/add.js), so the item shows
- *   in the theme cart icon, cart drawer and /cart page. Previously it created a
- *   separate Storefront API cart that only the chat's checkout link could see.
- *   The backend /api/cart cart is kept as a fallback; "Go to Cart" opens /cart.
- *
- * v4.0 — May 7, 2026 — CRITICAL RENDERING FIX
- *
- * ROOT CAUSE OF "CARDS NOT RENDERING" BUG:
- *   The v3.x deferred rendering strategy (buffer products until end_turn)
- *   had a fatal race condition:
- *
- *   1. Claude makes tool call #1 → product_results arrives → pendingProducts set
- *   2. Claude sends text → chunk events → message_complete fires
- *   3. message_complete handler resets currentAssistantMsg/fullText but does NOT
- *      flush pendingProducts
- *   4. Claude makes tool call #2 → NEW product_results arrives → pendingProducts
- *      overwritten with new (possibly empty) results
- *   5. end_turn fires → renders pendingProducts (which is now the wrong set,
- *      or empty if tool call #2 returned nothing)
- *
- *   Additionally, in long sessions (5+ searches), the `lastProductsGridEl`
- *   reference pointed to a DOM node that had already been scrolled far above,
- *   so the removal + re-add logic silently failed.
- *
- * FIX:
- *   - Render product cards IMMEDIATELY on product_results event
- *   - Remove deferred rendering entirely — it was an over-optimization
- *   - When a new product_results arrives in the same turn, remove the
- *     PREVIOUS grid from that turn (not from a prior turn)
- *   - This guarantees the user always sees the latest search results
- *
- * ALSO FIXED:
- *   - Image placeholder now uses buildProductImage() consistently
- *   - Modal description guards against [object Object]
- *   - onerror on <img> replaces with placeholder SVG
- */
+{% comment %}
+  AI Chat Assistant — app embed block
+  v4.1 — Email capture popup removed completely.
+    - All email popup CSS removed; hard-kill rule kept in case an older chat.js injects it
+    - emailPopupEnabled: false passed to chat.js
+    - Settings output escaped with | json (an apostrophe in the welcome message no longer breaks the script)
+{% endcomment %}
 
-(function () {
-  'use strict';
+{{ 'chat.css' | asset_url | stylesheet_tag }}
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
-  // ─── Image placeholder SVG ────────────────────────────────────────────────
-  const PLACEHOLDER_SVG = `<div class="shop-ai-img-placeholder" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#f5f5f5;border-radius:8px 8px 0 0;"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#c8c8c8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="14" rx="2"/><circle cx="12" cy="13" r="3"/><path d="M9 6l1.5-2h3L15 6"/></svg></div>`;
-
-  function buildProductImage(imageUrl, altText, cssClass) {
-    const src = (imageUrl && typeof imageUrl === 'string' && imageUrl.startsWith('http'))
-      ? imageUrl : null;
-
-    const wrapper = document.createElement('div');
-    wrapper.className = cssClass || 'shop-ai-product-image-wrap';
-    wrapper.style.cssText = 'width:100%;overflow:hidden;';
-
-    if (!src) {
-      wrapper.innerHTML = PLACEHOLDER_SVG;
-      return wrapper;
-    }
-
-    const img = document.createElement('img');
-    img.className = 'shop-ai-product-image';
-    img.src = src;
-    img.alt = altText || '';
-    img.loading = 'lazy';
-    img.onerror = function () {
-      this.onerror = null;
-      const ph = document.createElement('div');
-      ph.innerHTML = PLACEHOLDER_SVG;
-      if (this.parentElement) {
-        this.parentElement.replaceChild(ph.firstElementChild, this);
-      }
-    };
-
-    wrapper.appendChild(img);
-    return wrapper;
+<style>
+  /* ============================================
+     BLUR FIX — Blur page content when chat opens.
+     Shopify wraps extensions in a .shopify-section div,
+     so we mark that parent with .shop-ai-chat-section
+     via JS below and skip it here.
+     ============================================ */
+  body.shop-ai-open > *:not(.shop-ai-chat-section):not(.shop-ai-product-modal-overlay):not(#shop-ai-product-modal){
+    filter: blur(18px) saturate(120%);
+    transition: filter 0.35s ease;
+    pointer-events: none;
+    user-select: none;
   }
 
-  const ShopAIChat = {
-    state: {
-      isOpen: false,
-      isThinking: false,
-      thinkingInterval: null,
-      conversationId: sessionStorage.getItem('shopAiConversationId') || null,
-      visitorId: sessionStorage.getItem('shopAiVisitorId') || null,
-      emailCaptured: localStorage.getItem('shopAiEmailCaptured') === 'true',
-      emailPopupShown: sessionStorage.getItem('shopAiEmailPopupShown') === 'true',
-      isFirstMessage: !sessionStorage.getItem('shopAiConversationId'),
-      buffer: '',
-      placeholderIndex: 0,
-      chatHistory: JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]'),
-      cartId: sessionStorage.getItem('shopAiCartId') || null,
-      checkoutUrl: sessionStorage.getItem('shopAiCheckoutUrl') || null,
-      // 'native'   = item went into the store's own cart (/cart/add.js) — same
-      //              cart as the theme cart icon, cart drawer and /cart page.
-      // 'headless' = fallback Storefront API cart created by the backend; only
-      //              reachable through its checkoutUrl (/cart/c/...).
-      cartMode: sessionStorage.getItem('shopAiCartMode') || null,
-      selectedProduct: null,
-      selectedProductModal: null,
-      isCartUpdating: false,
-      addedByProductId: JSON.parse(sessionStorage.getItem('shopAiAddedByProductId') || '{}'),
-      productDataMap: new Map(),
-      lastCheckoutUrlShown: null,
-    },
-
-    placeholders: [
-      'Ask me anything...',
-      'Search for products',
-      'What do you need?',
-      'Tell me a product name...',
-    ],
-
-    elements: {},
-
-    init() {
-      this.elements = {
-        floatingGroup: document.getElementById('shop-ai-floating-group'),
-        modal: document.getElementById('shop-ai-modal'),
-        backdrop: document.getElementById('shop-ai-backdrop'),
-        messages: document.getElementById('shop-ai-messages'),
-        input: document.getElementById('shop-ai-input'),
-        sendBtn: document.getElementById('shop-ai-send-btn'),
-        closeBtn: document.getElementById('shop-ai-close-btn'),
-        menuBtn: document.getElementById('shop-ai-menu-btn'),
-        menuDropdown: document.getElementById('shop-ai-menu'),
-        suggestions: document.getElementById('shop-ai-suggestions'),
-        historyPanel: document.getElementById('shop-ai-history-panel'),
-        historyList: document.getElementById('shop-ai-history-list'),
-        backBtn: document.getElementById('shop-ai-back-btn'),
-      };
-
-      if (!this.elements.modal) {
-        console.error('❌ Modal element not found');
-        return;
-      }
-
-      this.bindEvents();
-      this.startPlaceholderRotation();
-      this.restoreState();
-      this.exposeAPI();
-
-      console.log('ShopAIChat v4.1 initialized');
-    },
-
-    bindEvents() {
-      document.querySelectorAll('[data-trigger]').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          this.open();
-        });
-      });
-
-      if (this.elements.closeBtn) {
-        this.elements.closeBtn.addEventListener('click', () => this.close());
-      }
-      if (this.elements.backdrop) {
-        this.elements.backdrop.addEventListener('click', () => this.close());
-      }
-
-      if (this.elements.sendBtn) {
-        this.elements.sendBtn.addEventListener('click', () => this.send());
-      }
-      if (this.elements.input) {
-        this.elements.input.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            this.send();
-          }
-        });
-        this.elements.input.addEventListener('input', () => {
-          const el = this.elements.input;
-          el.style.height = 'auto';
-          el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-          if (this.elements.sendBtn) {
-            this.elements.sendBtn.classList.toggle('active', !!el.value.trim());
-          }
-        });
-      }
-
-      if (this.elements.menuBtn) {
-        this.elements.menuBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          this.elements.menuDropdown?.classList.toggle('active');
-        });
-      }
-
-      if (this.elements.menuDropdown) {
-        this.elements.menuDropdown.addEventListener('click', (e) => {
-          const item = e.target.closest('[data-action]');
-          if (!item) return;
-          const action = item.dataset.action;
-          this.elements.menuDropdown.classList.remove('active');
-          if (action === 'new') this.startNewChat();
-          if (action === 'history') this.openHistory();
-          if (action === 'end') { this.startNewChat(); this.close(); }
-        });
-      }
-
-      if (this.elements.backBtn) {
-        this.elements.backBtn.addEventListener('click', () => this.closeHistory());
-      }
-
-      document.addEventListener('click', (e) => {
-        if (this.elements.menuDropdown?.classList.contains('active') &&
-            !this.elements.menuBtn?.contains(e.target) &&
-            !this.elements.menuDropdown?.contains(e.target)) {
-          this.elements.menuDropdown.classList.remove('active');
-        }
-      });
-
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && this.state.isOpen) this.close();
-      });
-
-      document.addEventListener('click', (e) => {
-        const btn = e.target.closest('[data-product-action]');
-        if (!btn) return;
-
-        e.preventDefault();
-        e.stopPropagation();
-
-        const action = btn.dataset.productAction;
-        const productId = btn.dataset.productId;
-
-        if (action === 'view-product') {
-          this.handleViewProduct(productId);
-        } else if (action === 'add-to-cart') {
-          this.handleAddToCart(productId);
-        } else if (action === 'go-to-cart') {
-          this.handleGoToCart();
-        } else if (action === 'modal-open') {
-          this.handleOpenProductModal(productId);
-        } else if (action === 'modal-close') {
-          this.handleCloseProductModal();
-        }
-      });
-    },
-
-    startPlaceholderRotation() {
-      setInterval(() => {
-        const input = this.elements.input;
-        if (input && !input.value) {
-          input.classList.add('placeholder-fade');
-          setTimeout(() => {
-            this.state.placeholderIndex = (this.state.placeholderIndex + 1) % this.placeholders.length;
-            input.placeholder = this.placeholders[this.state.placeholderIndex];
-            input.classList.remove('placeholder-fade');
-          }, 300);
-        }
-      }, 4000);
-    },
-
-    open() {
-      // Email capture popup is controlled by the "Show email capture popup"
-      // setting on the app embed (off by default).
-      const emailPopupEnabled = window.shopChatConfig?.emailPopupEnabled === true;
-      if (emailPopupEnabled && this.state.isFirstMessage && !this.state.emailCaptured && !this.state.emailPopupShown) {
-        this.showEmailPopup();
-        this.state.emailPopupShown = true;
-        sessionStorage.setItem('shopAiEmailPopupShown', 'true');
-      }
-
-      document.body.classList.add('shop-ai-open');
-      if (this.elements.floatingGroup) {
-        this.elements.floatingGroup.classList.add('hidden');
-      }
-      this.state.isOpen = true;
-      this.elements.input?.focus();
-    },
-
-    close() {
-      document.body.classList.remove('shop-ai-open');
-      if (this.elements.floatingGroup) {
-        this.elements.floatingGroup.classList.remove('hidden');
-      }
-      this.state.isOpen = false;
-    },
-
-    showEmailPopup() {
-      const overlay = document.getElementById('shop-ai-email-overlay');
-      if (!overlay) return;
-
-      overlay.classList.add('active');
-
-      const submitBtn = document.getElementById('shop-ai-email-submit');
-      const skipBtn = document.getElementById('shop-ai-email-skip');
-      const emailInput = document.getElementById('shop-ai-email-input');
-      const errorEl = document.getElementById('shop-ai-email-error');
-
-      const closeOverlay = () => overlay.classList.remove('active');
-
-      const onSubmit = () => {
-        const email = emailInput?.value?.trim();
-        if (email && email.includes('@') && email.includes('.')) {
-          this.state.emailCaptured = true;
-          localStorage.setItem('shopAiEmailCaptured', 'true');
-          closeOverlay();
-          this.captureEmail(email);
-          submitBtn?.removeEventListener('click', onSubmit);
-          skipBtn?.removeEventListener('click', onSkip);
-        } else {
-          if (errorEl) errorEl.classList.add('visible');
-        }
-      };
-
-      const onSkip = () => {
-        closeOverlay();
-        submitBtn?.removeEventListener('click', onSubmit);
-        skipBtn?.removeEventListener('click', onSkip);
-      };
-
-      submitBtn?.addEventListener('click', onSubmit);
-      skipBtn?.addEventListener('click', onSkip);
-
-      setTimeout(() => emailInput?.focus(), 300);
-    },
-
-    async captureEmail(email) {
-      try {
-        const leadsUrl = window.shopChatConfig?.leadsUrl;
-        if (!leadsUrl) {
-          console.warn('Leads URL not configured');
-          return;
-        }
-        await fetch(leadsUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email,
-            visitorId: this.state.visitorId,
-            conversationId: this.state.conversationId,
-            shop_domain: window.shopChatConfig?.shopDomain || '',
-          })
-        });
-      } catch (e) {
-        console.warn('Email capture failed:', e);
-      }
-    },
-
-    async send(messageArg) {
-      const message = (typeof messageArg === 'string' && messageArg.trim())
-        ? messageArg.trim()
-        : this.elements.input?.value?.trim();
-      if (!message) return;
-
-      if (this.state.isFirstMessage) {
-        this.state.isFirstMessage = false;
-        if (this.elements.suggestions) {
-          this.elements.suggestions.classList.remove('visible');
-          this.elements.suggestions.style.display = 'none';
-        }
-      }
-
-      this.addMessage(message, 'user');
-      if (this.elements.input) {
-        this.elements.input.value = '';
-        this.elements.input.style.height = 'auto';
-      }
-      if (this.elements.sendBtn) {
-        this.elements.sendBtn.classList.remove('active');
-      }
-
-      if (!this.state.conversationId) {
-        this.state.conversationId = 'conv_' + Date.now();
-        sessionStorage.setItem('shopAiConversationId', this.state.conversationId);
-      }
-
-      this.saveToHistory(message);
-      this.showThinking();
-
-      try {
-        const apiUrl = window.shopChatConfig?.apiUrl;
-        if (!apiUrl) {
-          throw new Error('Chat API URL not configured. Check theme extension settings.');
-        }
-
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message,
-            conversation_id: this.state.conversationId,
-            prompt_type: window.shopChatConfig?.promptType || 'standardAssistant',
-            shop_domain: window.shopChatConfig?.shopDomain || ''
-          })
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text().catch(() => '');
-          console.error('❌ API response:', response.status, errorText.substring(0, 200));
-          throw new Error(`Server returned ${response.status}`);
-        }
-
-        const contentType = response.headers.get('Content-Type') || '';
-        if (contentType.includes('text/html')) {
-          console.error('❌ Received HTML instead of SSE — check backend URL');
-          throw new Error('Received HTML response instead of stream. Backend URL may be wrong.');
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let currentAssistantMsg = null;
-        let buffer = '';
-        let fullText = '';
-
-        // v4.0: Track the current turn's product grid element so we can
-        // replace it if Claude does multiple searches in one turn.
-        // This is a per-turn reference — reset on each send().
-        let currentTurnGridEl = null;
-        // Track whether products were rendered this turn
-        let productsRenderedThisTurn = false;
-
-        // Track the active assistant text bubble across tool-result cycles.
-        let activeBubbleEl = null;
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const parts = buffer.split('\n\n');
-          buffer = parts.pop() || '';
-
-          for (const chunk of parts) {
-            const line = chunk.trim();
-            if (!line) continue;
-
-            const jsonStr = line.startsWith('data:') ? line.slice(5).trim() : line;
-            let data;
-            try {
-              data = JSON.parse(jsonStr);
-            } catch (err) {
-              continue;
-            }
-
-            if (data.type === 'id' && data.conversation_id) {
-              this.state.conversationId = data.conversation_id;
-              sessionStorage.setItem('shopAiConversationId', data.conversation_id);
-            }
-
-            if (data.type === 'thinking_state') {
-              this.updateThinkingState(data.state);
-            }
-
-            if (data.type === 'chunk') {
-              if (this.state.isThinking) {
-                this.removeThinking();
-              }
-              fullText += data.chunk;
-              if (!currentAssistantMsg) {
-                currentAssistantMsg = this.addMessage('', 'assistant');
-                activeBubbleEl = currentAssistantMsg.querySelector('.shop-ai-bubble');
-              }
-              if (activeBubbleEl) {
-                activeBubbleEl.innerHTML = this.parseMarkdown(fullText);
-                this.scrollToBottom();
-              }
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // v4.0 CRITICAL FIX: Render products IMMEDIATELY
-            //
-            // The v3.x "deferred to end_turn" approach caused cards to
-            // vanish in long sessions. Now we render on every
-            // product_results event. If Claude searches again in the
-            // same turn, we remove the previous grid and render the new
-            // one. This guarantees the user always sees the latest.
-            // ═══════════════════════════════════════════════════════════
-            if (data.type === 'product_results') {
-              this.removeThinking();
-              const products = data.products || [];
-              if (products.length > 0) {
-                // Remove previous grid from THIS turn (if Claude retried)
-                if (currentTurnGridEl && currentTurnGridEl.parentNode) {
-                  currentTurnGridEl.parentNode.removeChild(currentTurnGridEl);
-                }
-                currentTurnGridEl = this.renderProductsGrid(products);
-                productsRenderedThisTurn = true;
-              }
-            }
-
-            if (data.type === 'cart_updated') {
-              this.removeThinking();
-              if (data.checkout_url) {
-                this.updateCheckoutState(data.checkout_url, data.cart?.id);
-              }
-            }
-
-            if (data.type === 'message_complete') {
-              this.removeThinking();
-              if (currentAssistantMsg) {
-                // v4.0: Do NOT reset currentTurnGridEl here.
-                // The grid belongs to the turn, not the message.
-                currentAssistantMsg = null;
-                activeBubbleEl = null;
-                fullText = '';
-              }
-            }
-
-            if (data.type === 'end_turn') {
-              this.removeThinking();
-              // v4.0: Products already rendered. Just clean up state.
-              currentAssistantMsg = null;
-              activeBubbleEl = null;
-              fullText = '';
-              currentTurnGridEl = null;
-              productsRenderedThisTurn = false;
-            }
-
-            if (data.type === 'error') {
-              this.removeThinking();
-              this.addMessage(data.error || 'An error occurred', 'assistant');
-            }
-          }
-        }
-
-        this.removeThinking();
-      } catch (err) {
-        this.removeThinking();
-        console.error('❌ Chat error:', err);
-        this.addMessage('Sorry, there was an error. Please try again.', 'assistant');
-      }
-    },
-
-    addMessage(content, role) {
-      const msgDiv = document.createElement('div');
-      msgDiv.className = `shop-ai-message ${role}`;
-
-      const bubble = document.createElement('div');
-      bubble.className = 'shop-ai-bubble';
-
-      if (role === 'assistant') {
-        bubble.innerHTML = this.parseMarkdown(content);
-      } else {
-        bubble.textContent = content;
-      }
-
-      msgDiv.appendChild(bubble);
-      this.elements.messages?.appendChild(msgDiv);
-      this.scrollToBottom();
-      return msgDiv;
-    },
-
-    parseMarkdown(text) {
-      if (!text || typeof text !== 'string') return '<p></p>';
-
-      let cleaned = text
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-          (_m, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
-
-      const html = cleaned
-        .split('\n')
-        .filter(line => line.trim())
-        .join('<br>');
-
-      return `<p>${html}</p>`;
-    },
-
-    showThinking(initialText) {
-      if (this.state.isThinking) return;
-      this.state.isThinking = true;
-
-      const idlePhrases = [
-        'Thinking...',
-        'Analyzing your request...',
-        'Processing...',
-        'Working on it...',
-      ];
-
-      const container = document.createElement('div');
-      container.id = 'shop-ai-thinking';
-      container.className = 'shop-ai-thinking-container';
-      container.innerHTML =
-        '<div class="shop-ai-thinking-dots"><span></span><span></span><span></span></div>' +
-        '<span class="shop-ai-thinking-text">' + (initialText || idlePhrases[0]) + '</span>';
-
-      this.elements.messages?.appendChild(container);
-      this.scrollToBottom();
-
-      let cycleIdx = 0;
-      this.state.thinkingInterval = setInterval(() => {
-        cycleIdx = (cycleIdx + 1) % idlePhrases.length;
-        const el = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-        if (el) {
-          el.style.opacity = '0';
-          setTimeout(() => {
-            if (el.parentNode) {
-              el.textContent = idlePhrases[cycleIdx];
-              el.style.opacity = '1';
-            }
-          }, 200);
-        }
-      }, 2500);
-    },
-
-    updateThinkingState(toolText) {
-      clearInterval(this.state.thinkingInterval);
-      this.state.thinkingInterval = null;
-
-      const toolPhrases = {
-        'Searching products...':   ['Searching catalog...', 'Finding best matches...', 'Filtering results...', 'Almost done...'],
-        'Adding to cart...':       ['Adding to cart...', 'Preparing your order...', 'Updating basket...', 'Almost done...'],
-        'Looking up product...':   ['Looking up product...', 'Fetching details...', 'Checking availability...', 'Almost done...'],
-        'Looking up product details...': ['Fetching product details...', 'Loading specs...', 'Checking inventory...', 'Almost done...'],
-        'Checking availability...': ['Checking availability...', 'Looking up stock...', 'Verifying details...', 'Almost done...'],
-      };
-
-      const phrases = toolPhrases[toolText] || [toolText, 'Processing...', 'Working on it...', 'Almost done...'];
-
-      const el = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-      if (el) {
-        el.style.opacity = '0';
-        setTimeout(() => {
-          if (el.parentNode) {
-            el.textContent = phrases[0];
-            el.style.opacity = '1';
-          }
-        }, 150);
-
-        let cycleIdx = 0;
-        this.state.thinkingInterval = setInterval(() => {
-          cycleIdx = (cycleIdx + 1) % phrases.length;
-          const el2 = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-          if (el2) {
-            el2.style.opacity = '0';
-            setTimeout(() => {
-              if (el2.parentNode) {
-                el2.textContent = phrases[cycleIdx];
-                el2.style.opacity = '1';
-              }
-            }, 200);
-          }
-        }, 2500);
-      } else {
-        if (!this.state.isThinking) {
-          this.showThinking(toolText);
-        }
-      }
-    },
-
-    removeThinking() {
-      clearInterval(this.state.thinkingInterval);
-      this.state.thinkingInterval = null;
-      const ui = document.getElementById('shop-ai-thinking');
-      if (ui) ui.remove();
-      this.state.isThinking = false;
-    },
-
-    renderProductsGrid(products) {
-      if (!products || !products.length) return null;
-
-      console.log(`[ShopAIChat] Rendering ${products.length} products as carousel`);
-
-      const container = document.createElement('div');
-      container.className = 'shop-ai-product-grid';
-
-      products.forEach((prod, idx) => {
-        const productId = String(prod.id || `prod-${idx}`);
-        this.state.productDataMap.set(productId, prod);
-
-        const card = document.createElement('div');
-        card.className = 'shop-ai-product-card';
-        card.dataset.productId = productId;
-
-        const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
-          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-        }[c]));
-
-        const safeTitle = escapeHtml(prod.title || 'Untitled');
-        const safeSku = escapeHtml(prod.sku || '');
-        const safePrice = escapeHtml(prod.price || '');
-        const safeAlt = escapeHtml(prod.title || 'Product');
-
-        const imageEl = buildProductImage(prod.image_url, safeAlt, 'shop-ai-product-image-wrap');
-        if (imageEl.tagName !== 'IMG') {
-          imageEl.className = 'shop-ai-product-image shop-ai-product-image-wrap';
-        }
-        card.appendChild(imageEl);
-
-        const infoDiv = document.createElement('div');
-        infoDiv.className = 'shop-ai-product-info';
-        infoDiv.innerHTML = `
-          <h4 class="shop-ai-product-title" title="${safeTitle}">${safeTitle}</h4>
-          ${safeSku ? `<div class="shop-ai-product-sku">SKU: ${safeSku}</div>` : ''}
-          <div class="shop-ai-product-price">${safePrice}</div>
-        `;
-        card.appendChild(infoDiv);
-
-        card.addEventListener('click', () => {
-          this.handleOpenProductModal(productId);
-        });
-
-        container.appendChild(card);
-      });
-
-      this.elements.messages?.appendChild(container);
-      this.scrollToBottom();
-      return container;
-    },
-
-    handleOpenProductModal(productId) {
-      const product = this.state.productDataMap.get(productId);
-      if (!product) return;
-
-      this.handleCloseProductModal();
-
-      const overlay = document.createElement('div');
-      overlay.id = 'shop-ai-product-modal';
-      overlay.className = 'shop-ai-product-modal-overlay';
-
-      const isAdded = this.state.addedByProductId[productId] === true;
-      const safeTitle = (product.title || 'Product').replace(/"/g, '&quot;');
-
-      let rawDesc = product.description;
-      if (typeof rawDesc !== 'string') {
-        rawDesc = (rawDesc && typeof rawDesc === 'object')
-          ? (rawDesc.value || rawDesc.text || rawDesc.html || rawDesc.content || '')
-          : '';
-      }
-      const safeDescription = rawDesc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
-      const escapeHtmlAttr = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-      }[c]));
-
-      overlay.innerHTML = `
-        <div class="shop-ai-product-modal">
-          <button class="shop-ai-product-modal-close" data-product-action="modal-close">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
-
-          <div class="shop-ai-product-modal-left" id="shop-ai-modal-img-slot"></div>
-
-          <div class="shop-ai-product-modal-right">
-            <div class="shop-ai-product-modal-title">${escapeHtmlAttr(product.title || 'Product')}</div>
-            <div class="shop-ai-product-modal-price">${escapeHtmlAttr(product.price || 'Price on request')}</div>
-            ${product.sku ? `<div class="shop-ai-product-modal-sku"><span class="shop-ai-sku-label">SKU</span> ${escapeHtmlAttr(product.sku)}</div>` : ''}
-            ${safeDescription ? `<div class="shop-ai-product-modal-description">${escapeHtmlAttr(safeDescription)}</div>` : ''}
-
-            <div class="shop-ai-product-modal-actions">
-              ${product.url ? `<a href="${escapeHtmlAttr(product.url)}" target="_blank" rel="noopener noreferrer" class="shop-ai-product-modal-secondary">View on Store</a>` : ''}
-              ${(product.variant_id || product.merchandise_id) ? `<button class="shop-ai-product-modal-primary"
-                data-product-action="${isAdded ? 'go-to-cart' : 'add-to-cart'}"
-                data-product-id="${productId}">
-                ${isAdded ? 'Go to Cart' : 'Add to Cart'}
-              </button>` : ''}
-            </div>
-          </div>
-        </div>
-      `;
-
-      const imgSlot = overlay.querySelector('#shop-ai-modal-img-slot');
-      if (imgSlot) {
-        const modalImg = buildProductImage(product.image_url, safeTitle, 'shop-ai-modal-image-wrap');
-        modalImg.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;';
-        imgSlot.appendChild(modalImg);
-      }
-
-      document.body.appendChild(overlay);
-      requestAnimationFrame(() => overlay.classList.add('active'));
-      this.state.selectedProductModal = overlay;
-
-      overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) this.handleCloseProductModal();
-      });
-    },
-
-    handleCloseProductModal() {
-      if (this.state.selectedProductModal) {
-        const m = this.state.selectedProductModal;
-        m.classList.remove('active');
-        this.state.selectedProductModal = null;
-        setTimeout(() => m.remove(), 300);
-      }
-    },
-
-    handleViewProduct(productId) {
-      const product = this.state.productDataMap.get(productId);
-      if (!product) return;
-
-      const url = product.url || product.product_url;
-      if (!url) {
-        alert('Product page link not available');
-        return;
-      }
-
-      window.open(url, '_blank');
-    },
-
-    async handleAddToCart(productId) {
-      if (this.state.isCartUpdating) return;
-
-      const product = this.state.productDataMap.get(productId);
-      if (!product) return;
-
-      const variantId = product.variant_id || product.merchandise_id;
-      if (!variantId) {
-        this.addMessage('Cannot add this product - missing variant.', 'assistant');
-        return;
-      }
-
-      this.state.isCartUpdating = true;
-      const button = document.querySelector(`[data-product-action="add-to-cart"][data-product-id="${productId}"]`);
-
-      if (button) {
-        button.textContent = 'Adding...';
-        button.disabled = true;
-      }
-
-      try {
-        let added = false;
-
-        // 1) Store's own cart. The backend /api/cart creates a separate
-        //    Storefront API cart that the theme never sees (cart icon stays 0,
-        //    /cart page is empty), so the native Ajax Cart API comes first.
-        const numericVariantId = this.toNumericVariantId(variantId);
-        if (numericVariantId) {
-          try {
-            await this.addToNativeCart(numericVariantId, 1);
-            this.setCartMode('native');
-            added = true;
-            this.refreshThemeCart();
-          } catch (nativeErr) {
-            // 422 = Shopify refused the item (sold out, qty limit…). The
-            // headless cart would refuse it too, so show the reason instead.
-            if (nativeErr.status === 422) {
-              throw Object.assign(new Error(nativeErr.message), { userMessage: nativeErr.message });
-            }
-            console.warn('Native cart add failed, falling back to app cart:', nativeErr);
-          }
-        }
-
-        // 2) Fallback: backend Storefront API cart (pages without the Online
-        //    Store cart, e.g. a headless/custom page).
-        if (!added) {
-          const data = await this.addToHeadlessCart(variantId, 1);
-          this.updateCheckoutState(data.checkoutUrl, data.cartId);
-          this.setCartMode('headless');
-        }
-
-        this.state.addedByProductId[productId] = true;
-        sessionStorage.setItem('shopAiAddedByProductId', JSON.stringify(this.state.addedByProductId));
-
-        document.querySelectorAll(`[data-product-id="${productId}"]`).forEach(btn => {
-          if (btn.dataset.productAction === 'add-to-cart') {
-            btn.textContent = 'Go to Cart';
-            btn.dataset.productAction = 'go-to-cart';
-            btn.disabled = false;
-          }
-        });
-
-        this.addMessage('Added to cart! 🎉 Tap **Go to Cart** to view your cart and check out.', 'assistant');
-      } catch (err) {
-        console.error('❌ Add to cart error:', err);
-        if (button) {
-          button.textContent = 'Add to Cart';
-          button.disabled = false;
-        }
-        this.addMessage(
-          err.userMessage
-            ? `Could not add to cart: ${err.userMessage}`
-            : 'Could not add to cart. Please try again.',
-          'assistant'
-        );
-      } finally {
-        this.state.isCartUpdating = false;
-      }
-    },
-
-    // "gid://shopify/ProductVariant/123" → "123" (the Ajax Cart API needs the numeric ID)
-    toNumericVariantId(variantId) {
-      const match = String(variantId || '').match(/(\d+)\s*$/);
-      return match ? match[1] : null;
-    },
-
-    getStoreRoot() {
-      let root = window.shopChatConfig?.rootUrl || window.Shopify?.routes?.root || '/';
-      if (!root.endsWith('/')) root += '/';
-      return root;
-    },
-
-    getCartPageUrl() {
-      return window.shopChatConfig?.cartPageUrl || `${this.getStoreRoot()}cart`;
-    },
-
-    async addToNativeCart(numericVariantId, quantity) {
-      const url = window.shopChatConfig?.cartAddUrl
-        ? `${window.shopChatConfig.cartAddUrl}.js`
-        : `${this.getStoreRoot()}cart/add.js`;
-
-      const response = await fetch(url, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: JSON.stringify({ items: [{ id: Number(numericVariantId), quantity }] }),
-      });
-
-      let data = null;
-      try { data = await response.json(); } catch (_) { /* non-JSON (e.g. 404 page) */ }
-
-      if (!response.ok || !data || data.status) {
-        const message = (data && (data.description || data.message)) || `HTTP ${response.status}`;
-        const error = new Error(message);
-        error.status = (data && data.status) || response.status;
-        throw error;
-      }
-      return data;
-    },
-
-    async addToHeadlessCart(variantId, quantity) {
-      const cartApiUrl = window.shopChatConfig?.cartUrl ||
-        (window.shopChatConfig?.apiUrl || '/chat').replace('/chat', '/api/cart');
-
-      const response = await fetch(cartApiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          variantId,
-          quantity,
-          cartId: this.state.cartMode === 'headless' ? this.state.cartId : null,
-          conversationId: this.state.conversationId,
-          shop_domain: window.shopChatConfig?.shopDomain || ''
-        })
-      });
-
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-      const data = await response.json();
-      if (data.status !== 'success' || !data.checkoutUrl || !data.cartId) {
-        throw new Error(data.message || 'Failed to add to cart');
-      }
-      return data;
-    },
-
-    setCartMode(mode) {
-      this.state.cartMode = mode;
-      sessionStorage.setItem('shopAiCartMode', mode);
-    },
-
-    // Best-effort: update the theme's cart icon count / drawer without a reload.
-    async refreshThemeCart() {
-      try {
-        const root = this.getStoreRoot();
-
-        // Dawn-family themes: re-render the cart icon bubble and cart drawer sections.
-        const sectionsRes = await fetch(`${root}?sections=cart-icon-bubble,cart-drawer`, {
-          credentials: 'same-origin',
-        });
-        if (sectionsRes.ok) {
-          const sections = await sectionsRes.json().catch(() => null);
-          if (sections) this.applyThemeSections(sections);
-        }
-
-        // Generic count badges used by many themes.
-        const cartRes = await fetch(`${root}cart.js`, {
-          credentials: 'same-origin',
-          headers: { 'Accept': 'application/json' },
-        });
-        const cart = cartRes.ok ? await cartRes.json().catch(() => null) : null;
-        if (cart && typeof cart.item_count === 'number') {
-          document.querySelectorAll('[data-cart-count], .cart-count, .cart-count-bubble span[aria-hidden="true"]')
-            .forEach(el => { el.textContent = String(cart.item_count); });
-        }
-
-        // Notify the theme (Dawn pub/sub + common custom events).
-        // Dawn declares PUB_SUB_EVENTS with `const`, so it is a global binding
-        // but not a window property.
-        const pubSubEvents = typeof PUB_SUB_EVENTS !== 'undefined' ? PUB_SUB_EVENTS : window.PUB_SUB_EVENTS;
-        if (typeof window.publish === 'function' && pubSubEvents?.cartUpdate) {
-          window.publish(pubSubEvents.cartUpdate, { source: 'shop-ai-chat', cartData: cart });
-        }
-        document.dispatchEvent(new CustomEvent('cart:refresh', { bubbles: true, detail: { cart } }));
-        document.dispatchEvent(new CustomEvent('cart:updated', { bubbles: true, detail: { cart } }));
-      } catch (err) {
-        console.warn('Theme cart refresh skipped:', err);
-      }
-    },
-
-    applyThemeSections(sections) {
-      const parse = (html) => new DOMParser().parseFromString(html, 'text/html');
-
-      if (sections['cart-icon-bubble']) {
-        const target = document.getElementById('cart-icon-bubble');
-        const source = parse(sections['cart-icon-bubble']).querySelector('.shopify-section');
-        if (target && source) target.innerHTML = source.innerHTML;
-      }
-
-      if (sections['cart-drawer']) {
-        const target = document.getElementById('CartDrawer');
-        const source = parse(sections['cart-drawer']).getElementById('CartDrawer');
-        if (target && source) {
-          target.innerHTML = source.innerHTML;
-          target.closest('cart-drawer')?.classList.remove('is-empty');
-        }
-      }
-    },
-
-    handleGoToCart() {
-      if (this.state.cartMode === 'native') {
-        window.location.href = this.getCartPageUrl();
-        return;
-      }
-      this.openCheckout();
-    },
-
-    updateCheckoutState(checkoutUrl, cartId) {
-      if (checkoutUrl && checkoutUrl !== this.state.lastCheckoutUrlShown) {
-        this.state.checkoutUrl = checkoutUrl;
-        this.state.lastCheckoutUrlShown = checkoutUrl;
-        sessionStorage.setItem('shopAiCheckoutUrl', checkoutUrl);
-      }
-      if (cartId) {
-        this.state.cartId = cartId;
-        sessionStorage.setItem('shopAiCartId', cartId);
-      }
-    },
-
-    openCheckout() {
-      const url = this.state.checkoutUrl;
-
-      if (!url || typeof url !== 'string') {
-        console.error('No checkout URL available');
-        this.addMessage('Could not open cart.', 'assistant');
-        return;
-      }
-
-      const safeUrl = String(url).trim();
-
-      if (!safeUrl.startsWith('https://') && !safeUrl.startsWith('http://')) {
-        console.error('Invalid protocol:', safeUrl.substring(0, 30));
-        this.addMessage('Invalid cart link.', 'assistant');
-        return;
-      }
-
-      if (!safeUrl.includes('/cart/c/')) {
-        console.error('Invalid checkout path:', safeUrl.substring(0, 60));
-        this.addMessage('Invalid cart link format.', 'assistant');
-        return;
-      }
-
-      try {
-        window.open(safeUrl, '_blank');
-      } catch (err) {
-        console.warn('Popup blocked, using redirect');
-        window.location.href = safeUrl;
-      }
-    },
-
-    scrollToBottom() {
-      if (this.elements.messages) {
-        this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
-      }
-    },
-
-    startNewChat() {
-      this.state.addedByProductId = {};
-      this.state.cartId = null;
-      this.state.checkoutUrl = null;
-      this.state.lastCheckoutUrlShown = null;
-      this.state.cartMode = null;
-      this.state.conversationId = null;
-      this.state.isFirstMessage = true;
-      this.state.productDataMap.clear();
-
-      sessionStorage.removeItem('shopAiConversationId');
-      sessionStorage.removeItem('shopAiCartId');
-      sessionStorage.removeItem('shopAiCheckoutUrl');
-      sessionStorage.removeItem('shopAiCartMode');
-      sessionStorage.removeItem('shopAiAddedByProductId');
-
-      if (this.elements.messages) {
-        this.elements.messages.innerHTML = '';
-      }
-
-      if (this.elements.suggestions) {
-        this.elements.suggestions.style.display = '';
-        this.elements.messages?.appendChild(this.elements.suggestions);
-        this.elements.suggestions.classList.add('visible');
-      }
-
-      if (this.elements.input) {
-        this.elements.input.value = '';
-        this.elements.input.style.height = 'auto';
-        this.elements.input.focus();
-      }
-      if (this.elements.sendBtn) {
-        this.elements.sendBtn.classList.remove('active');
-      }
-    },
-
-    openHistory() {
-      this.elements.historyPanel?.classList.add('active');
-      this.renderHistoryList();
-    },
-
-    closeHistory() {
-      this.elements.historyPanel?.classList.remove('active');
-    },
-
-    renderHistoryList() {
-      const list = this.elements.historyList;
-      if (!list) return;
-
-      const history = JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]');
-
-      if (!history.length) {
-        list.innerHTML = '<div class="shop-ai-history-empty">No previous conversations yet</div>';
-        return;
-      }
-
-      list.innerHTML = '';
-      history.forEach(conv => {
-        const item = document.createElement('div');
-        item.className = 'shop-ai-history-item';
-
-        const timeStr = conv.timestamp
-          ? new Date(conv.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-          : '';
-
-        item.innerHTML = `
-          <div class="shop-ai-history-item-title">${conv.title || 'Conversation'}</div>
-          <div class="shop-ai-history-item-time">${timeStr}</div>
-        `;
-
-        item.addEventListener('click', () => this.loadConversation(conv.id));
-        list.appendChild(item);
-      });
-    },
-
-    async loadConversation(conversationId) {
-      this.closeHistory();
-
-      if (this.elements.messages) {
-        this.elements.messages.innerHTML = '';
-      }
-
-      this.state.conversationId = conversationId;
-      this.state.isFirstMessage = false;
-      sessionStorage.setItem('shopAiConversationId', conversationId);
-
-      if (this.elements.suggestions) {
-        this.elements.suggestions.classList.remove('visible');
-        this.elements.suggestions.style.display = 'none';
-      }
-
-      this.showThinking('Loading conversation...');
-
-      try {
-        const apiUrl = window.shopChatConfig?.apiUrl;
-        if (!apiUrl) throw new Error('API URL not configured');
-
-        const historyUrl = `${apiUrl}?history=true&conversation_id=${encodeURIComponent(conversationId)}`;
-        const response = await fetch(historyUrl);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-        this.removeThinking();
-
-        if (data.messages && data.messages.length) {
-          data.messages.forEach(msg => {
-            if (msg.role === 'user' || msg.role === 'assistant') {
-              const content = typeof msg.content === 'string' ? msg.content : '';
-              if (content) this.addMessage(content, msg.role);
-            }
-          });
-          this.scrollToBottom();
-        } else {
-          this.addMessage('This conversation has no messages.', 'assistant');
-        }
-      } catch (err) {
-        this.removeThinking();
-        console.error('Failed to load conversation:', err);
-        this.addMessage('Could not load conversation history.', 'assistant');
-      }
-    },
-
-    saveToHistory(firstMessage) {
-      if (!this.state.conversationId) return;
-
-      const history = JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]');
-
-      if (history.some(h => h.id === this.state.conversationId)) return;
-
-      history.unshift({
-        id: this.state.conversationId,
-        title: (firstMessage || 'Chat').substring(0, 60),
-        timestamp: Date.now(),
-      });
-
-      if (history.length > 30) history.length = 30;
-
-      localStorage.setItem('shopAiChatHistory', JSON.stringify(history));
-    },
-
-    restoreState() {
-      if (this.state.conversationId) {
-        this.state.isFirstMessage = false;
-        if (this.elements.suggestions) {
-          this.elements.suggestions.classList.remove('visible');
-          this.elements.suggestions.style.display = 'none';
-        }
-      }
-    },
-
-    openAndSend(message) {
-      if (!this.state.isOpen) {
-        this.open();
-      }
-      if (typeof message === 'string' && message.trim()) {
-        setTimeout(() => this.send(message), 150);
-      }
-    },
-
-    exposeAPI() {
-      window.ShopAIChat = this;
+  /* ============================================
+     MODERN THEME - BLACK, WHITE, LIGHT ORANGE
+     ============================================ */
+  :root{
+    --shop-ai-primary: #FF9D5C;
+    --shop-ai-primary-dark: #FF8534;
+    --shop-ai-gradient: linear-gradient(135deg, #FF9D5C 0%, #FF8534 100%);
+    --shop-ai-bg: #ffffff;
+    --shop-ai-text: #1a1a1a;
+    --shop-ai-text-light: #666666;
+    --shop-ai-border: rgba(0,0,0,0.08);
+    --shop-ai-glass: rgba(255,255,255,0.8);
+    --shop-ai-shadow: 0 20px 60px rgba(0,0,0,0.12);
+    --shop-ai-shadow-sm: 0 4px 12px rgba(0,0,0,0.06);
+    --shop-ai-shadow-xs: 0 1px 3px rgba(0,0,0,0.04);
+    --shop-ai-radius: 24px;
+    --shop-ai-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  .shop-ai-reset *{
+    box-sizing: border-box;
+    font-family: var(--shop-ai-font);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Override Shopify global *:focus-visible outline/box-shadow conflict */
+  .shop-ai-reset *:focus-visible{
+    outline: none !important;
+    box-shadow: none !important;
+  }
+
+  /* ============================================
+     FLOATING LAUNCHER — HIDDEN (moved to header)
+     ============================================ */
+  .shop-ai-floating-group{
+    display: none !important;
+  }
+
+  /* ============================================
+     HEADER "ASK AI" BUTTON — injected via JS
+     ============================================ */
+  .shop-ai-header-trigger{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: rgba(255,157,92,0.13);
+    color: var(--shop-ai-primary-dark) !important;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--shop-ai-font);
+    border: 1px solid rgba(255,157,92,0.2);
+    cursor: pointer;
+    white-space: nowrap;
+    line-height: 1;
+    letter-spacing: 0.01em;
+    transition: transform 0.2s cubic-bezier(0.16,1,0.3,1), box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
+    box-shadow: 0 2px 8px rgba(255,133,52,0.1);
+    vertical-align: middle;
+    text-decoration: none !important;
+    -webkit-font-smoothing: antialiased;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .shop-ai-header-trigger::after{
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(110deg, transparent 25%, rgba(255,157,92,0.18) 37%, transparent 63%);
+    background-size: 200% 100%;
+    animation: shimmer 3s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  .shop-ai-header-trigger:hover{
+    transform: translateY(-1px);
+    background: rgba(255,157,92,0.22);
+    box-shadow: 0 4px 16px rgba(255,133,52,0.18);
+  }
+
+  .shop-ai-header-trigger:active{
+    transform: scale(0.96);
+    transition-duration: 0.1s;
+  }
+
+  .shop-ai-header-trigger svg{
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    fill: var(--shop-ai-primary-dark);
+    color: var(--shop-ai-primary-dark);
+  }
+
+  /* Wrapper so it sits nicely in Dawn header__icons */
+  .shop-ai-header-trigger-wrap{
+    display: inline-flex;
+    align-items: center;
+    margin-left: 4px;
+  }
+
+  /* ---- Mobile: smaller pill ---- */
+  @media (max-width: 749px){
+    .shop-ai-header-trigger{
+      padding: 7px 12px;
+      font-size: 12px;
+      gap: 4px;
     }
-  };
+    .shop-ai-header-trigger svg{
+      width: 14px;
+      height: 14px;
+    }
+    .shop-ai-header-trigger .shop-ai-trigger-label{
+      display: inline;
+    }
+  }
+  @media (max-width: 389px){
+    .shop-ai-header-trigger{
+      padding: 6px 10px;
+      font-size: 0;
+      gap: 0;
+    }
+    .shop-ai-header-trigger svg{
+      width: 18px;
+      height: 18px;
+    }
+    .shop-ai-header-trigger .shop-ai-trigger-label{
+      display: none;
+    }
+  }
+
+  /* ============================================
+     BACKDROP & MODAL
+     ============================================ */
+  .shop-ai-backdrop{
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.40);
+    z-index: 999998;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.25s ease, visibility 0.25s ease;
+  }
+
+  body.shop-ai-open .shop-ai-backdrop{
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .shop-ai-modal{
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -48%) scale(0.96);
+    width: 92%;
+    max-width: 860px;
+    height: 82vh;
+    max-height: 92vh;
+    background: #ffffff;
+    border-radius: var(--shop-ai-radius);
+    box-shadow:
+      0 20px 60px rgba(0,0,0,0.15),
+      0 0 0 1px rgba(255,157,92,0.15),
+      0 0 20px rgba(255,157,92,0.08),
+      0 0 40px rgba(255,157,92,0.04);
+    border: 1.5px solid rgba(255,157,92,0.25);
+    z-index: 999999;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    opacity: 0;
+    visibility: hidden;
+    transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  body.shop-ai-open .shop-ai-modal{
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  .shop-ai-modal.active{
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  .shop-ai-backdrop.active{
+    opacity: 1;
+    visibility: visible;
+  }
+
+  /* ============================================
+     FLOATING TITLE — OUTSIDE MODAL, ON BORDER
+     ============================================ */
+  .shop-ai-floating-title{
+    position: fixed;
+    left: 50%;
+    top: calc(50% - 41vh);
+    transform: translate(-50%, -50%);
+    z-index: 1000000;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.35s cubic-bezier(0.16, 1, 0.3, 1) 0.08s, visibility 0.35s ease 0.08s, transform 0.35s cubic-bezier(0.16, 1, 0.3, 1) 0.08s;
+    pointer-events: none;
+    max-width: 90vw;
+    white-space: nowrap;
+  }
+
+  body.shop-ai-open .shop-ai-floating-title{
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .shop-ai-floating-title::before{
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 130%;
+    height: 260%;
+    background: radial-gradient(ellipse at center,
+      rgba(255,255,255,0.92) 0%,
+      rgba(255,255,255,0.7) 30%,
+      rgba(255,255,255,0.0) 70%);
+    filter: blur(6px);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .shop-ai-floating-title::after{
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 120%;
+    height: 200%;
+    background: radial-gradient(ellipse at center,
+      rgba(255,157,92,0.22) 0%,
+      rgba(255,133,52,0.08) 40%,
+      transparent 70%);
+    filter: blur(14px);
+    pointer-events: none;
+    z-index: -1;
+    animation: glowPulse 3s ease-in-out infinite;
+  }
+
+  /* Animated glow on the modal border */
+  body.shop-ai-open .shop-ai-modal::before{
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: var(--shop-ai-radius);
+    background: linear-gradient(135deg,
+      rgba(255,157,92,0.0) 0%,
+      rgba(255,157,92,0.3) 25%,
+      rgba(255,133,52,0.4) 50%,
+      rgba(255,157,92,0.3) 75%,
+      rgba(255,157,92,0.0) 100%);
+    background-size: 300% 300%;
+    animation: borderGlow 4s ease-in-out infinite;
+    z-index: -1;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    padding: 1.5px;
+    pointer-events: none;
+  }
+
+  @keyframes borderGlow{
+    0%, 100%{ background-position: 0% 50%; }
+    50%{ background-position: 100% 50%; }
+  }
+
+  @keyframes glowPulse{
+    0%, 100%{ opacity: 0.7; }
+    50%{ opacity: 1; }
+  }
+
+  .shop-ai-floating-title h3{
+    margin: 0;
+    padding: 6px 24px;
+    font-size: 20px;
+    font-weight: 700;
+    background: linear-gradient(135deg, #FF9D5C 0%, #FF8534 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.3px;
+    white-space: nowrap;
+  }
+
+  /* ============================================
+     HEADER — ACTION BUTTONS ONLY
+     ============================================ */
+  .shop-ai-header{
+    position: relative;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 56px;
+    border-bottom: 1px solid transparent;
+    background: linear-gradient(180deg, rgba(255,157,92,0.03) 0%, rgba(255,255,255,0) 100%);
+  }
+
+  .shop-ai-header::before{
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg,
+      transparent 0%,
+      rgba(255,157,92,0.3) 15%,
+      rgba(255,133,52,0.6) 50%,
+      rgba(255,157,92,0.3) 85%,
+      transparent 100%);
+  }
+
+  .shop-ai-header::after{
+    content: "";
+    position: absolute;
+    bottom: -2px;
+    left: 10%;
+    right: 10%;
+    height: 6px;
+    background: linear-gradient(90deg,
+      transparent 0%,
+      rgba(255,157,92,0.15) 20%,
+      rgba(255,133,52,0.25) 50%,
+      rgba(255,157,92,0.15) 80%,
+      transparent 100%);
+    filter: blur(4px);
+    pointer-events: none;
+  }
+
+  /* Mobile-only title (hidden on desktop) */
+  .shop-ai-header-title-mobile{
+    display: none;
+    margin: 0;
+    font-size: 20px;
+    font-weight: 700;
+    background: linear-gradient(135deg, #FF9D5C 0%, #FF8534 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.3px;
+  }
+
+  /* Header actions - minimalist 3-dot menu */
+  .shop-ai-header-actions{
+    position: absolute;
+    right: 20px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+  }
+
+  .shop-ai-icon-btn{
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.04);
+    border: 1px solid var(--shop-ai-border);
+    color: var(--shop-ai-text);
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .shop-ai-icon-btn:hover{
+    background: rgba(255,157,92,0.1);
+    transform: translateY(-1px);
+  }
+
+  .shop-ai-icon-btn:active{
+    transform: scale(0.94);
+    transition-duration: 0.1s;
+  }
+
+  .shop-ai-menu-btn{
+    position: relative;
+  }
+
+  .shop-ai-menu-btn svg{
+    width: 4px;
+    height: 4px;
+  }
+
+  .shop-ai-3dot-icon{
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    align-items: center;
+  }
+
+  .shop-ai-3dot-icon span{
+    width: 4px;
+    height: 4px;
+    background: var(--shop-ai-text);
+    border-radius: 50%;
+    opacity: 0.6;
+  }
+
+  .shop-ai-menu-dropdown{
+    position: absolute;
+    top: 48px;
+    right: 0;
+    background: white;
+    border: 1px solid var(--shop-ai-border);
+    border-radius: 12px;
+    box-shadow: var(--shop-ai-shadow);
+    min-width: 200px;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-8px);
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    overflow: hidden;
+    z-index: 1000;
+  }
+
+  .shop-ai-menu-dropdown.active{
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+  }
+
+  .shop-ai-menu-item{
+    width: 100%;
+    padding: 14px 18px;
+    border: none;
+    background: transparent;
+    text-align: left;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--shop-ai-text);
+    cursor: pointer;
+    transition: background 0.15s ease;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .shop-ai-menu-item:hover{
+    background: rgba(255,157,92,0.08);
+  }
+
+  .shop-ai-menu-item.danger{
+    color: #ef4444;
+  }
+
+  .shop-ai-messages{
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    background: transparent;
+    scroll-behavior: smooth;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0,0,0,0.1) transparent;
+  }
+
+  .shop-ai-messages::-webkit-scrollbar{ width: 4px; }
+  .shop-ai-messages::-webkit-scrollbar-track{ background: transparent; }
+  .shop-ai-messages::-webkit-scrollbar-thumb{ background: rgba(0,0,0,0.1); border-radius: 4px; }
+
+  .shop-ai-message{
+    display: flex;
+    flex-direction: column;
+    animation: messageSlide 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes messageSlide{
+    from{ opacity: 0; transform: translateY(8px); }
+    to{ opacity: 1; transform: translateY(0); }
+  }
+
+  .shop-ai-message.user{ align-self: flex-end; max-width: 75%; }
+  .shop-ai-message.user .shop-ai-bubble{
+    padding: 10px 14px;
+    background: var(--shop-ai-gradient);
+    border-radius: 16px;
+    border-bottom-right-radius: 4px;
+    box-shadow: var(--shop-ai-shadow-sm);
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 500;
+    text-align: right;
+  }
+
+  .shop-ai-message.assistant{ align-self: flex-start; max-width: 85%; }
+  .shop-ai-message.assistant .shop-ai-bubble{
+    padding: 16px 18px;
+    background: rgba(0,0,0,0.02);
+    border-radius: 18px;
+    border-top-left-radius: 4px;
+    box-shadow: var(--shop-ai-shadow-xs);
+    color: var(--shop-ai-text);
+    font-size: 15px;
+    line-height: 1.6;
+  }
+
+  .shop-ai-bubble p{ margin: 0 0 12px 0; }
+  .shop-ai-bubble p:last-child{ margin-bottom: 0; }
+  .shop-ai-bubble strong{ font-weight: 600; color: var(--shop-ai-text); }
+  .shop-ai-bubble a{ color: var(--shop-ai-primary); text-decoration: none; }
+
+  .shop-ai-suggestions{ display: block; margin-top: auto; opacity: 0; animation: fadeIn 0.5s ease forwards; animation-delay: 0.2s; }
+  @keyframes fadeIn{ to{ opacity: 1; } }
+  .shop-ai-suggestions.visible{ opacity: 1; }
+  .shop-ai-sugg-title{ font-size: 12px; text-transform: uppercase; color: var(--shop-ai-text-light); font-weight: 700; letter-spacing: 0.5px; margin-bottom: 14px; }
+  .shop-ai-sugg-list{ display: flex; flex-direction: column; gap: 10px; }
+  .shop-ai-sugg-item{ display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 12px; background: white; border: 1px solid var(--shop-ai-border); cursor: pointer; transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); font-size: 14px; font-weight: 500; color: var(--shop-ai-text); }
+  .shop-ai-sugg-item svg{ width: 18px; height: 18px; color: var(--shop-ai-primary); flex-shrink: 0; }
+  .shop-ai-sugg-item:hover{ transform: translateX(6px); border-color: var(--shop-ai-primary); box-shadow: var(--shop-ai-shadow-sm); }
+
+  @keyframes fadeInUp{ from{ opacity: 0; transform: translateY(12px); } to{ opacity: 1; transform: translateY(0); } }
+  .shop-ai-product-grid{ display: flex; flex-wrap: nowrap; gap: 12px; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; padding: 8px 2px 14px; scrollbar-width: none; animation: fadeInUp 0.35s ease; min-width: 0; }
+  .shop-ai-product-grid::-webkit-scrollbar{ display: none; }
+  .shop-ai-product-card{ flex: 0 0 158px; min-width: 0; scroll-snap-align: start; background: white; border: 1px solid var(--shop-ai-border); border-radius: 14px; overflow: hidden; cursor: pointer; transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.22s, border-color 0.22s; display: flex; flex-direction: column; position: relative; }
+  .shop-ai-product-card:hover{ transform: translateY(-4px); box-shadow: 0 8px 24px rgba(0,0,0,0.1); border-color: var(--shop-ai-primary); }
+  /* Subtle "view" overlay on hover */
+  .shop-ai-product-card::after{ content: 'Tap to view'; position: absolute; bottom: 0; left: 0; right: 0; padding: 10px 8px 8px; background: linear-gradient(to top, rgba(255,141,52,0.92) 0%, rgba(255,157,92,0.7) 60%, transparent 100%); color: #fff; font-size: 11px; font-weight: 600; text-align: center; letter-spacing: 0.2px; opacity: 0; transition: opacity 0.2s ease; border-radius: 0 0 14px 14px; pointer-events: none; }
+  .shop-ai-product-card:hover::after{ opacity: 1; }
+  .shop-ai-product-image{ width: 100%; height: 148px; object-fit: cover; background: #f5f5f5; display: block; }
+  .shop-ai-product-info{ padding: 10px; min-width: 0; overflow: hidden; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+  .shop-ai-product-title{ font-size: 12.5px; font-weight: 600; color: var(--shop-ai-text); margin: 0; overflow: hidden; text-overflow: ellipsis; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; min-height: 3.9em; }
+  .shop-ai-product-sku{ font-size: 10.5px; font-weight: 600; color: var(--shop-ai-text-light); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: rgba(0,0,0,0.03); border-radius: 4px; padding: 1px 5px; align-self: flex-start; }
+  .shop-ai-product-price{ font-size: 13px; font-weight: 700; color: var(--shop-ai-primary); margin: 2px 0 0; margin-top: auto; }
+
+  .shop-ai-product-modal-overlay{ position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.45); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 2000000; opacity: 0; visibility: hidden; transition: opacity 0.25s ease, visibility 0.25s ease; }
+  .shop-ai-product-modal-overlay.active{ opacity: 1; visibility: visible; }
+  .shop-ai-product-modal{ width: 100%; max-width: 580px; background: #fff; border-radius: 24px; box-shadow: 0 24px 80px rgba(0,0,0,0.18), 0 0 0 1px rgba(255,157,92,0.12); display: flex; gap: 20px; padding: 48px 24px 24px; position: relative; transform: translateY(16px) scale(0.97); transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease; margin: 0 16px; }
+  .shop-ai-product-modal-overlay.active .shop-ai-product-modal{ transform: translateY(0) scale(1); }
+  .shop-ai-product-modal-left{ flex: 0 0 200px; border-radius: 16px; overflow: hidden; background: #f7f7f7; display: flex; align-items: center; justify-content: center; aspect-ratio: 1; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.06); }
+  .shop-ai-product-modal-left img{ width: 100%; height: 100%; object-fit: cover; }
+  .shop-ai-product-modal-right{ flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .shop-ai-product-modal-title{ font-size: 17px; font-weight: 700; color: var(--shop-ai-text); line-height: 1.3; }
+  .shop-ai-product-modal-price{ font-size: 20px; font-weight: 800; color: var(--shop-ai-primary); letter-spacing: -0.3px; }
+  .shop-ai-product-modal-sku{ display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--shop-ai-text-light); font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(255,157,92,0.08); border: 1px solid rgba(255,157,92,0.18); border-radius: 6px; padding: 3px 8px; align-self: flex-start; }
+  .shop-ai-sku-label{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--shop-ai-primary); font-weight: 700; }
+  .shop-ai-product-modal-description{ font-size: 13.5px; color: var(--shop-ai-text-light); line-height: 1.55; max-height: 90px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.1) transparent; margin-top: 2px; }
+  .shop-ai-product-modal-description::-webkit-scrollbar{ width: 3px; }
+  .shop-ai-product-modal-description::-webkit-scrollbar-thumb{ background: rgba(0,0,0,0.12); border-radius: 3px; }
+  .shop-ai-product-modal-actions{ margin-top: auto; padding-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .shop-ai-product-modal-primary{ flex: 1; padding: 12px 20px; border-radius: 999px; border: none; background: var(--shop-ai-gradient); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: transform 0.2s, box-shadow 0.2s; box-shadow: 0 2px 8px rgba(255,133,52,0.25); }
+  .shop-ai-product-modal-primary:hover{ transform: translateY(-2px); box-shadow: 0 6px 20px rgba(255,157,92,0.35); }
+  .shop-ai-product-modal-secondary{ padding: 12px 20px; border-radius: 999px; border: 1.5px solid var(--shop-ai-border); background: #fff; color: var(--shop-ai-text); font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; transition: border-color 0.2s, background 0.2s, color 0.2s; }
+  .shop-ai-product-modal-secondary:hover{ border-color: var(--shop-ai-primary); background: rgba(255,157,92,0.05); color: var(--shop-ai-primary-dark); }
+  .shop-ai-product-modal-close{ position: absolute; top: 14px; right: 14px; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--shop-ai-border); background: rgba(255,255,255,0.95); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s, transform 0.15s; }
+  .shop-ai-product-modal-close:hover{ background: rgba(0,0,0,0.06); transform: scale(1.1); }
+  .shop-ai-product-modal-close svg{ width: 14px; height: 14px; }
+
+  .shop-ai-thinking-container{ display: inline-flex; align-items: center; gap: 10px; padding: 11px 16px; background: rgba(255,157,92,0.06); border: 1px solid rgba(255,157,92,0.14); border-radius: 18px; border-top-left-radius: 4px; align-self: flex-start; animation: messageSlide 0.3s ease; position: relative; overflow: hidden; max-width: 260px; }
+  .shop-ai-thinking-container::before{ content: ''; position: absolute; inset: 0; background: linear-gradient(110deg, transparent 20%, rgba(255,157,92,0.08) 37%, transparent 63%); background-size: 200% 100%; animation: shimmer 2.2s ease-in-out infinite; pointer-events: none; }
+  @keyframes shimmer{ 0%{ background-position: 200% 0; } 100%{ background-position: -200% 0; } }
+  .shop-ai-thinking-dots{ display: flex; gap: 5px; align-items: center; position: relative; z-index: 1; flex-shrink: 0; }
+  .shop-ai-thinking-dots span{ width: 7px; height: 7px; background: var(--shop-ai-primary); border-radius: 50%; animation: dotPulse 1.4s ease-in-out infinite; }
+  .shop-ai-thinking-dots span:nth-child(2){ animation-delay: 0.16s; }
+  .shop-ai-thinking-dots span:nth-child(3){ animation-delay: 0.32s; }
+  @keyframes dotPulse{ 0%, 80%, 100%{ transform: scale(0.45); opacity: 0.25; } 40%{ transform: scale(1.15); opacity: 1; } }
+  .shop-ai-thinking-text{ font-size: 13px; font-weight: 500; color: var(--shop-ai-text-light); transition: opacity 0.2s ease; position: relative; z-index: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .shop-ai-input-area{ padding: 12px 16px 16px; background: transparent; }
+  .shop-ai-input-wrapper{ display: flex; align-items: flex-end; gap: 8px; padding: 10px 10px 10px 18px; background: rgba(255,255,255,0.92); border: 1px solid rgba(0,0,0,0.07); border-radius: 24px; box-shadow: 0 1px 6px rgba(0,0,0,0.03); transition: border-color 0.2s, box-shadow 0.2s; }
+  .shop-ai-input-wrapper:focus-within{ border-color: rgba(255,157,92,0.35); box-shadow: 0 2px 10px rgba(255,157,92,0.08), 0 0 0 3px rgba(255,157,92,0.05); }
+  .shop-ai-textarea{ flex: 1; border: none; outline: none; resize: none; font-size: 15px; line-height: 1.5; color: var(--shop-ai-text); font-family: var(--shop-ai-font); max-height: 120px; min-height: 24px; background: transparent; overflow-y: auto; }
+  .shop-ai-textarea::placeholder{ color: var(--shop-ai-text-light); opacity: 0.5; transition: opacity 0.3s; }
+  .shop-ai-textarea.placeholder-fade::placeholder{ opacity: 0; }
+  .shop-ai-send-btn{ width: 36px; height: 36px; min-width: 36px; border-radius: 50%; background: var(--shop-ai-gradient); border: none; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); opacity: 0.3; pointer-events: none; transform: scale(0.85); }
+  .shop-ai-send-btn.active{ opacity: 1; pointer-events: auto; transform: scale(1); }
+  .shop-ai-send-btn:hover{ transform: translateY(-1px) scale(1.06); box-shadow: 0 4px 14px rgba(255,157,92,0.35); }
+  .shop-ai-send-btn svg{ width: 18px; height: 18px; }
+
+  /* ============================================
+     EMAIL CAPTURE POPUP — REMOVED
+     Hard-kill in case any older chat.js still injects it.
+     ============================================ */
+  #shop-ai-email-overlay,
+  .shop-ai-email-overlay,
+  .shop-ai-email-overlay-legacy,
+  .shop-ai-email-popup{
+    display: none !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+  }
+
+  .shop-ai-history-panel{ position: absolute; inset: 0; background: white; z-index: 50; display: flex; flex-direction: column; transform: translateX(100%); transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
+  .shop-ai-history-panel.active{ transform: translateX(0); }
+  .shop-ai-history-header{ padding: 24px; border-bottom: 1px solid var(--shop-ai-border); display: flex; align-items: center; gap: 16px; }
+  .shop-ai-history-header h3{ font-size: 18px; font-weight: 700; margin: 0; }
+  .shop-ai-back-btn{ width: 36px; height: 36px; border-radius: 50%; background: rgba(0,0,0,0.04); border: 1px solid var(--shop-ai-border); display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .shop-ai-back-btn:hover{ background: rgba(255,157,92,0.1); }
+  .shop-ai-history-list{ flex: 1; overflow-y: auto; padding: 16px; }
+  .shop-ai-history-item{ padding: 16px; border: 1px solid var(--shop-ai-border); border-radius: 12px; margin-bottom: 12px; cursor: pointer; transition: all 0.2s; }
+  .shop-ai-history-item:hover{ border-color: var(--shop-ai-primary); transform: translateX(6px); }
+  .shop-ai-history-item-title{ font-weight: 600; margin-bottom: 4px; color: var(--shop-ai-text); }
+  .shop-ai-history-item-time{ font-size: 13px; color: var(--shop-ai-text-light); }
+  .shop-ai-history-empty{ text-align: center; padding: 48px 24px; color: var(--shop-ai-text-light); font-size: 14px; }
+
+  @media (max-width: 768px){
+    .shop-ai-floating-title{ display: none !important; }
+    .shop-ai-header-title-mobile{ display: block; }
+    .shop-ai-header{ min-height: 80px; padding: max(16px, env(safe-area-inset-top)) 16px 14px; }
+    .shop-ai-header-actions{ top: max(16px, env(safe-area-inset-top)); right: 16px; transform: none; }
+    .shop-ai-modal{ width: 100%; height: 100%; max-width: none; max-height: none; border-radius: 0; top: 0; left: 0; transform: translateY(100%); }
+    body.shop-ai-open .shop-ai-modal{ transform: translateY(0); }
+    .shop-ai-modal.active{ transform: translateY(0); }
+    .shop-ai-messages{ padding: 16px; gap: 12px; }
+    .shop-ai-input-area{ padding: 10px 12px max(12px, env(safe-area-inset-bottom)); }
+    .shop-ai-input-wrapper{ padding: 8px 8px 8px 14px; }
+    .shop-ai-product-grid{ gap: 10px; padding: 6px 2px 10px; }
+    .shop-ai-product-card{ flex: 0 0 144px; }
+    .shop-ai-product-image{ height: 130px; }
+    .shop-ai-product-sku{ font-size: 10.5px; }
+    .shop-ai-product-modal{ flex-direction: column; max-width: 100%; margin: 0 12px; padding: 44px 16px 20px; gap: 14px; max-height: 88vh; overflow-y: auto; border-radius: 20px; }
+    .shop-ai-product-modal-left{ flex: 0 0 auto; width: 100%; max-height: 200px; aspect-ratio: auto; border-radius: 12px; }
+    .shop-ai-product-modal-right{ width: 100%; gap: 8px; }
+    .shop-ai-product-modal-actions{ flex-direction: column; }
+    .shop-ai-product-modal-sku{ font-size: 11px; }
+    .shop-ai-message.user{ max-width: 85%; }
+    .shop-ai-message.assistant{ max-width: 92%; }
+    .shop-ai-sugg-item{ padding: 12px 14px; font-size: 13px; }
+    .shop-ai-sugg-item:hover{ transform: none; }
+  }
+  @media (max-width: 480px){
+    .shop-ai-header h3{ font-size: 16px; }
+    .shop-ai-messages{ padding: 12px; gap: 10px; }
+    .shop-ai-input-area{ padding: 8px 8px max(10px, env(safe-area-inset-bottom)); }
+    .shop-ai-input-wrapper{ padding: 6px 6px 6px 12px; border-radius: 20px; }
+    .shop-ai-textarea{ font-size: 14px; min-height: 22px; }
+    .shop-ai-send-btn{ width: 32px; height: 32px; min-width: 32px; }
+    .shop-ai-send-btn svg{ width: 16px; height: 16px; }
+    .shop-ai-product-grid{ gap: 8px; padding: 6px 1px 10px; }
+    .shop-ai-product-card{ flex: 0 0 134px; }
+    .shop-ai-product-image{ height: 120px; }
+    .shop-ai-product-info{ padding: 8px; gap: 2px; }
+    .shop-ai-product-title{ font-size: 12px; -webkit-line-clamp: 3; min-height: 3.6em; }
+    .shop-ai-product-sku{ font-size: 10px; }
+    .shop-ai-product-price{ font-size: 12px; }
+    .shop-ai-product-modal{ margin: 0 8px; padding: 40px 14px 16px; border-radius: 18px; gap: 10px; }
+    .shop-ai-product-modal-left{ max-height: 170px; border-radius: 10px; }
+    .shop-ai-product-modal-title{ font-size: 15px; }
+    .shop-ai-product-modal-price{ font-size: 17px; }
+    .shop-ai-product-modal-description{ font-size: 12.5px; max-height: 70px; }
+    .shop-ai-product-modal-primary, .shop-ai-product-modal-secondary{ padding: 10px 16px; font-size: 13px; }
+    .shop-ai-message.user .shop-ai-bubble{ padding: 8px 12px; font-size: 14px; }
+    .shop-ai-message.assistant .shop-ai-bubble{ padding: 12px 14px; font-size: 14px; }
+    .shop-ai-thinking-container{ padding: 10px 14px; }
+    .shop-ai-thinking-text{ font-size: 12px; }
+    .shop-ai-sugg-item{ padding: 10px 12px; font-size: 12px; gap: 8px; }
+    .shop-ai-sugg-item svg{ width: 16px; height: 16px; }
+    .shop-ai-menu-dropdown{ min-width: 180px; }
+    .shop-ai-menu-item{ padding: 12px 14px; font-size: 13px; }
+    .shop-ai-history-header{ padding: 16px; }
+    .shop-ai-history-header h3{ font-size: 16px; }
+    .shop-ai-history-list{ padding: 12px; }
+    .shop-ai-history-item{ padding: 12px; margin-bottom: 8px; }
+  }
+  @media (max-width: 320px){
+    .shop-ai-header h3{ font-size: 14px; }
+    .shop-ai-icon-btn{ width: 34px; height: 34px; }
+    .shop-ai-product-card{ flex: 0 0 116px; }
+    .shop-ai-product-image{ height: 100px; }
+    .shop-ai-product-info{ padding: 6px; gap: 2px; }
+    .shop-ai-product-title{ font-size: 11px; -webkit-line-clamp: 3; min-height: 3.3em; }
+    .shop-ai-product-sku{ font-size: 9.5px; }
+    .shop-ai-product-price{ font-size: 11px; }
+  }
+
+  .shop-ai-reset, .shop-ai-modal, .shop-ai-input-area{ overflow-x: hidden; }
+  .shop-ai-bubble{ word-wrap: break-word; overflow-wrap: break-word; word-break: break-word; max-width: 100%; }
+  .shop-ai-message{ max-width: 100%; min-width: 0; }
+</style>
+
+<div class="shop-ai-reset" aria-hidden="false">
+  <div class="shop-ai-floating-group" id="shop-ai-floating-group">
+    <button class="shop-ai-pill-btn shop-ai-btn-primary" data-trigger="ask" aria-label="Ask AI">Ask AI</button>
+  </div>
+
+  <div class="shop-ai-backdrop" id="shop-ai-backdrop"></div>
+
+  <div class="shop-ai-floating-title" id="shop-ai-floating-title">
+    <h3>Hi, how can I help you?</h3>
+  </div>
+
+  <div class="shop-ai-modal" id="shop-ai-modal" role="dialog" aria-modal="true" aria-label="AI Assistant">
+    <div class="shop-ai-header">
+      <h3 class="shop-ai-header-title-mobile">Hi, how can I help you?</h3>
+      <div class="shop-ai-header-actions">
+        <button class="shop-ai-icon-btn shop-ai-menu-btn" id="shop-ai-menu-btn" aria-label="Menu">
+          <div class="shop-ai-3dot-icon"><span></span><span></span><span></span></div>
+        </button>
+        <button class="shop-ai-icon-btn" id="shop-ai-close-btn" aria-label="Close">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="shop-ai-menu-dropdown" id="shop-ai-menu">
+      <button class="shop-ai-menu-item" data-action="new"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg> New chat</button>
+      <button class="shop-ai-menu-item" data-action="history"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg> Previous chats</button>
+      <button class="shop-ai-menu-item danger" data-action="end"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> End chat</button>
+    </div>
+
+    <div class="shop-ai-messages" id="shop-ai-messages">
+      <div class="shop-ai-suggestions visible" id="shop-ai-suggestions">
+        <div class="shop-ai-sugg-title">How can I assist you?</div>
+        <div class="shop-ai-sugg-list">
+          <button class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Show me circuit breakers for industrial applications')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Show me circuit breakers for industrial applications</button>
+          <button class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('I need pneumatic components for manufacturing')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> I need pneumatic components for manufacturing</button>
+          <button class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Help me find the right inverter drive')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Help me find the right inverter drive</button>
+          <button class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Do you have SKU: ')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="5"/><path d="M16 11.37A4 4 0 1 1 12.63 8"/></svg> Search by SKU or model number</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="shop-ai-input-area">
+      <div class="shop-ai-input-wrapper">
+        <textarea class="shop-ai-textarea" id="shop-ai-input" placeholder="Ask me anything..." rows="1"></textarea>
+        <button class="shop-ai-send-btn" id="shop-ai-send-btn" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></button>
+      </div>
+    </div>
+
+    <div class="shop-ai-history-panel" id="shop-ai-history-panel">
+      <div class="shop-ai-history-header">
+        <button class="shop-ai-back-btn" id="shop-ai-back-btn" aria-label="Back"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15,18 9,12 15,6"/></svg></button>
+        <h3>Previous Chats</h3>
+      </div>
+      <div class="shop-ai-history-list" id="shop-ai-history-list"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function() {
+    var backend = {{ block.settings.backend_url | default: "" | json }};
+    var welcome = {{ block.settings.welcome_message | json }};
+    var shopDomain = {{ shop.permanent_domain | json }};
+
+    if (backend && backend !== 'https://shxhid-chat-agent-production.up.railway.app') {
+      window.shopChatConfig = {
+        apiUrl: backend + '/chat',
+        leadsUrl: backend + '/leads',
+        cartUrl: backend + '/api/cart',
+        shopDomain: shopDomain,
+        rootUrl: {{ routes.root_url | json }},
+        cartPageUrl: {{ routes.cart_url | json }},
+        cartAddUrl: {{ routes.cart_add_url | json }},
+        shopId: '{{ shop.id }}',
+        promptType: 'creativeAutomationAssistant',
+        welcomeMessage: welcome,
+        emailPopupEnabled: false
+      };
+    } else {
+      window.shopChatConfig = {
+        apiUrl: '/apps/shop-chat/chat',
+        leadsUrl: '/apps/shop-chat/leads',
+        cartUrl: '/apps/shop-chat/api/cart',
+        shopDomain: shopDomain,
+        rootUrl: {{ routes.root_url | json }},
+        cartPageUrl: {{ routes.cart_url | json }},
+        cartAddUrl: {{ routes.cart_add_url | json }},
+        shopId: '{{ shop.id }}',
+        promptType: 'creativeAutomationAssistant',
+        welcomeMessage: welcome,
+        emailPopupEnabled: false
+      };
+    }
+  })();
+</script>
+
+<!-- Email capture popup: permanently disabled.
+     Runs before chat.js (which is deferred), so it also covers older chat.js builds. -->
+<script>
+(function(){
+  try { sessionStorage.setItem('shopAiEmailPopupShown', 'true'); } catch (e) {}
+
+  function killEmailPopup(){
+    if (window.ShopAIChat) {
+      window.ShopAIChat.showEmailPopup = function(){};
+    }
+    var nodes = document.querySelectorAll('#shop-ai-email-overlay, .shop-ai-email-overlay');
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
+    }
+  }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => ShopAIChat.init());
+    document.addEventListener('DOMContentLoaded', killEmailPopup);
   } else {
-    ShopAIChat.init();
+    killEmailPopup();
+  }
+})();
+</script>
+
+<script src="{{ 'chat.js' | asset_url }}" defer></script>
+
+<!-- Mark the Shopify section wrapper so the blur CSS skips it -->
+<script>
+(function(){
+  var el = document.querySelector('.shop-ai-reset');
+  if (el) {
+    var section = el.closest('.shopify-section') || el.parentElement;
+    if (section && section !== document.body) {
+      section.classList.add('shop-ai-chat-section');
+    }
+  }
+})();
+</script>
+
+<script>
+(function(){
+  'use strict';
+
+  var BUTTON_HTML =
+    '<div class="shop-ai-header-trigger-wrap" id="shop-ai-header-btn-wrap">' +
+      '<button class="shop-ai-header-trigger" id="shop-ai-header-btn" aria-label="Ask AI Assistant" type="button">' +
+        '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L13.5 8.5L20 10L13.5 11.5L12 18L10.5 11.5L4 10L10.5 8.5L12 2Z"/></svg>' +
+        '<span class="shop-ai-trigger-label">Ask AI</span>' +
+      '</button>' +
+    '</div>';
+
+  function injectHeaderButton() {
+    if (document.getElementById('shop-ai-header-btn-wrap')) return true;
+    var headerIcons = document.querySelector('.header__icons');
+    if (headerIcons) { headerIcons.insertAdjacentHTML('afterbegin', BUTTON_HTML); bindBtn(); return true; }
+    var headerRight = document.querySelector('header .header__icon, header .site-header__icons, header .header-icons, header .header__buttons, .header__heading-link ~ *');
+    if (headerRight && headerRight.parentElement) { headerRight.parentElement.insertAdjacentHTML('afterbegin', BUTTON_HTML); bindBtn(); return true; }
+    var headerEl = document.querySelector('header') || document.querySelector('[role="banner"]');
+    if (headerEl) {
+      var inner = headerEl.querySelector('.header, .header__wrapper, .site-header__wrapper');
+      if (inner) { inner.insertAdjacentHTML('beforeend', BUTTON_HTML); } else { headerEl.insertAdjacentHTML('beforeend', BUTTON_HTML); }
+      bindBtn(); return true;
+    }
+    return false;
   }
 
-  window.ShopAIChat = ShopAIChat;
+  function bindBtn() {
+    var btn = document.getElementById('shop-ai-header-btn');
+    if (!btn) return;
+    btn.addEventListener('click', function(e) {
+      e.preventDefault(); e.stopPropagation();
+      if (window.ShopAIChat && typeof window.ShopAIChat.open === 'function') { window.ShopAIChat.open(); }
+      else { document.body.classList.add('shop-ai-open'); }
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() {
+      if (!injectHeaderButton()) { var tries=0; var iv=setInterval(function(){ tries++; if(injectHeaderButton()||tries>20) clearInterval(iv); },250); }
+    });
+  } else {
+    if (!injectHeaderButton()) { var tries=0; var iv=setInterval(function(){ tries++; if(injectHeaderButton()||tries>20) clearInterval(iv); },250); }
+  }
 })();
+</script>
+
+
+{% schema %}
+{
+  "name": "AI Chat Assistant",
+  "target": "body",
+  "settings": [
+    {
+      "type": "text",
+      "id": "backend_url",
+      "label": "Backend API URL",
+      "placeholder": "https://your-backend-url.com",
+      "info": "Leave empty to use Shopify app proxy (recommended). Only set for custom/staging backend URL."
+    },
+    {
+      "type": "text",
+      "id": "chat_title",
+      "label": "Chat Title",
+      "default": "AI Assistant"
+    },
+    {
+      "type": "text",
+      "id": "welcome_message",
+      "label": "Welcome Message",
+      "default": "Hi! How can I help you today?"
+    }
+  ]
+}
+{% endschema %}
