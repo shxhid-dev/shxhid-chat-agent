@@ -1,6 +1,13 @@
 /**
- * MCPClient — v2.3
+ * MCPClient — v2.4
  * Client for interacting with Model Context Protocol (MCP) API endpoints
+ *
+ * CHANGES (v2.4 — Oct 2026):
+ *   - _normalizeUrl() trims whitespace and strips trailing slashes so
+ *     endpoints never become "//api/mcp" and the customer account host
+ *     regex still matches.
+ *   - JSON-RPC errors now keep the server's `data` field for debugging.
+ *   - Cart quantity parsing uses an explicit radix.
  *
  * CHANGES (v2.3 — Sept 2026):
  *   - Shopify's UCP migration moved the catalog tools off /api/mcp.
@@ -78,16 +85,18 @@ class MCPClient {
   }
 
   _normalizeUrl(url) {
-    const resolved = url || process.env.SHOPIFY_STORE_DOMAIN;
+    const resolved = String(url || process.env.SHOPIFY_STORE_DOMAIN || "").trim();
     if (!resolved) {
       throw new Error(
         "hostUrl is required: pass shopDomain or set SHOPIFY_STORE_DOMAIN env var"
       );
     }
-    if (resolved.startsWith('http://') || resolved.startsWith('https://')) {
-      return resolved;
+    // Strip trailing slashes so endpoint paths join cleanly
+    const cleaned = resolved.replace(/\/+$/, "");
+    if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
+      return cleaned;
     }
-    return `https://${resolved}`;
+    return `https://${cleaned}`;
   }
 
   _ucpMeta() {
@@ -484,7 +493,7 @@ class MCPClient {
 
       const cartResult = await this.updateCart({
         cartId: existingCartId,
-        lines: [{ merchandise_id: merchandiseId, quantity: parseInt(quantity) || 1 }],
+        lines: [{ merchandise_id: merchandiseId, quantity: parseInt(quantity, 10) || 1 }],
       });
 
       console.log("✅ Product added to cart successfully");
@@ -533,6 +542,7 @@ class MCPClient {
       if (data.error) {
         const error = new Error(data.error.message || "JSON-RPC error");
         error.code = data.error.code;
+        error.data = data.error.data;
         throw error;
       }
 
