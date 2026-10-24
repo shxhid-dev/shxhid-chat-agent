@@ -1,7 +1,17 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v2.6 (1 Oct 2026)
+ * Chat API Route — v2.7 (24 Oct 2026)
  *
+ * CHANGES (v2.7) — photo search:
+ *   1. The body may carry `image` ({ data: base64 | data URL, media_type }) with or without `message`.
+ *      image-intel.server.js validates it (real JPEG/PNG/WebP/GIF bytes, size cap, rate limit).
+ *   2. The photo is read by one vision call (brand / part number / type), started in parallel with
+ *      the MCP connect. What was read is added to the search text, so a nameplate photo goes down
+ *      the same SKU / Algolia path as a typed part number.
+ *   3. The image goes to Claude for this turn only. The DB stores "[Photo: brand · part · type]"
+ *      plus the caption instead of the image, so follow-up turns still know what was identified.
+ *
+ * CHANGES (v2.6 — 1 Oct 2026):
  * CHANGES (v2.6) — from the 30 Sep logs and the router v6 / Algolia v4 release:
  *   1. Relevance filter uses the router's corrected query (smart.effectiveQuery) instead of the raw
  *      customer text. 30 Sep: the typo "switchgare" dropped 10/10 cards.
@@ -42,7 +52,7 @@
  *   - search_catalog + legacy search_shop_catalog; extractSearchQuery never JSON.stringify.
  */
 
-const CHAT_VERSION = "2.6";
+const CHAT_VERSION = "2.7";
 
 // Pre-search paths whose results may be off-target. For these the catalog search tool stays
 // available so Claude can recover / be honest. Router v6 types algolia_category, algolia_multi
@@ -532,8 +542,10 @@ async function handleChatRequest(request) {
       return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: getCorsHeaders(request) });
     }
 
-    const rawMessage = body?.message;
-    if (typeof rawMessage !== "string" || !rawMessage.trim()) {
+    // A photo may come with or without text ("what is this?" or nothing at all).
+    const rawMessage = typeof body?.message === "string" ? body.message : "";
+    const hasImage = body?.image != null;
+    if (!rawMessage.trim() && !hasImage) {
       return new Response(JSON.stringify({ error: "Missing message" }), { status: 400, headers: getCorsHeaders(request) });
     }
     let userMessage = rawMessage.trim();
@@ -545,6 +557,26 @@ async function handleChatRequest(request) {
     const visitorId = body.visitor_id;
     const fingerprintId = body.fingerprint_id;
     const conversationId = normalizeConversationId(body.conversation_id);
+
+    let image = null;
+    let imageIntel = null;
+    if (hasImage) {
+      const rejectImage = (status, error) =>
+        new Response(JSON.stringify({ error }), { status, headers: getCorsHeaders(request) });
+      imageIntel = await import("../services/image-intel.server.js");
+      if (!imageIntel.isImageUploadEnabled()) return rejectImage(400, "Photo upload is turned off");
+      const parsed = imageIntel.parseImagePayload(body.image);
+      if (!parsed.ok) {
+        console.warn(`[Chat] Photo rejected (${parsed.status}): ${parsed.error}`);
+        return rejectImage(parsed.status, parsed.error);
+      }
+      if (!imageIntel.allowImageUpload(conversationId)) {
+        console.warn(`[Chat] Photo rate limit hit | conversation=${conversationId}`);
+        return rejectImage(429, "Too many photos — please wait a little, or type the part number.");
+      }
+      image = parsed.image;
+      console.log(`[Chat] Photo received | ${image.mediaType} | ${Math.round(image.bytes / 1024)} KB`);
+    }
     const promptType = typeof body.prompt_type === "string" && body.prompt_type ? body.prompt_type : "standardAssistant";
 
     const dbMod = await import("../db.server");
@@ -575,7 +607,7 @@ async function handleChatRequest(request) {
     const responseStream = createSseStream(async (stream) => {
       await handleChatSession({
         request, userMessage, conversationId, promptType, stream,
-        visitorId, fingerprintId, shopDomain,
+        visitorId, fingerprintId, shopDomain, image, imageIntel,
         helpers: { saveMessage, getConversationHistory, getCustomerAccountUrlsFromDb, storeCustomerAccountUrls, ChatEvents, createClaudeService, createToolService, MCPClient },
       });
     });
@@ -590,7 +622,7 @@ async function handleChatRequest(request) {
   }
 }
 
-async function handleChatSession({ request, userMessage, conversationId, promptType, stream, visitorId, fingerprintId, shopDomain, helpers }) {
+async function handleChatSession({ request, userMessage, conversationId, promptType, stream, visitorId, fingerprintId, shopDomain, image, imageIntel, helpers }) {
   const startTime = Date.now();
   const { saveMessage, getConversationHistory, getCustomerAccountUrlsFromDb, storeCustomerAccountUrls, ChatEvents, createClaudeService, createToolService, MCPClient } = helpers;
 
@@ -611,6 +643,13 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     console.error("[Chat] ANTHROPIC_API_KEY missing");
     send({ type: "error", error: "Anthropic API key not configured." });
     return;
+  }
+
+  // Read the photo while the MCP servers connect (analyzeProductImage never throws).
+  let photoAnalysisJob = null;
+  if (image && imageIntel) {
+    send({ type: "thinking_state", state: "Reading your photo..." });
+    photoAnalysisJob = imageIntel.analyzeProductImage(image, { caption: userMessage });
   }
 
   // ── Per-turn state (hoisted so the catch block can see it) ──────────
@@ -844,9 +883,36 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       console.warn(`[Chat] WARNING: No catalog-search tool available (CATALOG_TOOL_MODE=ucp). Tools: ${mcpClient.tools.map((t) => t?.name).join(", ")}`);
     }
 
+    // ── Photo: what was read becomes search text; the DB keeps a marker, not the image ──
+    //   savedUserText — stored + shown in history: "[Photo: Siemens · 3RT2026-1BB40 · contactor] do you have it?"
+    //   queryText     — drives SKU detection, advisory and search: caption + "Siemens 3RT2026-1BB40 contactor"
+    let savedUserText = userMessage;
+    let queryText = userMessage;
+    let photoNote = "";
+    let photoSkipsSearch = false;
+    let photoHasPartNumber = false;
+    if (photoAnalysisJob) {
+      const analysis = await photoAnalysisJob;
+      const imageSearchText = imageIntel.buildImageSearchText(analysis);
+      savedUserText = [imageIntel.buildPhotoMarker(analysis), userMessage].filter(Boolean).join(" ");
+      queryText = [userMessage, imageSearchText].filter(Boolean).join(" ");
+      photoNote = imageIntel.buildPhotoNote(analysis);
+      // Nothing to search for: no caption and nothing readable in the photo.
+      photoSkipsSearch = !queryText;
+      photoHasPartNumber = !!analysis?.isProductPhoto && analysis.partNumbers.length > 0;
+      track("photoAnalyzed", {
+        conversationId,
+        ok: !!analysis,
+        isProductPhoto: analysis?.isProductPhoto ?? null,
+        hasPartNumber: !!analysis?.partNumbers?.length,
+        confidence: analysis?.confidence ?? null,
+      });
+      console.log(`[Chat] Photo → query "${queryText.slice(0, 120)}"${photoSkipsSearch ? " (no search)" : ""}`);
+    }
+
     // ── Save + load history ─────────────────────────────────────────
     try {
-      await saveMessage(conversationId, "user", userMessage, { shopDomain, visitorId });
+      await saveMessage(conversationId, "user", savedUserText, { shopDomain, visitorId });
     } catch (dbError) {
       console.error("[Chat] Failed to save user message:", dbError.message);
     }
@@ -862,17 +928,17 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     }
 
     const lastMsg = conversationHistory[conversationHistory.length - 1];
-    if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== userMessage) {
-      conversationHistory.push({ role: "user", content: userMessage });
+    if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== savedUserText) {
+      conversationHistory.push({ role: "user", content: savedUserText });
     }
 
-    const detectedSkus = detectSkuTokens(userMessage);
+    const detectedSkus = detectSkuTokens(queryText);
 
     // ── Advisory analysis (raw history, before any annotation) ──────
     if (ADVISORY_ENABLED) {
       try {
         advisoryMod = await import("../services/advisory.server.js");
-        advisory = advisoryMod.analyzeEnquiry(userMessage, conversationHistory, { hasSku: detectedSkus.length > 0 });
+        advisory = advisoryMod.analyzeEnquiry(queryText, conversationHistory, { hasSku: detectedSkus.length > 0 });
         if (advisory) console.log(advisoryMod.formatAdvisoryLog(advisory));
       } catch (advisoryErr) {
         console.warn(`[Chat] Advisory analysis failed: ${advisoryErr.message}`);
@@ -895,15 +961,18 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     let smartResult = null;
     let systemNote = null;
 
-    if (advisory?.skipPreSearch) {
+    if (photoSkipsSearch) {
+      console.log("[Chat] Photo: search pre-pass skipped (nothing readable to search for)");
+    } else if (advisory?.skipPreSearch && !photoHasPartNumber) {
       console.log("[Chat] Advisory: search pre-pass skipped (no product query fits this enquiry yet)");
     } else {
       try {
         const { smartSearch } = await import("../services/search-router.server.js");
         const historyForSearch = conversationHistory.slice(-6);
-        const searchInput = advisory?.searchQuery || userMessage;
-        if (advisory?.searchQuery) {
-          console.log(`[Chat] Advisory search query: "${advisory.searchQuery}" (customer wrote: "${userMessage.slice(0, 80)}")`);
+        // A part number read from a photo beats the advisory query: it names the exact product.
+        const searchInput = (!photoHasPartNumber && advisory?.searchQuery) || queryText;
+        if (advisory?.searchQuery && !photoHasPartNumber) {
+          console.log(`[Chat] Advisory search query: "${advisory.searchQuery}" (customer wrote: "${queryText.slice(0, 80)}")`);
         }
         let smart = await smartSearch(searchInput, shopDomain, historyForSearch);
 
@@ -963,7 +1032,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       }
     }
 
-    // ── Compose the last user turn: SYSTEM NOTE → ADVISORY BRIEF → message ──
+    // ── Compose the last user turn: PHOTO ANALYSIS → SYSTEM NOTE → ADVISORY BRIEF → message ──
     let advisoryBrief = "";
     if (advisory && advisoryMod) {
       try {
@@ -972,12 +1041,12 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         console.warn(`[Chat] buildAdvisoryBrief failed: ${e.message}`);
       }
     }
-    if (systemNote || advisoryBrief) {
+    if (photoNote || systemNote || advisoryBrief) {
       const lastIdx = conversationHistory.length - 1;
       if (conversationHistory[lastIdx]?.role === "user" && typeof conversationHistory[lastIdx].content === "string") {
         conversationHistory[lastIdx] = {
           role: "user",
-          content: [systemNote, advisoryBrief, `User message: ${conversationHistory[lastIdx].content}`].filter(Boolean).join("\n\n"),
+          content: [photoNote, systemNote, advisoryBrief, `User message: ${conversationHistory[lastIdx].content}`].filter(Boolean).join("\n\n"),
         };
       }
     }
@@ -999,6 +1068,21 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       const before = conversationHistory.length;
       conversationHistory = capHistory(conversationHistory, MAX_HISTORY_MESSAGES);
       console.log(`[Chat] History capped ${before} → ${conversationHistory.length} messages`);
+    }
+
+    // ── Attach the photo to this turn only (history keeps the text marker) ──
+    if (image) {
+      const lastIdx = conversationHistory.length - 1;
+      const last = conversationHistory[lastIdx];
+      if (last?.role === "user" && typeof last.content === "string") {
+        conversationHistory[lastIdx] = {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } },
+            { type: "text", text: last.content },
+          ],
+        };
+      }
     }
 
     // ── Claude loop ─────────────────────────────────────────────────
@@ -1150,7 +1234,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
 
                 let products = [];
                 try {
-                  products = toolService.processProductSearchResult(toolUseResponse, shopDomain, userMessage, searchQuery) || [];
+                  products = toolService.processProductSearchResult(toolUseResponse, shopDomain, queryText, searchQuery) || [];
                 } catch (e) {
                   console.warn(`[Chat] processProductSearchResult failed: ${e.message}`);
                 }

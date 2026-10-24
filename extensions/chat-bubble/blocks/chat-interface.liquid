@@ -610,6 +610,32 @@
   .shop-ai-send-btn:hover{ transform: translateY(-1px) scale(1.06); box-shadow: 0 4px 14px rgba(255,157,92,0.35); }
   .shop-ai-send-btn svg{ width: 18px; height: 18px; }
 
+  /* Photo search: attach button, preview card, sent photo, history chip */
+  .shop-ai-input-area .shop-ai-input-wrapper{ padding-left: 8px; }
+  .shop-ai-attach-btn{ width: 36px; height: 36px; min-width: 36px; border-radius: 50%; border: none; background: rgba(255,157,92,0.1); color: var(--shop-ai-primary-dark); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.2s, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), color 0.2s; }
+  .shop-ai-attach-btn:hover{ background: rgba(255,157,92,0.18); transform: scale(1.06); }
+  .shop-ai-attach-btn:active{ transform: scale(0.94); }
+  .shop-ai-attach-btn:focus-visible{ outline: 2px solid var(--shop-ai-primary); outline-offset: 2px; }
+  .shop-ai-attach-btn svg{ width: 19px; height: 19px; }
+  .shop-ai-input-area.shop-ai-drop-active .shop-ai-input-wrapper{ border-color: var(--shop-ai-primary); border-style: dashed; background: rgba(255,157,92,0.06); box-shadow: 0 0 0 4px rgba(255,157,92,0.1); }
+
+  .shop-ai-image-preview{ display: flex; align-items: center; gap: 12px; margin: 0 4px 10px; padding: 8px 8px 8px 8px; background: #fff; border: 1px solid rgba(255,157,92,0.22); border-radius: 16px; box-shadow: 0 4px 14px rgba(255,133,52,0.08); animation: fadeInUp 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
+  .shop-ai-image-preview[hidden]{ display: none; }
+  .shop-ai-image-preview-thumb{ width: 52px; height: 52px; flex-shrink: 0; border-radius: 11px; overflow: hidden; background: #f5f5f5; display: flex; align-items: center; justify-content: center; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.06); }
+  .shop-ai-image-preview-thumb img{ width: 100%; height: 100%; object-fit: cover; display: block; }
+  .shop-ai-image-preview-spinner{ width: 20px; height: 20px; border-radius: 50%; border: 2.5px solid rgba(255,157,92,0.25); border-top-color: var(--shop-ai-primary); animation: shopAiSpin 0.8s linear infinite; }
+  @keyframes shopAiSpin{ to{ transform: rotate(360deg); } }
+  .shop-ai-image-preview-text{ flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .shop-ai-image-preview-title{ font-size: 13.5px; font-weight: 600; color: var(--shop-ai-text); }
+  .shop-ai-image-preview-hint{ font-size: 12px; color: var(--shop-ai-text-light); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .shop-ai-image-preview-remove{ width: 30px; height: 30px; flex-shrink: 0; border-radius: 50%; border: 1px solid var(--shop-ai-border); background: #fff; color: var(--shop-ai-text-light); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s, color 0.15s, transform 0.15s; }
+  .shop-ai-image-preview-remove:hover{ background: rgba(0,0,0,0.05); color: var(--shop-ai-text); transform: scale(1.08); }
+
+  .shop-ai-message.user .shop-ai-user-photo{ display: block; align-self: flex-end; width: auto; max-width: 220px; max-height: 240px; border-radius: 16px; border-bottom-right-radius: 4px; object-fit: cover; box-shadow: var(--shop-ai-shadow-sm); margin-bottom: 6px; background: #f5f5f5; }
+  .shop-ai-photo-chip{ align-self: flex-end; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 11px; margin-bottom: 6px; border-radius: 999px; background: rgba(255,157,92,0.1); border: 1px solid rgba(255,157,92,0.22); color: var(--shop-ai-primary-dark); font-size: 12px; font-weight: 600; }
+  .shop-ai-photo-chip span{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .shop-ai-photo-chip svg{ flex-shrink: 0; }
+
   /* ============================================
      EMAIL CAPTURE POPUP — REMOVED
      Hard-kill in case any older chat.js still injects it.
@@ -754,7 +780,12 @@
     </div>
 
     <div class="shop-ai-input-area">
+      <div class="shop-ai-image-preview" id="shop-ai-image-preview" hidden></div>
       <div class="shop-ai-input-wrapper">
+        <button type="button" class="shop-ai-attach-btn" id="shop-ai-attach-btn" aria-label="Send a photo of the part or its nameplate" title="Send a photo of the part or nameplate">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        </button>
+        <input type="file" id="shop-ai-file-input" accept="image/*" hidden>
         <textarea class="shop-ai-textarea" id="shop-ai-input" placeholder="Ask me anything..." rows="1"></textarea>
         <button class="shop-ai-send-btn" id="shop-ai-send-btn" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></button>
       </div>
@@ -782,6 +813,9 @@
         leadsUrl: backend + '/leads',
         cartUrl: backend + '/api/cart',
         shopDomain: shopDomain,
+        rootUrl: {{ routes.root_url | json }},
+        cartPageUrl: {{ routes.cart_url | json }},
+        cartAddUrl: {{ routes.cart_add_url | json }},
         shopId: '{{ shop.id }}',
         promptType: 'creativeAutomationAssistant',
         welcomeMessage: welcome,
@@ -793,6 +827,9 @@
         leadsUrl: '/apps/shop-chat/leads',
         cartUrl: '/apps/shop-chat/api/cart',
         shopDomain: shopDomain,
+        rootUrl: {{ routes.root_url | json }},
+        cartPageUrl: {{ routes.cart_url | json }},
+        cartAddUrl: {{ routes.cart_add_url | json }},
         shopId: '{{ shop.id }}',
         promptType: 'creativeAutomationAssistant',
         welcomeMessage: welcome,
