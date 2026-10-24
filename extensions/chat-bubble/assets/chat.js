@@ -5,6 +5,12 @@
  * - Chat history with conversation loading
  * - Email capture via built-in overlay
  * - SSE streaming with thinking indicators
+ * - Photo search: attach / paste / drop a photo of a part or nameplate
+ *
+ * v4.2 — Oct 24, 2026 — PHOTO SEARCH
+ *   The camera button (or paste / drag-and-drop) attaches one photo. It is resized in the
+ *   browser (longest side 1568 px, JPEG) before upload and sent as `image` with the message;
+ *   the message text is optional. History shows "[Photo: …]" markers as a photo chip.
  *
  * v4.1 — Oct 5, 2026 — ADD TO CART FIX
  *   Add to Cart now uses the store's own cart (/cart/add.js), so the item shows
@@ -81,6 +87,54 @@
     return wrapper;
   }
 
+  // ─── Photo upload ─────────────────────────────────────────────────────────
+  // 1568 px is the largest size Claude reads without downscaling; JPEG keeps uploads ~150-500 KB.
+  const PHOTO_MAX_EDGE = 1568;
+  const PHOTO_JPEG_QUALITY = 0.85;
+  const PHOTO_MAX_SOURCE_BYTES = 25 * 1024 * 1024;
+  const PHOTO_MARKER_RE = /^\[Photo(?::\s*([^\]]*))?\]\s*/;
+
+  const CAMERA_ICON_SVG = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>';
+
+  function loadImageElement(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
+      img.src = url;
+    });
+  }
+
+  /** Decode, downscale and re-encode as JPEG. Rejects if the browser can't read the format (e.g. HEIC on Chrome). */
+  async function preparePhoto(file) {
+    let source;
+    if (typeof createImageBitmap === 'function') {
+      try {
+        source = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      } catch (_) {
+        source = null;
+      }
+    }
+    if (!source) source = await loadImageElement(file);
+
+    const w = source.width;
+    const h = source.height;
+    if (!w || !h) throw new Error('empty image');
+    const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(w, h));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff'; // transparent PNGs would turn black in JPEG
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    if (typeof source.close === 'function') source.close();
+
+    const dataUrl = canvas.toDataURL('image/jpeg', PHOTO_JPEG_QUALITY);
+    return { dataUrl, data: dataUrl.split(',')[1], mediaType: 'image/jpeg' };
+  }
+
   const ShopAIChat = {
     state: {
       isOpen: false,
@@ -107,6 +161,9 @@
       addedByProductId: JSON.parse(sessionStorage.getItem('shopAiAddedByProductId') || '{}'),
       productDataMap: new Map(),
       lastCheckoutUrlShown: null,
+      // { dataUrl, data, mediaType } of the photo waiting to be sent with the next message
+      pendingImage: null,
+      isPreparingImage: false,
     },
 
     placeholders: [
@@ -133,6 +190,10 @@
         historyPanel: document.getElementById('shop-ai-history-panel'),
         historyList: document.getElementById('shop-ai-history-list'),
         backBtn: document.getElementById('shop-ai-back-btn'),
+        attachBtn: document.getElementById('shop-ai-attach-btn'),
+        fileInput: document.getElementById('shop-ai-file-input'),
+        imagePreview: document.getElementById('shop-ai-image-preview'),
+        inputArea: document.querySelector('#shop-ai-modal .shop-ai-input-area'),
       };
 
       if (!this.elements.modal) {
@@ -177,9 +238,57 @@
           const el = this.elements.input;
           el.style.height = 'auto';
           el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-          if (this.elements.sendBtn) {
-            this.elements.sendBtn.classList.toggle('active', !!el.value.trim());
+          this.updateSendState();
+        });
+        // Paste a screenshot / copied photo straight into the box.
+        this.elements.input.addEventListener('paste', (e) => {
+          const file = Array.from(e.clipboardData?.files || []).find(f => f.type.startsWith('image/'));
+          if (file) {
+            e.preventDefault();
+            this.handleImageFile(file);
           }
+        });
+      }
+
+      if (this.elements.attachBtn && this.elements.fileInput) {
+        this.elements.attachBtn.addEventListener('click', () => this.elements.fileInput.click());
+        this.elements.fileInput.addEventListener('change', () => {
+          const file = this.elements.fileInput.files?.[0];
+          this.elements.fileInput.value = ''; // allow picking the same file again
+          if (file) this.handleImageFile(file);
+        });
+      }
+
+      if (this.elements.imagePreview) {
+        this.elements.imagePreview.addEventListener('click', (e) => {
+          if (e.target.closest('[data-image-action="remove"]')) this.clearPendingImage();
+        });
+      }
+
+      if (this.elements.modal && this.elements.attachBtn) {
+        const area = this.elements.inputArea;
+        let dragDepth = 0;
+        const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+        this.elements.modal.addEventListener('dragenter', (e) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth++;
+          area?.classList.add('shop-ai-drop-active');
+        });
+        this.elements.modal.addEventListener('dragover', (e) => {
+          if (hasFiles(e)) e.preventDefault();
+        });
+        this.elements.modal.addEventListener('dragleave', () => {
+          dragDepth = Math.max(0, dragDepth - 1);
+          if (!dragDepth) area?.classList.remove('shop-ai-drop-active');
+        });
+        this.elements.modal.addEventListener('drop', (e) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth = 0;
+          area?.classList.remove('shop-ai-drop-active');
+          const file = Array.from(e.dataTransfer.files || []).find(f => f.type.startsWith('image/'));
+          if (file) this.handleImageFile(file);
         });
       }
 
@@ -344,10 +453,12 @@
     },
 
     async send(messageArg) {
-      const message = (typeof messageArg === 'string' && messageArg.trim())
-        ? messageArg.trim()
-        : this.elements.input?.value?.trim();
-      if (!message) return;
+      const fromArg = typeof messageArg === 'string' && !!messageArg.trim();
+      const message = fromArg ? messageArg.trim() : (this.elements.input?.value?.trim() || '');
+      // Suggestion buttons (openAndSend) send their text only; a typed send carries the pending photo.
+      if (!fromArg && this.state.isPreparingImage) return;
+      const image = fromArg ? null : this.state.pendingImage;
+      if (!message && !image) return;
 
       if (this.state.isFirstMessage) {
         this.state.isFirstMessage = false;
@@ -357,21 +468,20 @@
         }
       }
 
-      this.addMessage(message, 'user');
+      this.addMessage(message, 'user', { imageUrl: image?.dataUrl });
       if (this.elements.input) {
         this.elements.input.value = '';
         this.elements.input.style.height = 'auto';
       }
-      if (this.elements.sendBtn) {
-        this.elements.sendBtn.classList.remove('active');
-      }
+      if (image) this.clearPendingImage();
+      this.updateSendState();
 
       if (!this.state.conversationId) {
         this.state.conversationId = 'conv_' + Date.now();
         sessionStorage.setItem('shopAiConversationId', this.state.conversationId);
       }
 
-      this.saveToHistory(message);
+      this.saveToHistory(message || '📷 Photo');
       this.showThinking();
 
       try {
@@ -387,14 +497,20 @@
             message,
             conversation_id: this.state.conversationId,
             prompt_type: window.shopChatConfig?.promptType || 'standardAssistant',
-            shop_domain: window.shopChatConfig?.shopDomain || ''
+            shop_domain: window.shopChatConfig?.shopDomain || '',
+            ...(image ? { image: { data: image.data, media_type: image.mediaType } } : {}),
           })
         });
 
         if (!response.ok) {
           const errorText = await response.text().catch(() => '');
           console.error('❌ API response:', response.status, errorText.substring(0, 200));
-          throw new Error(`Server returned ${response.status}`);
+          // Photo rejections (413 too large, 415 format, 429 too many) carry a readable reason.
+          let reason = '';
+          try { reason = JSON.parse(errorText)?.error || ''; } catch (_) { /* not JSON */ }
+          const error = new Error(`Server returned ${response.status}`);
+          if (image && reason && [400, 413, 415, 429].includes(response.status)) error.userMessage = reason;
+          throw error;
         }
 
         const contentType = response.headers.get('Content-Type') || '';
@@ -524,11 +640,11 @@
       } catch (err) {
         this.removeThinking();
         console.error('❌ Chat error:', err);
-        this.addMessage('Sorry, there was an error. Please try again.', 'assistant');
+        this.addMessage(err.userMessage || 'Sorry, there was an error. Please try again.', 'assistant');
       }
     },
 
-    addMessage(content, role) {
+    addMessage(content, role, opts = {}) {
       const msgDiv = document.createElement('div');
       msgDiv.className = `shop-ai-message ${role}`;
 
@@ -537,14 +653,107 @@
 
       if (role === 'assistant') {
         bubble.innerHTML = this.parseMarkdown(content);
+        msgDiv.appendChild(bubble);
       } else {
-        bubble.textContent = content;
-      }
+        // History stores photos as "[Photo: brand · part · type] caption" — show a chip instead.
+        let text = String(content || '');
+        let photoLabel = null;
+        const marker = PHOTO_MARKER_RE.exec(text);
+        if (marker) {
+          photoLabel = (marker[1] || '').trim() || 'Photo';
+          text = text.slice(marker[0].length);
+        }
 
-      msgDiv.appendChild(bubble);
+        if (opts.imageUrl) {
+          const photo = document.createElement('img');
+          photo.className = 'shop-ai-user-photo';
+          photo.src = opts.imageUrl;
+          photo.alt = 'Photo you sent';
+          photo.addEventListener('load', () => this.scrollToBottom(), { once: true });
+          msgDiv.appendChild(photo);
+        } else if (photoLabel) {
+          const chip = document.createElement('div');
+          chip.className = 'shop-ai-photo-chip';
+          chip.innerHTML = CAMERA_ICON_SVG;
+          const label = document.createElement('span');
+          label.textContent = photoLabel;
+          chip.appendChild(label);
+          msgDiv.appendChild(chip);
+        }
+
+        if (text.trim()) {
+          bubble.textContent = text;
+          msgDiv.appendChild(bubble);
+        }
+      }
       this.elements.messages?.appendChild(msgDiv);
       this.scrollToBottom();
       return msgDiv;
+    },
+
+    updateSendState() {
+      const hasText = !!this.elements.input?.value?.trim();
+      const ready = (hasText || !!this.state.pendingImage) && !this.state.isPreparingImage;
+      this.elements.sendBtn?.classList.toggle('active', ready);
+    },
+
+    async handleImageFile(file) {
+      if (!file || this.state.isPreparingImage) return;
+      if (!file.type.startsWith('image/')) {
+        this.addMessage('Please attach a photo (JPG, PNG or WebP).', 'assistant');
+        return;
+      }
+      if (file.size > PHOTO_MAX_SOURCE_BYTES) {
+        this.addMessage('That photo is too large — please pick one under 25 MB.', 'assistant');
+        return;
+      }
+
+      this.state.isPreparingImage = true;
+      this.renderImagePreview(null, true);
+      this.updateSendState();
+      try {
+        this.state.pendingImage = await preparePhoto(file);
+        this.renderImagePreview(this.state.pendingImage.dataUrl, false);
+      } catch (err) {
+        console.warn('Photo could not be read:', err);
+        this.state.pendingImage = null;
+        this.renderImagePreview(null, false);
+        this.addMessage("I couldn't open that photo. Please try a JPG or PNG — on iPhone, a screenshot of the photo works too.", 'assistant');
+      } finally {
+        this.state.isPreparingImage = false;
+        this.updateSendState();
+        this.elements.input?.focus();
+      }
+    },
+
+    renderImagePreview(dataUrl, loading) {
+      const preview = this.elements.imagePreview;
+      if (!preview) return;
+      if (!dataUrl && !loading) {
+        preview.hidden = true;
+        preview.innerHTML = '';
+        return;
+      }
+      preview.hidden = false;
+      preview.innerHTML = `
+        <div class="shop-ai-image-preview-thumb${loading ? ' loading' : ''}">
+          ${dataUrl ? '<img alt="Photo to send">' : '<span class="shop-ai-image-preview-spinner" aria-hidden="true"></span>'}
+        </div>
+        <div class="shop-ai-image-preview-text">
+          <span class="shop-ai-image-preview-title">${loading ? 'Preparing photo…' : 'Photo attached'}</span>
+          <span class="shop-ai-image-preview-hint">${loading ? 'Just a moment' : 'Add a question or just press send'}</span>
+        </div>
+        ${loading ? '' : `<button type="button" class="shop-ai-image-preview-remove" data-image-action="remove" aria-label="Remove photo">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>`}
+      `;
+      if (dataUrl) preview.querySelector('img').src = dataUrl;
+    },
+
+    clearPendingImage() {
+      this.state.pendingImage = null;
+      this.renderImagePreview(null, false);
+      this.updateSendState();
     },
 
     parseMarkdown(text) {
@@ -605,6 +814,7 @@
       this.state.thinkingInterval = null;
 
       const toolPhrases = {
+        'Reading your photo...':   ['Reading your photo...', 'Looking for the part number...', 'Reading the nameplate...', 'Almost done...'],
         'Searching products...':   ['Searching catalog...', 'Finding best matches...', 'Filtering results...', 'Almost done...'],
         'Adding to cart...':       ['Adding to cart...', 'Preparing your order...', 'Updating basket...', 'Almost done...'],
         'Looking up product...':   ['Looking up product...', 'Fetching details...', 'Checking availability...', 'Almost done...'],
@@ -1074,6 +1284,7 @@
       this.state.conversationId = null;
       this.state.isFirstMessage = true;
       this.state.productDataMap.clear();
+      this.clearPendingImage();
 
       sessionStorage.removeItem('shopAiConversationId');
       sessionStorage.removeItem('shopAiCartId');
