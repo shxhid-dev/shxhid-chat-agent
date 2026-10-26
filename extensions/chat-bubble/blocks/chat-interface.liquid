@@ -1,18 +1,21 @@
 {% comment %}
   AI Chat Assistant ("TIA") — app embed block
-  v5.0 — Redesign: all styles moved to assets/chat.css (light/dark themes, modal or side-popup
-    layout, both remembered in localStorage by chat.js). Header says "TIA"; a greeting sits in
-    the chat body. Only the "hide until chat.css loads" rule stays inline.
-  v4.1 — Email capture popup removed completely (hard-kill rule now lives in chat.css).
+  v6.0 — Studio redesign: TIA logo mark + wordmark (inline SVG), Lucide icons, neutral palette
+    with one accent, list-style empty state, composer with the photo preview inside it.
+    All styles live in assets/chat.css; only the "hide until loaded" rule stays inline.
+  v5.0 — Display modes (full screen / side popup) and themes, remembered by chat.js.
+  v4.1 — Email capture popup removed completely (hard-kill rule lives in chat.css).
 {% endcomment %}
+
+{%- capture tia_mark -%}<svg class="tia-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="tia-mark-tile" width="24" height="24" rx="7"/><path class="tia-mark-glyph" d="M7.5 7.5h9M12 7.5v9"/><circle class="tia-mark-dot" cx="17.25" cy="16.5" r="1.75"/></svg>{%- endcapture -%}
 
 <style>.shop-ai-reset{display:none}</style>
 {{ 'chat.css' | asset_url | stylesheet_tag }}
 
-<div class="shop-ai-reset tia-mode-modal" data-theme="light" aria-hidden="false">
+<div class="shop-ai-reset tia-mode-modal" data-theme="light">
   <div class="shop-ai-floating-group" id="shop-ai-floating-group">
     <button type="button" class="shop-ai-launcher" data-trigger="ask" aria-label="Open TIA, the shop assistant">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8M8 13h5"/></svg>
+      {{ tia_mark }}<span>Ask TIA</span>
     </button>
   </div>
 
@@ -21,79 +24,108 @@
   <div class="shop-ai-modal" id="shop-ai-modal" role="dialog" aria-modal="true" aria-labelledby="shop-ai-title">
     <div class="shop-ai-header">
       <div class="shop-ai-brand">
-        <span class="shop-ai-brand-orb" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l1.9 5.6 5.6 1.9-5.6 1.9L12 17.5l-1.9-5.6-5.6-1.9 5.6-1.9L12 2.5zM18.5 15l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z"/></svg>
-        </span>
+        {{ tia_mark }}
         <div class="shop-ai-brand-text">
-          <h3 class="shop-ai-brand-title" id="shop-ai-title">TIA</h3>
-          <span class="shop-ai-brand-sub"><i class="shop-ai-status-dot" aria-hidden="true"></i>Technical assistant</span>
+          <h2 class="shop-ai-brand-title" id="shop-ai-title"><span class="tia-sr">TIA</span><svg class="tia-wordmark" viewBox="0 0 30 13" aria-hidden="true" focusable="false"><path d="M1 1.15h9M5.5 1.15V13M14.5 0V13M18.6 13L23.6 1.4 28.6 13M20.5 8.5h6.2" stroke-linejoin="bevel"/></svg></h2>
+          <span class="shop-ai-brand-sub">Creative Automation parts assistant</span>
         </div>
       </div>
       <div class="shop-ai-header-actions">
-        <button type="button" class="shop-ai-icon-btn shop-ai-mode-btn" id="shop-ai-mode-btn" aria-label="Switch to side popup" title="Switch layout">
-          <svg class="tia-icon-popup" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><rect x="12" y="11" width="7" height="8" rx="1.5" fill="currentColor" stroke="none"/></svg>
-          <svg class="tia-icon-modal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+        <button type="button" class="shop-ai-icon-btn shop-ai-mode-btn tia-press" id="shop-ai-mode-btn" aria-label="Switch to side popup" title="Switch layout">
+          <svg class="tia-i tia-icon-to-popup" viewBox="0 0 24 24" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg>
+          <svg class="tia-i tia-icon-to-modal" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>
         </button>
-        <button type="button" class="shop-ai-icon-btn shop-ai-menu-btn" id="shop-ai-menu-btn" aria-label="Menu" aria-haspopup="true">
-          <div class="shop-ai-3dot-icon"><span></span><span></span><span></span></div>
+        <button type="button" class="shop-ai-icon-btn shop-ai-menu-btn tia-press" id="shop-ai-menu-btn" aria-label="More options" aria-haspopup="menu" aria-expanded="false">
+          <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
         </button>
-        <button type="button" class="shop-ai-icon-btn" id="shop-ai-close-btn" aria-label="Close">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        <button type="button" class="shop-ai-icon-btn tia-press" id="shop-ai-close-btn" aria-label="Close">
+          <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
         </button>
       </div>
     </div>
 
-    <div class="shop-ai-menu-dropdown" id="shop-ai-menu" role="menu">
-      <button type="button" class="shop-ai-menu-item" data-action="new"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg> New chat</button>
-      <button type="button" class="shop-ai-menu-item" data-action="history"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg> Previous chats</button>
-      <div class="shop-ai-menu-sep"></div>
-      <div class="shop-ai-menu-label">Layout</div>
-      <div class="shop-ai-segmented" role="group" aria-label="Layout">
+    <div class="shop-ai-menu-dropdown" id="shop-ai-menu" role="menu" aria-label="Chat options">
+      <button type="button" class="shop-ai-menu-item tia-press" role="menuitem" data-action="new"><svg class="tia-i tia-i-sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.4 2.6a1 1 0 0 1 3 3L12.4 14.6a2 2 0 0 1-.85.5l-2.87.84a.5.5 0 0 1-.62-.62l.84-2.87a2 2 0 0 1 .5-.85z"/></svg>New chat</button>
+      <button type="button" class="shop-ai-menu-item tia-press" role="menuitem" data-action="history"><svg class="tia-i tia-i-sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>Previous chats</button>
+      <div class="shop-ai-menu-sep" role="separator"></div>
+      <div class="shop-ai-menu-label" id="shop-ai-layout-label">Layout</div>
+      <div class="shop-ai-segmented" role="group" aria-labelledby="shop-ai-layout-label">
         <button type="button" data-set-mode="modal" aria-pressed="true">Full screen</button>
-        <button type="button" data-set-mode="popup" aria-pressed="false">Side popup</button>
+        <button type="button" data-set-mode="popup" aria-pressed="false">Side panel</button>
       </div>
-      <div class="shop-ai-menu-label">Appearance</div>
-      <div class="shop-ai-segmented" role="group" aria-label="Appearance">
+      <div class="shop-ai-menu-label" id="shop-ai-theme-label">Appearance</div>
+      <div class="shop-ai-segmented" role="group" aria-labelledby="shop-ai-theme-label">
         <button type="button" data-set-theme="light" aria-pressed="true">Light</button>
         <button type="button" data-set-theme="dark" aria-pressed="false">Dark</button>
         <button type="button" data-set-theme="system" aria-pressed="false">Auto</button>
       </div>
-      <div class="shop-ai-menu-sep"></div>
-      <button type="button" class="shop-ai-menu-item danger" data-action="end"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> End chat</button>
+      <div class="shop-ai-menu-sep" role="separator"></div>
+      <button type="button" class="shop-ai-menu-item danger tia-press" role="menuitem" data-action="end"><svg class="tia-i tia-i-sm" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>End chat</button>
     </div>
 
-    <div class="shop-ai-messages" id="shop-ai-messages" aria-live="polite">
+    <div class="shop-ai-messages" id="shop-ai-messages" aria-live="polite" aria-relevant="additions">
       <div class="shop-ai-suggestions visible" id="shop-ai-suggestions">
-        <div class="shop-ai-greeting">
-          <div class="shop-ai-greeting-bubble">Hi, I'm <strong>TIA</strong> 👋 Ask me about any part — or send a photo of its nameplate and I'll find it.</div>
+        <div class="shop-ai-empty">
+          {{ tia_mark }}
+          <div class="shop-ai-empty-copy">
+            <h3 class="shop-ai-empty-title">Hi, I'm TIA</h3>
+            <p class="shop-ai-empty-text">Ask about any part, or send a photo of its nameplate and I'll find it in our catalogue.</p>
+          </div>
         </div>
         <div class="shop-ai-sugg-title">Try asking</div>
         <div class="shop-ai-sugg-list">
-          <button type="button" class="shop-ai-sugg-item is-photo" onclick="ShopAIChat.openPhotoPicker()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg> Find a part from a photo</button>
-          <button type="button" class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Show me circuit breakers for industrial applications')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Circuit breakers for industrial use</button>
-          <button type="button" class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('I need pneumatic components for manufacturing')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Pneumatic components</button>
-          <button type="button" class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Help me find the right inverter drive')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Help me pick an inverter drive</button>
-          <button type="button" class="shop-ai-sugg-item" onclick="ShopAIChat.openAndSend('Do you have SKU: ')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="5"/><path d="M7 8h10M7 12h10M7 16h6"/></svg> Search by SKU or model number</button>
+          <button type="button" class="shop-ai-sugg-item is-photo tia-press" onclick="ShopAIChat.openPhotoPicker()">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+            <span>Find a part from a photo</span>
+            <svg class="tia-i tia-i-sm tia-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="shop-ai-sugg-item tia-press" onclick="ShopAIChat.openAndSend('Show me circuit breakers for industrial applications')">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
+            <span>Circuit breakers for industrial use</span>
+            <svg class="tia-i tia-i-sm tia-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="shop-ai-sugg-item tia-press" onclick="ShopAIChat.openAndSend('I need pneumatic components for manufacturing')">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+            <span>Pneumatic components</span>
+            <svg class="tia-i tia-i-sm tia-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="shop-ai-sugg-item tia-press" onclick="ShopAIChat.openAndSend('Help me find the right inverter drive')">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>
+            <span>Help me pick an inverter drive</span>
+            <svg class="tia-i tia-i-sm tia-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <button type="button" class="shop-ai-sugg-item tia-press" onclick="ShopAIChat.openAndSend('Do you have SKU: ')">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M8 7v10"/><path d="M12 7v10"/><path d="M17 7v10"/></svg>
+            <span>Search by SKU or model number</span>
+            <svg class="tia-i tia-i-sm tia-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
         </div>
       </div>
     </div>
 
     <div class="shop-ai-input-area">
-      <div class="shop-ai-image-preview" id="shop-ai-image-preview" hidden></div>
       <div class="shop-ai-input-wrapper">
-        <button type="button" class="shop-ai-attach-btn" id="shop-ai-attach-btn" aria-label="Send a photo of the part or its nameplate" title="Send a photo of the part or nameplate">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-        </button>
-        <input type="file" id="shop-ai-file-input" accept="image/*" hidden>
-        <textarea class="shop-ai-textarea" id="shop-ai-input" placeholder="Ask me anything..." rows="1" aria-label="Message TIA"></textarea>
-        <button type="button" class="shop-ai-send-btn" id="shop-ai-send-btn" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></button>
+        <div class="shop-ai-image-preview" id="shop-ai-image-preview" hidden></div>
+        <div class="shop-ai-composer-row">
+          <button type="button" class="shop-ai-attach-btn tia-press" id="shop-ai-attach-btn" aria-label="Attach a photo of the part or its nameplate" title="Attach a photo">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+          </button>
+          <input type="file" id="shop-ai-file-input" accept="image/*" hidden>
+          <textarea class="shop-ai-textarea" id="shop-ai-input" placeholder="Ask about a part, or attach a photo" rows="1" aria-label="Message TIA" enterkeyhint="send"></textarea>
+          <button type="button" class="shop-ai-send-btn" id="shop-ai-send-btn" aria-label="Send">
+            <svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true" style="stroke-width:2.25"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>
+          </button>
+        </div>
       </div>
-      <div class="shop-ai-disclaimer">TIA answers from our catalogue — please confirm critical specs with our team.</div>
+      <div class="shop-ai-composer-hint">
+        <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span>
+        <span class="tia-hint-right">Answers come from our catalogue</span>
+      </div>
     </div>
 
-    <div class="shop-ai-history-panel" id="shop-ai-history-panel">
+    <div class="shop-ai-history-panel" id="shop-ai-history-panel" aria-label="Previous chats">
       <div class="shop-ai-history-header">
-        <button type="button" class="shop-ai-back-btn" id="shop-ai-back-btn" aria-label="Back"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15,18 9,12 15,6"/></svg></button>
+        <button type="button" class="shop-ai-back-btn tia-press" id="shop-ai-back-btn" aria-label="Back to chat"><svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
         <h3>Previous chats</h3>
       </div>
       <div class="shop-ai-history-list" id="shop-ai-history-list"></div>
@@ -184,9 +216,9 @@
 
   var BUTTON_HTML =
     '<div class="shop-ai-header-trigger-wrap" id="shop-ai-header-btn-wrap">' +
-      '<button class="shop-ai-header-trigger" id="shop-ai-header-btn" aria-label="Ask AI Assistant" type="button">' +
-        '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L13.5 8.5L20 10L13.5 11.5L12 18L10.5 11.5L4 10L10.5 8.5L12 2Z"/></svg>' +
-        '<span class="shop-ai-trigger-label">Ask AI</span>' +
+      '<button class="shop-ai-header-trigger" id="shop-ai-header-btn" aria-label="Ask TIA, the shop assistant" type="button">' +
+        '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="tia-mark-tile" width="24" height="24" rx="7"/><path class="tia-mark-glyph" d="M7.5 7.5h9M12 7.5v9"/><circle class="tia-mark-dot" cx="17.25" cy="16.5" r="1.75"/></svg>' +
+        '<span class="shop-ai-trigger-label">Ask TIA</span>' +
       '</button>' +
     '</div>';
 
