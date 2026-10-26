@@ -1,4 +1,4 @@
-// app/services/image-intel.server.js — v1.0
+// app/services/image-intel.server.js — v1.1
 //
 // PHOTO SEARCH: the customer attaches a photo of a part or its nameplate; we read the brand,
 // part number and product type from it and hand that text to the normal search pipeline
@@ -22,7 +22,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 
-export const IMAGE_INTEL_VERSION = "1.0.0";
+export const IMAGE_INTEL_VERSION = "1.1.0";
 export const PHOTO_NOTE_TAG = "[PHOTO ANALYSIS — NOT FROM USER]";
 
 function intEnv(name, fallback) {
@@ -34,6 +34,8 @@ const MAX_IMAGE_BYTES = intEnv("IMAGE_MAX_BYTES", 3932160);
 const ANALYSIS_TIMEOUT_MS = intEnv("IMAGE_INTEL_TIMEOUT_MS", 25000);
 const MAX_PART_NUMBERS = 3;
 const MAX_SPECS = 6;
+const MAX_QUERIES = 4;
+const MAX_TERMS = 4;
 
 export function isImageUploadEnabled() {
   return String(process.env.IMAGE_UPLOAD || "on").toLowerCase() !== "off";
@@ -132,10 +134,23 @@ const ANALYSIS_SCHEMA = {
       description: "Ratings printed on the part, e.g. '24 V DC', 'IP67', '32 A', 'M12'.",
     },
     visible_text: { type: "string", description: "Other legible text that helps identify the product, max 200 characters." },
+    search_queries: {
+      type: "array",
+      items: { type: "string" },
+      description: "2-4 catalogue search queries, most specific first, 2-6 words each, e.g. 'M23 17 pin female cable connector', 'M23 circular connector'. Include the brand only if it was read.",
+    },
+    distinctive_terms: {
+      type: "array",
+      items: { type: "string" },
+      description: "Up to 4 short designations a correct catalogue product must also show, e.g. 'M23', '17 pin', 'female', '5/2', '32 mm bore'. Only what the photo clearly shows.",
+    },
     confidence: { type: "string", enum: ["high", "medium", "low"], description: "How sure you are of brand and part number." },
     notes: { type: "string", description: "Short note for the sales assistant, e.g. 'label partly cut off' or 'photo is blurry'." },
   },
-  required: ["is_product_photo", "brand", "part_numbers", "product_type", "key_specs", "visible_text", "confidence", "notes"],
+  required: [
+    "is_product_photo", "brand", "part_numbers", "product_type", "key_specs", "visible_text",
+    "search_queries", "distinctive_terms", "confidence", "notes",
+  ],
   additionalProperties: false,
 };
 
@@ -145,6 +160,8 @@ Identify the product so the shop can search its catalogue:
 - Copy part numbers character by character, exactly as printed (keep dashes, dots, slashes and spaces inside the code). Never complete or guess characters you cannot read; leave a code out rather than invent one.
 - Prefer the orderable code (often labelled "Order No.", "Art.-Nr.", "Cat. No.", "Type", "Model", "MLFB", "P/N"). Leave out serial numbers, production dates, batch and certificate numbers.
 - Brand: use the printed name or logo. Do not infer a brand from the product's look alone.
+- Search queries: write them the way an industrial catalogue titles products (type + size / series designation + key variant), most specific first and a broader one last. Read the designation from the part itself (thread or body size like M8/M12/M23, pin count, port configuration like 5/2, bore and stroke) — when it is clearly visible, even without a label.
+- Distinctive terms: the few designations that separate the right product from similar ones (an M12 connector is not an M23 connector). Leave out generic words like "industrial" or "connector".
 - If the photo is not of a product (a person, a room, a screenshot of unrelated content), set is_product_photo to false and leave the other fields empty.`;
 
 let _client;
@@ -155,6 +172,19 @@ function getClient() {
 
 function cleanString(v, max = 120) {
   return typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, max) : "";
+}
+
+function uniqueStrings(list, { min, max }) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : [])
+    .map((v) => cleanString(v, max))
+    .filter((v) => v.length >= min)
+    .filter((v) => {
+      const k = v.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
 }
 
 /** Clamp and de-duplicate model output so the rest of the pipeline can trust its shape. */
@@ -179,6 +209,8 @@ export function normalizeAnalysis(raw) {
     productType: cleanString(raw.product_type, 60),
     keySpecs: (Array.isArray(raw.key_specs) ? raw.key_specs : []).map((s) => cleanString(s, 40)).filter(Boolean).slice(0, MAX_SPECS),
     visibleText: cleanString(raw.visible_text, 200),
+    searchQueries: uniqueStrings(raw.search_queries, { min: 3, max: 80 }).slice(0, MAX_QUERIES),
+    distinctiveTerms: uniqueStrings(raw.distinctive_terms, { min: 1, max: 24 }).slice(0, MAX_TERMS),
     confidence,
     notes: cleanString(raw.notes, 200),
   };
@@ -231,7 +263,8 @@ export async function analyzeProductImage(image, { caption = "", client = getCli
     const analysis = normalizeAnalysis(JSON.parse(text));
     console.log(
       `[ImageIntel] ${model} | ${Date.now() - t0}ms | product=${analysis?.isProductPhoto} brand="${analysis?.brand}" ` +
-        `parts=[${analysis?.partNumbers.join(", ")}] type="${analysis?.productType}" confidence=${analysis?.confidence}`
+        `parts=[${analysis?.partNumbers.join(", ")}] type="${analysis?.productType}" confidence=${analysis?.confidence} ` +
+        `queries=${JSON.stringify(analysis?.searchQueries)} terms=${JSON.stringify(analysis?.distinctiveTerms)}`
     );
     return analysis;
   } catch (error) {
@@ -268,8 +301,11 @@ export function buildPhotoMarker(analysis) {
   return parts.length ? `[Photo: ${parts.join(" · ")}]` : "[Photo]";
 }
 
-/** Instructions for the main Claude call, placed before the customer's text. */
-export function buildPhotoNote(analysis) {
+/**
+ * Instructions for the main Claude call, placed before the customer's text.
+ * `match` is the photo-search result ({ confidence, label, products }) or null if no search ran.
+ */
+export function buildPhotoNote(analysis, match = null) {
   if (!analysis) {
     return (
       `${PHOTO_NOTE_TAG} The customer attached a photo (shown above). Automatic reading of the photo failed, so look at it yourself. ` +
@@ -289,14 +325,37 @@ export function buildPhotoNote(analysis) {
     `part number(s): ${analysis.partNumbers.length ? analysis.partNumbers.join(", ") : "not readable"}`,
     `product type: ${analysis.productType || "unknown"}`,
   ];
+  if (analysis.distinctiveTerms.length) lines.push(`identifying designations: ${analysis.distinctiveTerms.join(", ")}`);
   if (analysis.keySpecs.length) lines.push(`ratings on the part: ${analysis.keySpecs.join(", ")}`);
   if (analysis.visibleText) lines.push(`other text: ${analysis.visibleText}`);
-  lines.push(`confidence: ${analysis.confidence}${analysis.notes ? ` (${analysis.notes})` : ""}`);
-  lines.push(
-    analysis.confidence === "low" || !analysis.partNumbers.length
-      ? "The reading is uncertain: check it against the photo, tell the customer what you could read, and ask for a sharper photo of the nameplate or the part number as text if it matters. Never invent a part number."
-      : "Treat the part number as the customer's request. If the catalogue has no exact match, say so plainly before offering close matches."
-  );
+  lines.push(`reading confidence: ${analysis.confidence}${analysis.notes ? ` (${analysis.notes})` : ""}`);
+
+  if (match) {
+    const top = match.products?.[0];
+    const shown = match.products?.length || 0;
+    lines.push(
+      `catalogue match: ${match.label} — confidence ${match.confidence}` +
+        (top ? `; best card: "${top.title}"${top.sku ? ` (part number ${top.sku})` : ""}` : "") +
+        `; ${shown} card(s) shown, ranked by how well they fit the photo.`
+    );
+    if (match.reasons?.length) lines.push(`why: ${match.reasons.join("; ")}`);
+    lines.push(
+      {
+        high: "Say it matches and name the best card with its part number. Mention anything the photo can't confirm only if it matters.",
+        medium:
+          "Say these are likely matches, name the best one, and ask ONE question that would confirm it (e.g. pin count, size, brand or the part number on the label).",
+        low: "Say these are only possible matches, not confirmed. Ask for the part number, a sharp photo of the nameplate, or the key specs.",
+        none:
+          "No product in the catalogue fits this photo, and no cards are shown. Say what you could identify, say we don't list a match on the website, and ask for the part number, a nameplate photo or the key specs; offer websales@creativeautomation.ae.",
+      }[match.confidence] || ""
+    );
+  } else {
+    lines.push(
+      analysis.confidence === "low" || !analysis.partNumbers.length
+        ? "The reading is uncertain: check it against the photo, tell the customer what you could read, and ask for a sharper photo of the nameplate or the part number as text if it matters. Never invent a part number."
+        : "Treat the part number as the customer's request. If the catalogue has no exact match, say so plainly before offering close matches."
+    );
+  }
   return lines.join("\n");
 }
 

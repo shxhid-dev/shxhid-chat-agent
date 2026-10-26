@@ -155,3 +155,27 @@ test("analyzeProductImage returns null on refusal, bad JSON or API errors", asyn
   assert.equal(await analyzeProductImage(IMAGE, { client: fakeClient(new Error("network down")) }), null);
   assert.equal(await analyzeProductImage(null, { client: fakeClient(new Error("unused")) }), null);
 });
+
+test("normalizeAnalysis keeps search queries and distinctive terms, de-duplicated and capped", () => {
+  const a = normalizeAnalysis({
+    ...NAMEPLATE,
+    search_queries: ["M23 17 pin female connector", "m23 17 PIN female connector", "M23 connector", "x", "a b", "c d", "e f"],
+    distinctive_terms: ["M23", "17 pin", "female", "straight", "IP67", ""],
+  });
+  assert.deepEqual(a.searchQueries, ["M23 17 pin female connector", "M23 connector", "a b", "c d"]);
+  assert.deepEqual(a.distinctiveTerms, ["M23", "17 pin", "female", "straight"]);
+  assert.deepEqual(normalizeAnalysis(NAMEPLATE).searchQueries, []);
+});
+
+test("photo note reports the catalogue match and asks on low / none", () => {
+  const a = normalizeAnalysis({ ...NAMEPLATE, distinctive_terms: ["M23"] });
+  const high = buildPhotoNote(a, { confidence: "high", label: "Exact part number match", products: [{ title: "Siemens Contactor", sku: "3RT2026-1BB40" }], reasons: ["the part number on the photo matches the catalogue"] });
+  assert.match(high, /catalogue match: Exact part number match — confidence high/);
+  assert.match(high, /part number 3RT2026-1BB40/);
+  assert.match(high, /identifying designations: M23/);
+
+  assert.match(buildPhotoNote(a, { confidence: "low", label: "Possible matches", products: [{ title: "x" }] }), /only possible matches/);
+  const none = buildPhotoNote(a, { confidence: "none", label: "No good match", products: [] });
+  assert.match(none, /no cards are shown/);
+  assert.match(none, /websales@/);
+});
