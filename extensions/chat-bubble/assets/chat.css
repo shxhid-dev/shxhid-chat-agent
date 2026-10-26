@@ -1,685 +1,981 @@
-:root {
-    --viewport-height: 100vh;
-  }
+/* ==========================================================================
+   TIA chat widget — v5.0 (26 Oct 2026)
+   One stylesheet for the app embed (the Liquid block keeps only a tiny
+   "hide until loaded" rule).
 
-  .shop-ai-chat-container {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 9999;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  }
+   Root:  .shop-ai-reset[data-theme="light|dark"].tia-mode-modal|.tia-mode-popup
+   Body:  .shop-ai-open (panel open) + .shop-ai-mode-modal|.shop-ai-mode-popup
+   ========================================================================== */
 
-  .shop-ai-chat-bubble {
-    width: 60px;
-    height: 60px;
-    background-color: #5046e4;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    transition: transform 0.3s ease;
-  }
+/* ---------- Tokens ---------- */
+.shop-ai-reset {
+  --tia-accent: #ff8534;
+  --tia-accent-2: #ff9d5c;
+  --tia-accent-ink: #c2541a;
+  --tia-accent-soft: rgba(255, 133, 52, 0.1);
+  --tia-accent-ring: rgba(255, 133, 52, 0.28);
+  --tia-grad: linear-gradient(135deg, #ffa463 0%, #ff7a2f 100%);
 
-  @media (max-width: 480px) {
-    .shop-ai-chat-bubble {
-      width: 50px;
-      height: 50px;
-    }
+  --tia-bg: #ffffff;
+  --tia-surface: #f6f6f7;
+  --tia-surface-2: #eeeef0;
+  --tia-elev: #ffffff;
+  --tia-glass: rgba(255, 255, 255, 0.78);
+  --tia-text: #111114;
+  --tia-text-2: #55555f;
+  --tia-text-3: #8b8b95;
+  --tia-border: rgba(17, 17, 20, 0.08);
+  --tia-border-2: rgba(17, 17, 20, 0.14);
+  --tia-scrim: rgba(10, 10, 14, 0.38);
 
-    .shop-ai-chat-bubble svg {
-      width: 25px;
-      height: 25px;
-    }
-  }
+  --tia-good: #15803d;
+  --tia-good-soft: rgba(22, 163, 74, 0.1);
+  --tia-warn: #b45309;
+  --tia-warn-soft: rgba(217, 119, 6, 0.12);
+  --tia-muted: #52525b;
+  --tia-muted-soft: rgba(82, 82, 91, 0.1);
+  --tia-danger: #dc2626;
 
-  .shop-ai-chat-bubble:hover {
-    transform: scale(1.05);
-  }
+  --tia-shadow-lg: 0 32px 80px -16px rgba(17, 17, 20, 0.28), 0 12px 32px -12px rgba(17, 17, 20, 0.16);
+  --tia-shadow-md: 0 10px 28px -8px rgba(17, 17, 20, 0.16);
+  --tia-shadow-sm: 0 1px 2px rgba(17, 17, 20, 0.06), 0 1px 1px rgba(17, 17, 20, 0.04);
 
-  .shop-ai-chat-bubble svg {
-    width: 30px;
-    height: 30px;
-    color: white;
-  }
+  --tia-r-xl: 26px;
+  --tia-r-lg: 18px;
+  --tia-r-md: 14px;
+  --tia-r-sm: 10px;
 
-  .shop-ai-chat-window {
-    position: absolute;
-    bottom: 80px;
+  --tia-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --tia-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --tia-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --tia-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  display: block;
+  color: var(--tia-text);
+  font-family: var(--tia-font);
+}
+
+.shop-ai-reset[data-theme="dark"] {
+  --tia-accent: #ff9a55;
+  --tia-accent-2: #ffb07a;
+  --tia-accent-ink: #ffb07a;
+  --tia-accent-soft: rgba(255, 154, 85, 0.14);
+  --tia-accent-ring: rgba(255, 154, 85, 0.35);
+
+  --tia-bg: #121215;
+  --tia-surface: #1c1c21;
+  --tia-surface-2: #26262c;
+  --tia-elev: #1d1d22;
+  --tia-glass: rgba(20, 20, 24, 0.78);
+  --tia-text: #f4f4f5;
+  --tia-text-2: #b4b4bd;
+  --tia-text-3: #7d7d88;
+  --tia-border: rgba(255, 255, 255, 0.08);
+  --tia-border-2: rgba(255, 255, 255, 0.15);
+  --tia-scrim: rgba(0, 0, 0, 0.55);
+
+  --tia-good: #4ade80;
+  --tia-good-soft: rgba(74, 222, 128, 0.12);
+  --tia-warn: #fbbf24;
+  --tia-warn-soft: rgba(251, 191, 36, 0.13);
+  --tia-muted: #a1a1aa;
+  --tia-muted-soft: rgba(161, 161, 170, 0.14);
+
+  --tia-shadow-lg: 0 32px 80px -16px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --tia-shadow-md: 0 10px 28px -8px rgba(0, 0, 0, 0.6);
+  --tia-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  color-scheme: dark;
+}
+
+.shop-ai-reset *,
+.shop-ai-reset *::before,
+.shop-ai-reset *::after {
+  box-sizing: border-box;
+  font-family: var(--tia-font);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Shopify themes style *:focus-visible globally; use our own ring. */
+.shop-ai-reset *:focus-visible {
+  outline: 2px solid var(--tia-accent) !important;
+  outline-offset: 2px;
+  box-shadow: none !important;
+}
+.shop-ai-reset textarea:focus-visible { outline: none !important; }
+
+.shop-ai-reset button { font: inherit; }
+
+/* ---------- Page blur (modal mode only) ---------- */
+body.shop-ai-open.shop-ai-mode-modal > *:not(.shop-ai-chat-section) {
+  filter: blur(18px) saturate(120%);
+  transition: filter 0.35s ease;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ---------- Store-header "Ask AI" trigger (injected by the block) ---------- */
+.shop-ai-header-trigger-wrap { display: inline-flex; align-items: center; margin-left: 4px; }
+.shop-ai-header-trigger {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 133, 52, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 157, 92, 0.13);
+  color: #e06a22 !important;
+  font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  text-decoration: none !important;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(255, 133, 52, 0.1);
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.2s ease, box-shadow 0.2s ease;
+}
+.shop-ai-header-trigger::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(110deg, transparent 25%, rgba(255, 157, 92, 0.2) 37%, transparent 63%);
+  background-size: 200% 100%;
+  animation: tiaShimmer 3.2s ease-in-out infinite;
+  pointer-events: none;
+}
+.shop-ai-header-trigger:hover { transform: translateY(-1px); background: rgba(255, 157, 92, 0.22); box-shadow: 0 6px 18px rgba(255, 133, 52, 0.2); }
+.shop-ai-header-trigger:active { transform: scale(0.95); }
+.shop-ai-header-trigger svg { width: 16px; height: 16px; flex-shrink: 0; fill: currentColor; }
+@media (max-width: 749px) {
+  .shop-ai-header-trigger { padding: 7px 12px; font-size: 12px; gap: 4px; }
+  .shop-ai-header-trigger svg { width: 14px; height: 14px; }
+}
+@media (max-width: 389px) {
+  .shop-ai-header-trigger { padding: 7px 9px; gap: 0; }
+  .shop-ai-header-trigger .shop-ai-trigger-label { display: none; }
+  .shop-ai-header-trigger svg { width: 18px; height: 18px; }
+}
+
+/* ---------- Launcher bubble (side-popup mode, while closed) ---------- */
+.shop-ai-floating-group {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 999997;
+  display: none;
+}
+.shop-ai-reset.tia-mode-popup .shop-ai-floating-group { display: block; }
+.shop-ai-reset.tia-mode-popup .shop-ai-floating-group.hidden { display: none; }
+.shop-ai-launcher {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  border: none;
+  border-radius: 50%;
+  background: var(--tia-grad);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 14px 34px -8px rgba(255, 122, 47, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.35) inset;
+  animation: tiaLauncherIn 0.6s var(--tia-spring) both;
+  transition: transform 0.3s var(--tia-spring), box-shadow 0.3s ease;
+}
+.shop-ai-launcher::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 133, 52, 0.35);
+  animation: tiaPulse 2.6s ease-out infinite;
+}
+.shop-ai-launcher:hover { transform: translateY(-2px) scale(1.05); box-shadow: 0 18px 40px -8px rgba(255, 122, 47, 0.7); }
+.shop-ai-launcher:active { transform: scale(0.94); }
+.shop-ai-launcher svg { width: 26px; height: 26px; }
+
+/* ---------- Backdrop ---------- */
+.shop-ai-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999998;
+  background: var(--tia-scrim);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.3s ease, visibility 0.3s ease;
+}
+body.shop-ai-open.shop-ai-mode-modal .shop-ai-backdrop { opacity: 1; visibility: visible; }
+
+/* ---------- Panel ---------- */
+.shop-ai-modal {
+  position: fixed;
+  z-index: 999999;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--tia-bg);
+  color: var(--tia-text);
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-xl);
+  box-shadow: var(--tia-shadow-lg);
+  opacity: 0;
+  visibility: hidden;
+  filter: blur(6px);
+  transition:
+    opacity 0.32s var(--tia-ease),
+    transform 0.5s var(--tia-spring),
+    filter 0.32s var(--tia-ease),
+    visibility 0s linear 0.32s;
+}
+body.shop-ai-open .shop-ai-modal {
+  opacity: 1;
+  visibility: visible;
+  filter: none;
+  transition:
+    opacity 0.32s var(--tia-ease),
+    transform 0.5s var(--tia-spring),
+    filter 0.32s var(--tia-ease),
+    visibility 0s;
+}
+
+/* Modal (full-screen style) */
+.tia-mode-modal .shop-ai-modal {
+  top: 50%;
+  left: 50%;
+  width: min(920px, calc(100vw - 48px));
+  height: min(86vh, 900px);
+  transform: translate(-50%, -47%) scale(0.95);
+}
+body.shop-ai-open .tia-mode-modal .shop-ai-modal { transform: translate(-50%, -50%) scale(1); }
+
+/* Side popup (bottom-right widget) */
+.tia-mode-popup .shop-ai-modal {
+  right: 24px;
+  bottom: 24px;
+  width: 408px;
+  height: min(680px, calc(100vh - 48px));
+  transform-origin: bottom right;
+  transform: translateY(16px) scale(0.92);
+}
+body.shop-ai-open .tia-mode-popup .shop-ai-modal { transform: none; }
+
+/* Mode switch: quick blur cross-fade */
+.shop-ai-reset.tia-switching .shop-ai-modal { opacity: 0 !important; filter: blur(10px) !important; transition: opacity 0.16s ease, filter 0.16s ease !important; }
+
+/* Soft accent glow behind the header */
+.shop-ai-modal::before {
+  content: "";
+  position: absolute;
+  top: -120px;
+  left: 50%;
+  width: 70%;
+  height: 220px;
+  transform: translateX(-50%);
+  background: radial-gradient(closest-side, rgba(255, 133, 52, 0.16), transparent);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ---------- Header ---------- */
+.shop-ai-header {
+  position: relative;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 68px;
+  padding: 12px 14px 12px 18px;
+  background: var(--tia-glass);
+  -webkit-backdrop-filter: saturate(160%) blur(16px);
+  backdrop-filter: saturate(160%) blur(16px);
+  border-bottom: 1px solid var(--tia-border);
+}
+.shop-ai-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.shop-ai-brand-orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  border-radius: 13px;
+  background: var(--tia-grad);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  box-shadow: 0 8px 18px -6px rgba(255, 122, 47, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+.shop-ai-brand-orb svg { width: 20px; height: 20px; }
+.shop-ai-brand-text { display: flex; flex-direction: column; min-width: 0; }
+.shop-ai-reset .shop-ai-brand-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: 0.06em;
+  color: var(--tia-text);
+}
+.shop-ai-brand-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tia-text-3);
+  white-space: nowrap;
+}
+.shop-ai-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
+}
+
+.shop-ai-header-actions { position: relative; display: flex; align-items: center; gap: 6px; }
+.shop-ai-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--tia-text-2);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.3s var(--tia-spring);
+}
+.shop-ai-icon-btn:hover { background: var(--tia-surface); color: var(--tia-text); }
+.shop-ai-icon-btn:active { transform: scale(0.9); }
+.shop-ai-icon-btn svg { width: 19px; height: 19px; }
+.shop-ai-3dot-icon { display: flex; flex-direction: column; gap: 3px; align-items: center; }
+.shop-ai-3dot-icon span { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+
+/* Mode toggle shows the icon of the layout it switches TO */
+.shop-ai-mode-btn .tia-icon-popup,
+.tia-mode-popup .shop-ai-mode-btn .tia-icon-modal { display: block; }
+.shop-ai-mode-btn .tia-icon-modal,
+.tia-mode-popup .shop-ai-mode-btn .tia-icon-popup { display: none; }
+
+/* ---------- Menu ---------- */
+.shop-ai-menu-dropdown {
+  position: absolute;
+  top: 60px;
+  right: 14px;
+  z-index: 40;
+  width: 236px;
+  padding: 6px;
+  background: var(--tia-elev);
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-md);
+  box-shadow: var(--tia-shadow-md);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-6px) scale(0.97);
+  transform-origin: top right;
+  transition: opacity 0.18s ease, transform 0.3s var(--tia-spring), visibility 0s linear 0.18s;
+}
+.shop-ai-menu-dropdown.active { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+.shop-ai-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-radius: var(--tia-r-sm);
+  background: transparent;
+  color: var(--tia-text);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.shop-ai-menu-item:hover { background: var(--tia-surface); }
+.shop-ai-menu-item svg { flex-shrink: 0; color: var(--tia-text-2); }
+.shop-ai-menu-item.danger, .shop-ai-menu-item.danger svg { color: var(--tia-danger); }
+.shop-ai-menu-sep { height: 1px; margin: 6px 4px; background: var(--tia-border); }
+.shop-ai-menu-label { padding: 6px 12px 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--tia-text-3); }
+.shop-ai-segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+  margin: 2px 6px 6px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--tia-surface);
+}
+.shop-ai-segmented button {
+  padding: 7px 4px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tia-text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+.shop-ai-segmented button[aria-pressed="true"] { background: var(--tia-elev); color: var(--tia-text); box-shadow: var(--tia-shadow-sm); }
+
+/* ---------- Messages ---------- */
+.shop-ai-messages {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  padding: 22px 22px 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tia-border-2) transparent;
+}
+.shop-ai-messages::-webkit-scrollbar { width: 5px; }
+.shop-ai-messages::-webkit-scrollbar-thumb { background: var(--tia-border-2); border-radius: 5px; }
+/* Modal mode: keep a ~760px reading column centred in the wide panel */
+.tia-mode-modal .shop-ai-messages { padding-left: max(22px, calc((100% - 760px) / 2)); padding-right: max(22px, calc((100% - 760px) / 2)); }
+
+.shop-ai-message { display: flex; flex-direction: column; min-width: 0; max-width: 100%; animation: tiaRise 0.42s var(--tia-spring) both; }
+.shop-ai-bubble { max-width: 100%; overflow-wrap: anywhere; word-break: normal; }
+.shop-ai-bubble p { margin: 0 0 10px; }
+.shop-ai-bubble p:last-child { margin-bottom: 0; }
+.shop-ai-bubble strong { font-weight: 650; }
+.shop-ai-bubble a { color: var(--tia-accent-ink); text-decoration: underline; text-decoration-color: var(--tia-accent-ring); text-underline-offset: 2px; }
+
+/* User */
+.shop-ai-message.user { align-self: flex-end; align-items: flex-end; max-width: min(78%, 560px); }
+.shop-ai-message.user .shop-ai-bubble {
+  padding: 10px 15px;
+  border-radius: 20px 20px 6px 20px;
+  background: var(--tia-grad);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.5;
+  box-shadow: 0 8px 20px -10px rgba(255, 122, 47, 0.7);
+}
+.shop-ai-message.user .shop-ai-bubble a { color: #fff; }
+
+/* Assistant — avatar drawn with ::before so every assistant row gets it */
+.shop-ai-message.assistant,
+.shop-ai-thinking-container,
+.shop-ai-greeting {
+  position: relative;
+  align-self: flex-start;
+  padding-left: 38px;
+}
+.shop-ai-message.assistant { max-width: min(88%, 680px); }
+.shop-ai-message.assistant::before,
+.shop-ai-thinking-container::before,
+.shop-ai-greeting::before {
+  content: "T";
+  position: absolute;
+  left: 0;
+  top: 2px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 10px;
+  background: var(--tia-grad);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: 0 6px 14px -6px rgba(255, 122, 47, 0.6);
+}
+.shop-ai-message.assistant .shop-ai-bubble {
+  padding: 12px 16px;
+  border-radius: 6px 20px 20px 20px;
+  background: var(--tia-surface);
+  border: 1px solid var(--tia-border);
+  color: var(--tia-text);
+  font-size: 15px;
+  line-height: 1.6;
+}
+/* Streaming caret */
+.shop-ai-bubble.is-streaming > p:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: -0.18em;
+  border-radius: 1px;
+  background: var(--tia-accent);
+  animation: tiaCaret 0.9s steps(1) infinite;
+}
+
+/* Typing indicator */
+.shop-ai-thinking-container { display: flex; align-items: center; animation: tiaRise 0.36s var(--tia-spring) both; }
+.shop-ai-thinking-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  border-radius: 6px 20px 20px 20px;
+  background: var(--tia-surface);
+  border: 1px solid var(--tia-border);
+  max-width: 280px;
+  overflow: hidden;
+  position: relative;
+}
+.shop-ai-thinking-pill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 20%, var(--tia-accent-soft) 40%, transparent 60%);
+  background-size: 220% 100%;
+  animation: tiaShimmer 2.2s ease-in-out infinite;
+  pointer-events: none;
+}
+.shop-ai-thinking-dots { display: flex; gap: 4px; flex-shrink: 0; }
+.shop-ai-thinking-dots span { width: 7px; height: 7px; border-radius: 50%; background: var(--tia-accent); animation: tiaBounce 1.2s var(--tia-ease) infinite; }
+.shop-ai-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.shop-ai-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+.shop-ai-thinking-text { font-size: 13px; font-weight: 500; color: var(--tia-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity 0.2s ease; }
+
+/* ---------- Welcome: greeting + suggestions ---------- */
+.shop-ai-suggestions { display: block; margin-top: auto; padding-top: 8px; }
+.shop-ai-suggestions:not(.visible) { display: none; }
+.shop-ai-greeting { margin-bottom: 18px; animation: tiaRise 0.5s var(--tia-spring) both; }
+.shop-ai-greeting-bubble {
+  display: inline-block;
+  padding: 13px 17px;
+  border-radius: 6px 20px 20px 20px;
+  background: var(--tia-surface);
+  border: 1px solid var(--tia-border);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--tia-text);
+}
+.shop-ai-greeting-bubble strong { font-weight: 700; }
+.shop-ai-sugg-title { margin: 0 0 10px 38px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--tia-text-3); }
+.shop-ai-sugg-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-left: 38px; }
+.tia-mode-popup .shop-ai-sugg-list { grid-template-columns: 1fr; }
+.shop-ai-sugg-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-md);
+  background: var(--tia-elev);
+  color: var(--tia-text);
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--tia-shadow-sm);
+  animation: tiaRise 0.5s var(--tia-spring) both;
+  transition: transform 0.35s var(--tia-spring), border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+.shop-ai-sugg-item:nth-child(1) { animation-delay: 0.06s; }
+.shop-ai-sugg-item:nth-child(2) { animation-delay: 0.12s; }
+.shop-ai-sugg-item:nth-child(3) { animation-delay: 0.18s; }
+.shop-ai-sugg-item:nth-child(4) { animation-delay: 0.24s; }
+.shop-ai-sugg-item:nth-child(5) { animation-delay: 0.3s; }
+.shop-ai-sugg-item:hover { transform: translateY(-2px); border-color: var(--tia-accent-ring); box-shadow: var(--tia-shadow-md); }
+.shop-ai-sugg-item:active { transform: scale(0.98); }
+.shop-ai-sugg-item svg { width: 18px; height: 18px; flex-shrink: 0; color: var(--tia-accent); }
+.shop-ai-sugg-item.is-photo { background: var(--tia-accent-soft); border-color: var(--tia-accent-ring); }
+
+/* ---------- Results: confidence chip + product cards ---------- */
+.shop-ai-results { display: flex; flex-direction: column; gap: 8px; min-width: 0; animation: tiaRise 0.45s var(--tia-spring) both; }
+.shop-ai-match {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  align-self: flex-start;
+  margin-left: 38px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.shop-ai-match i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.shop-ai-match.is-high { color: var(--tia-good); background: var(--tia-good-soft); }
+.shop-ai-match.is-medium { color: var(--tia-warn); background: var(--tia-warn-soft); }
+.shop-ai-match.is-low { color: var(--tia-muted); background: var(--tia-muted-soft); }
+
+.shop-ai-product-grid {
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+  padding: 4px 2px 12px 38px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-padding-left: 38px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.shop-ai-product-grid::-webkit-scrollbar { display: none; }
+.shop-ai-product-card {
+  position: relative;
+  display: flex;
+  flex: 0 0 186px;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  scroll-snap-align: start;
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-lg);
+  background: var(--tia-elev);
+  box-shadow: var(--tia-shadow-sm);
+  cursor: pointer;
+  animation: tiaRise 0.5s var(--tia-spring) both;
+  transition: transform 0.4s var(--tia-spring), box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.shop-ai-product-card:nth-child(2) { animation-delay: 0.05s; }
+.shop-ai-product-card:nth-child(3) { animation-delay: 0.1s; }
+.shop-ai-product-card:nth-child(4) { animation-delay: 0.15s; }
+.shop-ai-product-card:nth-child(n + 5) { animation-delay: 0.2s; }
+.shop-ai-product-card:hover { transform: translateY(-4px); border-color: var(--tia-accent-ring); box-shadow: var(--tia-shadow-md); }
+.shop-ai-product-media { position: relative; aspect-ratio: 4 / 3; background: #fff; border-bottom: 1px solid var(--tia-border); }
+.shop-ai-product-media .shop-ai-product-image-wrap,
+.shop-ai-product-media .shop-ai-img-placeholder { width: 100% !important; height: 100% !important; border-radius: 0 !important; }
+.shop-ai-product-image { display: block; width: 100%; height: 100%; padding: 10px; object-fit: contain; background: #fff; }
+.shop-ai-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--tia-grad);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow: 0 4px 10px -4px rgba(255, 122, 47, 0.7);
+}
+.shop-ai-badge.is-soft { background: rgba(17, 17, 20, 0.72); box-shadow: none; }
+.shop-ai-product-info { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; padding: 11px 12px 12px; }
+.shop-ai-reset .shop-ai-product-title {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  min-height: 2.7em;
+  color: var(--tia-text);
+}
+.shop-ai-product-sku {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 2px 7px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--tia-surface);
+  color: var(--tia-text-2);
+  font: 600 11px/1.5 var(--tia-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shop-ai-product-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 2px; }
+.shop-ai-product-price { min-width: 0; font-size: 13.5px; font-weight: 700; color: var(--tia-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.01em; }
+.shop-ai-product-price.is-empty { color: var(--tia-text-3); font-weight: 500; font-size: 12px; }
+.shop-ai-reset .shop-ai-product-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: var(--tia-accent-soft);
+  color: var(--tia-accent-ink);
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+  transition: background 0.2s ease, transform 0.3s var(--tia-spring);
+}
+.shop-ai-reset .shop-ai-product-link:hover { background: var(--tia-accent-ring); transform: translateX(1px); }
+.shop-ai-product-link svg { width: 12px; height: 12px; }
+
+/* ---------- Product details modal ---------- */
+.shop-ai-product-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--tia-scrim);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.25s ease, visibility 0.25s ease;
+}
+.shop-ai-product-modal-overlay.active { opacity: 1; visibility: visible; }
+.shop-ai-product-modal {
+  position: relative;
+  display: flex;
+  gap: 22px;
+  width: 100%;
+  max-width: 620px;
+  max-height: calc(100vh - 32px);
+  padding: 26px;
+  overflow-y: auto;
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-xl);
+  background: var(--tia-elev);
+  color: var(--tia-text);
+  box-shadow: var(--tia-shadow-lg);
+  transform: translateY(14px) scale(0.96);
+  transition: transform 0.45s var(--tia-spring);
+}
+.shop-ai-product-modal-overlay.active .shop-ai-product-modal { transform: none; }
+.shop-ai-product-modal-left { display: flex; align-items: center; justify-content: center; flex: 0 0 210px; aspect-ratio: 1; overflow: hidden; border-radius: var(--tia-r-lg); background: #fff; border: 1px solid var(--tia-border); }
+.shop-ai-product-modal-left img { width: 100%; height: 100%; padding: 14px; object-fit: contain; }
+.shop-ai-product-modal-right { display: flex; flex: 1; flex-direction: column; gap: 8px; min-width: 0; padding-top: 18px; }
+.shop-ai-product-modal-title { font-size: 18px; font-weight: 700; line-height: 1.3; }
+.shop-ai-product-modal-price { font-size: 21px; font-weight: 800; color: var(--tia-accent-ink); letter-spacing: -0.01em; }
+.shop-ai-product-modal-sku { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; padding: 3px 9px; border-radius: 7px; background: var(--tia-surface); font: 600 12px/1.5 var(--tia-mono); color: var(--tia-text-2); }
+.shop-ai-sku-label { font-family: var(--tia-font); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: var(--tia-accent-ink); }
+.shop-ai-product-modal-description { max-height: 120px; overflow-y: auto; font-size: 13.5px; line-height: 1.55; color: var(--tia-text-2); }
+.shop-ai-product-modal-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: auto; padding-top: 12px; }
+.shop-ai-product-modal-primary,
+.shop-ai-product-modal-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 20px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.35s var(--tia-spring), box-shadow 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+.shop-ai-product-modal-primary { flex: 1; border: none; background: var(--tia-grad); color: #fff; box-shadow: 0 10px 22px -10px rgba(255, 122, 47, 0.8); }
+.shop-ai-product-modal-primary:hover { transform: translateY(-2px); }
+.shop-ai-product-modal-primary:disabled { opacity: 0.7; cursor: default; transform: none; }
+.shop-ai-product-modal-secondary { border: 1px solid var(--tia-border-2); background: transparent; color: var(--tia-text); }
+.shop-ai-product-modal-secondary:hover { border-color: var(--tia-accent); color: var(--tia-accent-ink); }
+.shop-ai-product-modal-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--tia-border);
+  border-radius: 50%;
+  background: var(--tia-elev);
+  color: var(--tia-text);
+  cursor: pointer;
+  transition: transform 0.3s var(--tia-spring), background 0.2s ease;
+}
+.shop-ai-product-modal-close:hover { background: var(--tia-surface); transform: rotate(90deg); }
+
+/* ---------- Composer ---------- */
+.shop-ai-input-area { position: relative; z-index: 2; padding: 10px 18px 14px; }
+.tia-mode-modal .shop-ai-input-area { padding-left: max(18px, calc((100% - 760px) / 2)); padding-right: max(18px, calc((100% - 760px) / 2)); }
+.shop-ai-input-wrapper {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--tia-border-2);
+  border-radius: 22px;
+  background: var(--tia-elev);
+  box-shadow: var(--tia-shadow-sm);
+  transition: border-color 0.2s ease, box-shadow 0.25s ease;
+}
+.shop-ai-input-wrapper:focus-within { border-color: var(--tia-accent); box-shadow: 0 0 0 4px var(--tia-accent-soft), var(--tia-shadow-sm); }
+.shop-ai-textarea {
+  flex: 1;
+  min-height: 24px;
+  max-height: 132px;
+  margin: 0;
+  padding: 7px 4px;
+  overflow-y: auto;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--tia-text);
+  font-size: 15px;
+  line-height: 1.5;
+}
+.shop-ai-textarea::placeholder { color: var(--tia-text-3); opacity: 1; transition: opacity 0.3s ease; }
+.shop-ai-textarea.placeholder-fade::placeholder { opacity: 0; }
+.shop-ai-attach-btn,
+.shop-ai-send-btn {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  min-width: 38px;
+  padding: 0;
+  border: none;
+  border-radius: 14px;
+  cursor: pointer;
+  transition: transform 0.35s var(--tia-spring), background 0.2s ease, opacity 0.2s ease, box-shadow 0.2s ease;
+}
+.shop-ai-attach-btn { background: var(--tia-surface); color: var(--tia-text-2); }
+.shop-ai-attach-btn:hover { background: var(--tia-accent-soft); color: var(--tia-accent-ink); transform: scale(1.06); }
+.shop-ai-attach-btn:active { transform: scale(0.92); }
+.shop-ai-attach-btn svg { width: 19px; height: 19px; }
+.shop-ai-send-btn { background: var(--tia-grad); color: #fff; opacity: 0.35; pointer-events: none; transform: scale(0.9); }
+.shop-ai-send-btn.active { opacity: 1; pointer-events: auto; transform: scale(1); box-shadow: 0 8px 18px -8px rgba(255, 122, 47, 0.9); }
+.shop-ai-send-btn.active:hover { transform: translateY(-1px) scale(1.06); }
+.shop-ai-send-btn.active:active { transform: scale(0.92); }
+.shop-ai-send-btn svg { width: 18px; height: 18px; }
+.shop-ai-input-area.shop-ai-drop-active .shop-ai-input-wrapper { border-style: dashed; border-color: var(--tia-accent); background: var(--tia-accent-soft); box-shadow: 0 0 0 5px var(--tia-accent-soft); }
+.shop-ai-disclaimer { margin-top: 8px; font-size: 11px; line-height: 1.4; text-align: center; color: var(--tia-text-3); }
+
+/* Photo preview card */
+.shop-ai-image-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding: 8px;
+  border: 1px solid var(--tia-accent-ring);
+  border-radius: var(--tia-r-lg);
+  background: var(--tia-elev);
+  box-shadow: var(--tia-shadow-md);
+  animation: tiaRise 0.4s var(--tia-spring) both;
+}
+.shop-ai-image-preview[hidden] { display: none; }
+.shop-ai-image-preview-thumb { display: grid; place-items: center; width: 52px; height: 52px; flex-shrink: 0; overflow: hidden; border-radius: 12px; background: var(--tia-surface); }
+.shop-ai-image-preview-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shop-ai-image-preview-spinner { width: 20px; height: 20px; border: 2.5px solid var(--tia-accent-soft); border-top-color: var(--tia-accent); border-radius: 50%; animation: tiaSpin 0.8s linear infinite; }
+.shop-ai-image-preview-text { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
+.shop-ai-image-preview-title { font-size: 13.5px; font-weight: 600; color: var(--tia-text); }
+.shop-ai-image-preview-hint { overflow: hidden; font-size: 12px; color: var(--tia-text-3); text-overflow: ellipsis; white-space: nowrap; }
+.shop-ai-image-preview-remove { display: grid; place-items: center; width: 30px; height: 30px; flex-shrink: 0; border: 1px solid var(--tia-border); border-radius: 50%; background: var(--tia-elev); color: var(--tia-text-2); cursor: pointer; transition: background 0.15s ease, transform 0.3s var(--tia-spring); }
+.shop-ai-image-preview-remove:hover { background: var(--tia-surface); transform: rotate(90deg); }
+
+/* Photo in the user's message / history chip */
+.shop-ai-message.user .shop-ai-user-photo {
+  display: block;
+  max-width: 240px;
+  max-height: 260px;
+  margin-bottom: 6px;
+  border-radius: 20px 20px 6px 20px;
+  object-fit: cover;
+  background: var(--tia-surface);
+  box-shadow: var(--tia-shadow-md);
+}
+.shop-ai-photo-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; margin-bottom: 6px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--tia-accent-ring); background: var(--tia-accent-soft); color: var(--tia-accent-ink); font-size: 12px; font-weight: 600; }
+.shop-ai-photo-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shop-ai-photo-chip svg { flex-shrink: 0; }
+
+/* ---------- History panel ---------- */
+.shop-ai-history-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  background: var(--tia-bg);
+  transform: translateX(100%);
+  transition: transform 0.45s var(--tia-spring);
+}
+.shop-ai-history-panel.active { transform: none; }
+.shop-ai-history-header { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--tia-border); }
+.shop-ai-reset .shop-ai-history-header h3 { margin: 0; font-size: 17px; font-weight: 700; color: var(--tia-text); }
+.shop-ai-back-btn { display: grid; place-items: center; width: 36px; height: 36px; border: none; border-radius: 12px; background: var(--tia-surface); color: var(--tia-text); cursor: pointer; }
+.shop-ai-back-btn:hover { background: var(--tia-surface-2); }
+.shop-ai-history-list { flex: 1; padding: 14px; overflow-y: auto; }
+.shop-ai-history-item { margin-bottom: 8px; padding: 14px 16px; border: 1px solid var(--tia-border); border-radius: var(--tia-r-md); background: var(--tia-elev); cursor: pointer; transition: border-color 0.2s ease, transform 0.35s var(--tia-spring); }
+.shop-ai-history-item:hover { border-color: var(--tia-accent-ring); transform: translateX(4px); }
+.shop-ai-history-item-title { margin-bottom: 3px; font-weight: 600; color: var(--tia-text); }
+.shop-ai-history-item-time { font-size: 12.5px; color: var(--tia-text-3); }
+.shop-ai-history-empty { padding: 48px 24px; font-size: 14px; text-align: center; color: var(--tia-text-3); }
+
+/* Email capture popup was removed; hard-kill in case an older script injects it. */
+#shop-ai-email-overlay,
+.shop-ai-email-overlay,
+.shop-ai-email-overlay-legacy,
+.shop-ai-email-popup { display: none !important; visibility: hidden !important; pointer-events: none !important; }
+
+/* ---------- Phones: both modes become a full-screen sheet ---------- */
+@media (max-width: 599px) {
+  .tia-mode-modal .shop-ai-modal,
+  .tia-mode-popup .shop-ai-modal {
+    inset: 0;
+    top: 0;
+    left: 0;
     right: 0;
-    width: 90vw;
-    max-width: 450px;
-    height: 70vh;
-    height: calc(var(--viewport-height, 100vh) * 0.7);
-    max-height: 650px;
-    min-height: 350px;
-    background-color: white;
-    border-radius: 16px;
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(20px);
-    transition: opacity 0.3s ease, transform 0.3s ease;
-  }
-
-  /* Responsive adjustments for smaller screens */
-  @media (max-width: 480px) {
-    .shop-ai-chat-window {
-      position: fixed;
-      width: 100vw;
-      height: 100vh;
-      height: calc(var(--viewport-height, 100vh));
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      max-width: none;
-      min-height: 100vh;
-      min-height: calc(var(--viewport-height, 100vh));
-      border-radius: 0;
-    }
-
-    .shop-ai-chat-container {
-      bottom: 10px;
-      right: 10px;
-    }
-
-    .shop-ai-message {
-      max-width: 90%;
-    }
-
-    /* Prevent scrolling on the main page when chat is open */
-    body.shop-ai-chat-open {
-      overflow: hidden;
-      position: fixed;
-      width: 100%;
-      height: 100%;
-    }
-
-    .shop-ai-chat-header {
-      padding: 12px 16px;
-      border-radius: 0;
-    }
-  }
-
-  .shop-ai-chat-window.active {
-    opacity: 1;
-    pointer-events: all;
-    transform: translateY(0);
-  }
-
-  @media (max-width: 480px) {
-    .shop-ai-chat-window {
-      transform: translateY(100%);
-      z-index: 999999;
-      transition: transform 0.4s ease, opacity 0.3s ease;
-    }
-
-    .shop-ai-chat-window.active {
-      transform: translateY(0);
-    }
-
-    .shop-ai-chat-bubble {
-      z-index: 1000000;
-      position: relative;
-    }
-  }
-
-  .shop-ai-chat-header {
-    padding: 16px;
-    background-color: #5046e4;
-    color: white;
-    font-weight: 600;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  .shop-ai-chat-close {
-    background: none;
-    border: none;
-    color: white;
-    cursor: pointer;
-    font-size: 20px;
-    padding: 0;
-    line-height: 1;
-  }
-
-  .shop-ai-chat-messages {
-    flex: 1;
-    padding: 16px;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
-  }
-
-  .shop-ai-message {
-    max-width: 80%;
-    padding: 12px 16px;
-    border-radius: 18px;
-    font-size: 14px;
-    line-height: 1.4;
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-    word-break: break-word;
-  }
-
-  @media (max-width: 480px) {
-    .shop-ai-chat-messages {
-      padding: 12px 10px;
-    }
-
-    .shop-ai-message {
-      font-size: 15px;
-      padding: 10px 14px;
-    }
-  }
-
-  .shop-ai-message.assistant {
-    align-self: flex-start;
-    /* Bubble visuals are now handled in theme extension styles */
-    background-color: transparent;
-    border-radius: 0;
-    padding: 0;
-  }
-
-  .shop-ai-message.assistant a {
-    color: #5046e4;
-    text-decoration: underline;
-    font-weight: 500;
-    word-break: break-word;
-  }
-
-  .shop-ai-message.assistant a:hover {
-    opacity: 0.8;
-  }
-
-  @media (max-width: 480px) {
-    .shop-ai-message.assistant a,
-    .shop-ai-message.user a {
-      display: inline-block;
-      max-width: 100%;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-  }
-
-  /* List styling for assistant messages */
-  .shop-ai-message.assistant ul,
-  .shop-ai-message.assistant ol {
-    margin: 8px 0;
-    padding-left: 24px;
-  }
-
-  .shop-ai-message.assistant li {
-    margin-bottom: 6px;
-  }
-
-  .shop-ai-message.assistant li:last-child {
-    margin-bottom: 0;
-  }
-
-  /* Nested list styling */
-  .shop-ai-message.assistant li > ul,
-  .shop-ai-message.assistant li > ol {
-    margin-top: 6px;
-  }
-
-  /* Paragraph styling */
-  .shop-ai-message.assistant p {
-    margin: 0 0 10px 0;
-  }
-
-  .shop-ai-message.assistant p:last-child {
-    margin-bottom: 0;
-  }
-
-  /* Bold text styling */
-  .shop-ai-message.assistant strong {
-    font-weight: 600;
-  }
-
-  .shop-ai-message.user {
-    align-self: flex-end;
-    /* Bubble visuals are now handled in theme extension styles */
-    background-color: transparent;
-    color: inherit;
-    border-radius: 0;
-    padding: 0;
-  }
-
-  .shop-ai-message.user a {
-    color: white;
-    text-decoration: underline;
-    font-weight: 500;
-  }
-
-  .shop-ai-message.tool-use {
-    align-self: flex-start;
-    background-color: #f5f5f5 !important;
-    color: #000000 !important;
-    border: 1px solid #ddd;
-    border-bottom-left-radius: 4px;
-    font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
-    font-size: 13px;
-    font-weight: 400;
-    max-width: 80%;
-  }
-
-  .shop-ai-tool-header {
-    cursor: pointer;
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-  }
-
-  .shop-ai-tool-header:hover {
-    opacity: 0.8;
-  }
-
-  .shop-ai-tool-text {
-    flex: 1;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .shop-ai-tool-toggle {
-    font-size: 12px;
-    color: #666;
-    user-select: none;
-    flex-shrink: 0;
-    margin-left: 8px;
-  }
-
-  .shop-ai-tool-args {
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid #ddd;
-    font-size: 12px;
-    color: #333;
-    word-break: break-all;
-    display: none;
-  }
-
-  .shop-ai-tool-args.expanded {
-    display: block;
-  }
-
-  .shop-ai-chat-input {
-    border-top: 1px solid #e9e9e9;
-    padding: 16px;
-    display: flex;
-    gap: 8px;
-    align-items: center;
-  }
-
-  .shop-ai-chat-input input {
-    flex: 1;
-    padding: 12px 16px;
-    border: 1px solid #e9e9e9;
-    border-radius: 24px;
-    font-size: 14px;
-    outline: none;
-    min-height: 24px;
-  }
-
-  @media (max-width: 480px) {
-    .shop-ai-chat-input {
-      padding: 12px 10px;
-    }
-
-    .shop-ai-chat-input input {
-      padding: 10px 14px;
-      font-size: 16px; /* Better for mobile input */
-    }
-  }
-
-  .shop-ai-chat-input input:focus {
-    border-color: #5046e4;
-  }
-
-  .shop-ai-chat-send {
-    background-color: #5046e4;
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 40px;
-    height: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-  }
-
-  .shop-ai-typing-indicator {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 8px 16px;
-    background-color: #f1f1f1;
-    border-radius: 18px;
-    border-bottom-left-radius: 4px;
-    align-self: flex-start;
-    font-size: 14px;
-  }
-
-  .shop-ai-typing-indicator span {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background-color: #606060;
-    display: inline-block;
-    animation: typing 1.4s infinite both;
-  }
-
-  .shop-ai-typing-indicator span:nth-child(2) {
-    animation-delay: 0.2s;
-  }
-
-  .shop-ai-typing-indicator span:nth-child(3) {
-    animation-delay: 0.4s;
-  }
-
-  /* Authentication link styles */
-.shop-auth-trigger {
-    color: #5046e4;
-    text-decoration: underline;
-    font-weight: 500;
-    cursor: pointer;
-  }
-
-  .shop-auth-trigger:hover {
-    opacity: 0.8;
-  }
-
-  /* Product Section Styling */
-  .shop-ai-product-section {
-    display: flex;
-    flex-direction: column;
-    margin: 15px 0;
-    width: 100%;
-    border-top: 1px solid #eaeaea;
-    border-bottom: 1px solid #eaeaea;
-    padding: 10px 0;
-  }
-
-  /* ============================================
-     PRODUCT ROWS (chat.js renderProducts)
-     Larger cards + 2 buttons side-by-side
-     ============================================ */
-  .shop-ai-product-container{
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    margin: 10px 0;
-  }
-
-  .shop-ai-product-row{
-    display: flex;
-    gap: 16px;
-    padding: 16px;
-    border: 1px solid #eaeaea;
-    border-radius: 14px;
-    background: #ffffff;
-    align-items: center;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.06);
-  }
-
-  .shop-ai-prod-img{
-    width: 110px;
-    height: 110px;
-    border-radius: 12px;
-    object-fit: cover;
-    background: #f7f7f7;
-    flex-shrink: 0;
-  }
-
-  .shop-ai-prod-info{
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .shop-ai-prod-title{
-    font-size: 15px;
-    font-weight: 650;
-    color: #111827;
-    line-height: 1.25;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .shop-ai-prod-price{
-    font-size: 14px;
-    font-weight: 700;
-    color: #5046e4;
-  }
-
-  .shop-ai-prod-actions{
-    display: flex;
-    gap: 10px;
-    margin-top: 6px;
-  }
-
-  .shop-ai-prod-btn{
-    flex: 1;
-    padding: 10px 14px;
-    border-radius: 999px;
-    border: none;
-    background: #5046e4;
-    color: #ffffff;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .shop-ai-prod-btn-view{
-    background: #ffffff;
-    color: #111827;
-    border: 1px solid #e5e7eb;
-  }
-
-  .shop-ai-prod-btn:disabled{
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  @media (max-width: 480px) {
-    .shop-ai-product-row{
-      padding: 14px;
-    }
-    .shop-ai-prod-img{
-      width: 90px;
-      height: 90px;
-    }
-    .shop-ai-prod-actions{
-      flex-direction: row;
-    }
-  }
-
-  /* Product Header Styling */
-  .shop-ai-product-header {
-    padding: 0 0 10px 5px;
-    margin-bottom: 10px;
-  }
-
-  .shop-ai-product-header h4 {
-    font-size: 15px;
-    font-weight: 600;
-    color: #333;
-    margin: 0;
-  }
-
-  /* Product Grid Styling */
-  .shop-ai-product-grid {
-    display: flex;
-    flex-direction: row;
-    gap: 12px;
-    overflow-x: auto;
-    padding: 5px 0;
-    scrollbar-width: thin;
-    width: 100%;
-    min-height: 220px;
-    background-color: transparent;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  /* Hide scrollbar in webkit browsers */
-  .shop-ai-product-grid::-webkit-scrollbar {
-    height: 6px;
-  }
-
-  .shop-ai-product-grid::-webkit-scrollbar-thumb {
-    background-color: rgba(0, 0, 0, 0.2);
-    border-radius: 3px;
-  }
-
-  /* Product Card Styling */
-  .shop-ai-product-card {
-    background: white;
-    border-radius: 10px;
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
-    min-width: 180px;
-    max-width: 180px;
-    overflow: hidden;
-    transition: transform 0.2s, box-shadow 0.2s;
-    flex-shrink: 0;
-    display: block;
-    border: 1px solid #eaeaea;
-    position: relative;
-  }
-
-  .shop-ai-product-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  }
-
-  /* Product Image Styling */
-  .shop-ai-product-image {
-    height: 140px;
-    width: 100%;
-    overflow: hidden;
-    background: #f7f7f7;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .shop-ai-product-image img {
+    bottom: 0;
     width: 100%;
     height: 100%;
-    object-fit: cover;
-  }
-
-  /* Product Info Styling */
-  .shop-ai-product-info {
-    padding: 10px;
-  }
-
-  .shop-ai-product-title {
-    margin: 0 0 5px 0;
-    font-size: 14px;
-    line-height: 1.3;
-    font-weight: 500;
-    color: #333;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .shop-ai-product-price {
-    margin: 0 0 10px 0;
-    font-size: 14px;
-    font-weight: 600;
-    color: #5046e4;
-  }
-
-  /* Add to Cart Button Styling */
-  .shop-ai-add-to-cart {
-    width: 100%;
-    padding: 8px 0;
-    background-color: #5046e4;
-    color: white;
+    height: 100dvh;
     border: none;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background-color 0.2s;
+    border-radius: 0;
+    transform: translateY(100%);
+    transform-origin: center bottom;
   }
+  body.shop-ai-open .tia-mode-modal .shop-ai-modal,
+  body.shop-ai-open .tia-mode-popup .shop-ai-modal { transform: none; }
+  .shop-ai-header { padding: max(10px, env(safe-area-inset-top)) 10px 10px 14px; min-height: 62px; }
+  .shop-ai-mode-btn { display: none; }
+  .shop-ai-messages,
+  .tia-mode-modal .shop-ai-messages { padding: 16px 14px 10px; gap: 12px; }
+  .shop-ai-message.user { max-width: 86%; }
+  .shop-ai-message.assistant { max-width: 94%; }
+  .shop-ai-sugg-list { grid-template-columns: 1fr; }
+  .shop-ai-product-card { flex-basis: 172px; }
+  .shop-ai-product-info { padding: 10px 10px 11px; }
+  .shop-ai-reset .shop-ai-product-link { padding: 5px 8px; }
+  .shop-ai-input-area,
+  .tia-mode-modal .shop-ai-input-area { padding: 8px 10px max(10px, env(safe-area-inset-bottom)); }
+  .shop-ai-textarea { font-size: 16px; } /* 16px stops iOS zooming into the field */
+  .shop-ai-floating-group { right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); }
+  .shop-ai-launcher { width: 54px; height: 54px; }
+  .shop-ai-product-modal { flex-direction: column; gap: 14px; padding: 20px 16px 18px; border-radius: 22px; }
+  .shop-ai-product-modal-left { flex: 0 0 auto; width: 100%; max-height: 210px; aspect-ratio: auto; }
+  .shop-ai-product-modal-right { padding-top: 0; }
+  .shop-ai-product-modal-actions { flex-direction: column; }
+  .shop-ai-disclaimer { display: none; }
+}
+@media (max-width: 360px) {
+  .shop-ai-product-card { flex-basis: 146px; }
+  .shop-ai-message.assistant, .shop-ai-thinking-container, .shop-ai-greeting { padding-left: 0; }
+  .shop-ai-message.assistant::before, .shop-ai-thinking-container::before, .shop-ai-greeting::before { display: none; }
+  .shop-ai-sugg-title, .shop-ai-sugg-list, .shop-ai-match { margin-left: 0; }
+  .shop-ai-product-grid { padding-left: 0; scroll-padding-left: 0; }
+}
 
-  .shop-ai-add-to-cart:hover {
-    background-color: #3f36c0;
+/* ---------- Motion ---------- */
+@keyframes tiaRise { from { opacity: 0; transform: translateY(10px) scale(0.98); filter: blur(4px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes tiaBounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.45; } 30% { transform: translateY(-5px); opacity: 1; } }
+@keyframes tiaCaret { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+@keyframes tiaShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+@keyframes tiaSpin { to { transform: rotate(360deg); } }
+@keyframes tiaPulse { 0% { transform: scale(0.9); opacity: 0.9; } 80%, 100% { transform: scale(1.35); opacity: 0; } }
+@keyframes tiaLauncherIn { from { opacity: 0; transform: translateY(20px) scale(0.6); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .shop-ai-reset *,
+  .shop-ai-reset *::before,
+  .shop-ai-reset *::after,
+  .shop-ai-header-trigger::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
-
-  /*
-   * MOBILE PRODUCT LAYOUT (April 30, 2026 fix)
-   * ------------------------------------------
-   * The previous @media (max-width: 480px) block here forced:
-   *   .shop-ai-product-grid { flex-direction: column; }
-   *   .shop-ai-product-card { min-width: 100%; max-width: 100%; }
-   * which OVERRODE the horizontal-scroll carousel defined inline in
-   * `extensions/chat-bubble/blocks/chat-interface.liquid`. The result was
-   * a full-width vertical stack with cropped product titles on mobile —
-   * the exact behaviour reported in the user's mobile screenshots.
-   *
-   * Those rules have been deleted. The inline carousel styles in
-   * chat-interface.liquid (cards at flex: 0 0 144px on mobile, 134px at
-   * ≤480px, 116px at ≤320px) are now the single source of truth on mobile.
-   *
-   * The mobile-only padding override on `.shop-ai-add-to-cart` that was
-   * also in the deleted block is gone too — the modern card UI no longer
-   * renders that button on mobile, so the rule was dead code.
-   */
-
-  /* Even smaller screens */
-  @media (max-width: 380px) {
-    .shop-ai-chat-input input {
-      padding: 8px 12px;
-    }
-
-    .shop-ai-chat-send {
-      width: 36px;
-      height: 36px;
-    }
-
-    .shop-ai-message {
-      max-width: 95%;
-      font-size: 14px;
-      padding: 10px 12px;
-    }
-
-    .shop-ai-chat-header {
-      padding: 10px;
-    }
-  }
-
-  @keyframes typing {
-    0% {
-      opacity: 0.4;
-      transform: scale(1);
-    }
-    50% {
-      opacity: 1;
-      transform: scale(1.2);
-    }
-    100% {
-      opacity: 0.4;
-      transform: scale(1);
-    }
-  }
+  body.shop-ai-open.shop-ai-mode-modal > *:not(.shop-ai-chat-section) { transition: none; }
+}
