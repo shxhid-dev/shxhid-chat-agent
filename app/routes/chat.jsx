@@ -52,7 +52,9 @@
  *   - search_catalog + legacy search_shop_catalog; extractSearchQuery never JSON.stringify.
  */
 
-const CHAT_VERSION = "2.7";
+import { withCardsMarker, stripCardsMarker, specSnippet } from "../services/card-memory.server.js";
+
+const CHAT_VERSION = "2.8";
 
 // Pre-search paths whose results may be off-target. For these the catalog search tool stays
 // available so Claude can recover / be honest. Router v6 types algolia_category, algolia_multi
@@ -235,6 +237,18 @@ function refineSafely(cf, products, query, searchType) {
 }
 
 // ─── Small helpers ─────────────────────────────────────────────────────
+
+/** What Claude gets about the shown cards: titles, part numbers, prices, and specs for the top 5. */
+function prefoundSummary(shown) {
+  return (Array.isArray(shown) ? shown : []).slice(0, 8).map((p, i) => ({
+    title: p.title,
+    vendor: p.vendor,
+    price: p.price,
+    sku: p.sku,
+    ...(p.match_label ? { match: p.match_label } : {}),
+    ...(i < 5 && p.description ? { specs: specSnippet(p.description) } : {}),
+  }));
+}
 
 /**
  * Extract the plain-text query string from catalog search tool args.
@@ -518,6 +532,7 @@ async function handleHistoryRequest(request, conversationId) {
       } catch (e) {
         parsedContent = msg.content;
       }
+      if (msg.role === "assistant" && typeof parsedContent === "string") parsedContent = stripCardsMarker(parsedContent);
       return { id: msg.id, role: msg.role, content: parsedContent, contentType: msg.contentType, createdAt: msg.createdAt };
     });
 
@@ -680,7 +695,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     send({ type: "chunk", chunk: text });
     send({ type: "message_complete" });
     Promise.resolve(
-      saveMessage(conversationId, "assistant", text, { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
+      saveMessage(conversationId, "assistant", withCardsMarker(text, gridProducts), { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
     ).catch((err) => console.error("[Chat] Error saving fallback message:", err?.message));
   };
 
@@ -705,7 +720,13 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   // ── Tool-result hints (shared by the UCP path and the local path) ───
   const buildStopHint = (shown, { lowConfidence = false, accessoryOnly = false, searchNote = "" } = {}) =>
     JSON.stringify({
-      products: shown.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
+      products: shown.slice(0, 5).map((p) => ({
+        id: p.id,
+        title: p.title,
+        sku: p.sku || null,
+        price: p.price || null,
+        specs: specSnippet(p.description),
+      })),
       total_count: shown.length,
       ...(searchNote ? { _search_note: String(searchNote).slice(0, 800) } : {}),
       _display_note:
@@ -1010,7 +1031,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
           smartResult = { ...smart, products: shown };
           console.log(`[Chat] SmartSearch pre-found ${shown.length} products (${smart.searchType})`);
 
-          const summary = shown.slice(0, 8).map((p) => ({ title: p.title, vendor: p.vendor, price: p.price, sku: p.sku }));
+          const summary = prefoundSummary(shown);
           const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
           const replyInstruction = advisory
             ? `An [ADVISORY BRIEF] follows below: its REPLY FORMAT overrides the 1-3 sentence limit for this reply. `
@@ -1117,8 +1138,10 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
             }
             const responseTime = Date.now() - startTime;
             if (textContent.trim()) {
+              // The final reply of the turn remembers which cards were shown (follow-up memory).
+              const toSave = message?.stop_reason !== "tool_use" ? withCardsMarker(textContent, gridProducts) : textContent;
               Promise.resolve(
-                saveMessage(conversationId, message.role, textContent, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
+                saveMessage(conversationId, message.role, toSave, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
               ).catch((err) => console.error("[Chat] Error saving assistant message:", err?.message));
             }
             track("messageReceived", { conversationId, responseTimeMs: responseTime, contentLength: textContent.length });
