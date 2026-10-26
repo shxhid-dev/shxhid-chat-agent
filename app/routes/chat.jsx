@@ -1,6 +1,14 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v2.7 (24 Oct 2026)
+ * Chat API Route — v2.8 (26 Oct 2026)
+ *
+ * CHANGES (v2.8) — grounding + photo matching:
+ *   1. Photo turns run photo-search.server.js instead of the plain pre-pass: the analysis' search
+ *      queries are scored against what the photo shows, and `product_results` carries
+ *      `match: { confidence, label }`. Low confidence ("photo_match_low") keeps the catalog tools.
+ *   2. The pre-found summary and tool stop-hints include a short spec snippet for the top 5 cards.
+ *   3. Follow-up memory: the saved final reply ends with "[[Cards shown: …]]" (card-memory.server.js),
+ *      so "the second one" resolves on later turns. The history endpoint strips it for the widget.
  *
  * CHANGES (v2.7) — photo search:
  *   1. The body may carry `image` ({ data: base64 | data URL, media_type }) with or without `message`.
@@ -52,7 +60,9 @@
  *   - search_catalog + legacy search_shop_catalog; extractSearchQuery never JSON.stringify.
  */
 
-const CHAT_VERSION = "2.7";
+import { withCardsMarker, stripCardsMarker, specSnippet } from "../services/card-memory.server.js";
+
+const CHAT_VERSION = "2.8";
 
 // Pre-search paths whose results may be off-target. For these the catalog search tool stays
 // available so Claude can recover / be honest. Router v6 types algolia_category, algolia_multi
@@ -63,6 +73,7 @@ const LOW_CONFIDENCE_PATHS = new Set([
   "storefront_search_last_resort",
   "algolia_search_weak",   // relevance floor judged hits off-target
   "algolia_brand_missing", // customer asked for a brand we don't carry
+  "photo_match_low",       // photo matched only on product type (photo-search.server.js)
 ]);
 
 // Router v6 already guarantees relevance for these (product noun in every title it keeps,
@@ -235,6 +246,18 @@ function refineSafely(cf, products, query, searchType) {
 }
 
 // ─── Small helpers ─────────────────────────────────────────────────────
+
+/** What Claude gets about the shown cards: titles, part numbers, prices, and specs for the top 5. */
+function prefoundSummary(shown) {
+  return (Array.isArray(shown) ? shown : []).slice(0, 8).map((p, i) => ({
+    title: p.title,
+    vendor: p.vendor,
+    price: p.price,
+    sku: p.sku,
+    ...(p.match_label ? { match: p.match_label } : {}),
+    ...(i < 5 && p.description ? { specs: specSnippet(p.description) } : {}),
+  }));
+}
 
 /**
  * Extract the plain-text query string from catalog search tool args.
@@ -518,6 +541,7 @@ async function handleHistoryRequest(request, conversationId) {
       } catch (e) {
         parsedContent = msg.content;
       }
+      if (msg.role === "assistant" && typeof parsedContent === "string") parsedContent = stripCardsMarker(parsedContent);
       return { id: msg.id, role: msg.role, content: parsedContent, contentType: msg.contentType, createdAt: msg.createdAt };
     });
 
@@ -680,7 +704,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     send({ type: "chunk", chunk: text });
     send({ type: "message_complete" });
     Promise.resolve(
-      saveMessage(conversationId, "assistant", text, { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
+      saveMessage(conversationId, "assistant", withCardsMarker(text, gridProducts), { contentType: "TEXT", responseTimeMs: Date.now() - startTime, shopDomain, visitorId })
     ).catch((err) => console.error("[Chat] Error saving fallback message:", err?.message));
   };
 
@@ -688,7 +712,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
    * Show product cards. Searches made inside the same Claude response (parallel tool calls) are
    * merged into one grid; a later Claude call or the pre-pass replaces it.
    */
-  const showProducts = (products, { merge = false } = {}) => {
+  const showProducts = (products, { merge = false, match = null } = {}) => {
     const list = dedupeProducts(products);
     if (!list.length) return [];
     const shown =
@@ -697,7 +721,8 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         : list.slice(0, MAX_CARDS);
     gridLoop = loopCount;
     gridProducts = shown;
-    send({ type: "product_results", products: shown });
+    // `match` ({ confidence, label }) drives the widget's confidence chip for photo matches.
+    send({ type: "product_results", products: shown, ...(match ? { match } : {}) });
     productsSentToFrontend = true;
     return shown;
   };
@@ -705,7 +730,13 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   // ── Tool-result hints (shared by the UCP path and the local path) ───
   const buildStopHint = (shown, { lowConfidence = false, accessoryOnly = false, searchNote = "" } = {}) =>
     JSON.stringify({
-      products: shown.slice(0, 3).map((p) => ({ id: p.id, title: p.title, sku: p.sku || null, price: p.price || null })),
+      products: shown.slice(0, 5).map((p) => ({
+        id: p.id,
+        title: p.title,
+        sku: p.sku || null,
+        price: p.price || null,
+        specs: specSnippet(p.description),
+      })),
       total_count: shown.length,
       ...(searchNote ? { _search_note: String(searchNote).slice(0, 800) } : {}),
       _display_note:
@@ -889,10 +920,12 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     let savedUserText = userMessage;
     let queryText = userMessage;
     let photoNote = "";
+    let photoAnalysis = null;
     let photoSkipsSearch = false;
     let photoHasPartNumber = false;
     if (photoAnalysisJob) {
       const analysis = await photoAnalysisJob;
+      photoAnalysis = analysis;
       const imageSearchText = imageIntel.buildImageSearchText(analysis);
       savedUserText = [imageIntel.buildPhotoMarker(analysis), userMessage].filter(Boolean).join(" ");
       queryText = [userMessage, imageSearchText].filter(Boolean).join(" ");
@@ -963,6 +996,33 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
 
     if (photoSkipsSearch) {
       console.log("[Chat] Photo: search pre-pass skipped (nothing readable to search for)");
+    } else if (photoAnalysis?.isProductPhoto) {
+      // ── Photo pre-pass: candidate queries → scored against the photo → confidence ──
+      try {
+        const { photoSearch } = await import("../services/photo-search.server.js");
+        const match = await photoSearch(photoAnalysis, shopDomain);
+        photoNote = imageIntel.buildPhotoNote(photoAnalysis, match);
+        track("photoMatched", { conversationId, confidence: match.confidence, cards: match.products.length });
+        if (match.products.length) {
+          const shown = showProducts(match.products, { match: { confidence: match.confidence, label: match.label } });
+          const confident = match.confidence === "high" || match.confidence === "medium";
+          smartResult = { products: shown, searchType: confident ? "photo_match" : "photo_match_low" };
+          systemNote =
+            `[SYSTEM NOTE — NOT FROM USER] Products matching the customer's photo were found and product cards are ALREADY DISPLAYED, ranked by how well they fit the photo. ` +
+            (confident
+              ? `Do NOT call the catalog search again. `
+              : `You may call the catalog search ONCE if the photo clearly shows something these cards miss. `) +
+            (advisory
+              ? `An [ADVISORY BRIEF] follows below: its REPLY FORMAT overrides the 1-3 sentence limit for this reply. `
+              : `Write ONE short reply (1-3 sentences) following the PHOTO ANALYSIS note. `) +
+            `Pre-found product summary: ${JSON.stringify(prefoundSummary(shown))}`;
+          console.log(`[Chat] Photo pre-pass: ${shown.length} card(s), confidence=${match.confidence}`);
+        } else {
+          console.log("[Chat] Photo pre-pass: no good match — no cards shown");
+        }
+      } catch (photoErr) {
+        console.warn(`[Chat] Photo pre-pass failed: ${photoErr.message}`);
+      }
     } else if (advisory?.skipPreSearch && !photoHasPartNumber) {
       console.log("[Chat] Advisory: search pre-pass skipped (no product query fits this enquiry yet)");
     } else {
@@ -1010,7 +1070,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
           smartResult = { ...smart, products: shown };
           console.log(`[Chat] SmartSearch pre-found ${shown.length} products (${smart.searchType})`);
 
-          const summary = shown.slice(0, 8).map((p) => ({ title: p.title, vendor: p.vendor, price: p.price, sku: p.sku }));
+          const summary = prefoundSummary(shown);
           const isLowConfidence = LOW_CONFIDENCE_PATHS.has(smart.searchType);
           const replyInstruction = advisory
             ? `An [ADVISORY BRIEF] follows below: its REPLY FORMAT overrides the 1-3 sentence limit for this reply. `
@@ -1117,8 +1177,10 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
             }
             const responseTime = Date.now() - startTime;
             if (textContent.trim()) {
+              // The final reply of the turn remembers which cards were shown (follow-up memory).
+              const toSave = message?.stop_reason !== "tool_use" ? withCardsMarker(textContent, gridProducts) : textContent;
               Promise.resolve(
-                saveMessage(conversationId, message.role, textContent, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
+                saveMessage(conversationId, message.role, toSave, { contentType: "TEXT", responseTimeMs: responseTime, shopDomain, visitorId })
               ).catch((err) => console.error("[Chat] Error saving assistant message:", err?.message));
             }
             track("messageReceived", { conversationId, responseTimeMs: responseTime, contentLength: textContent.length });

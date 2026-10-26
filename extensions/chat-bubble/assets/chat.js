@@ -7,6 +7,14 @@
  * - SSE streaming with thinking indicators
  * - Photo search: attach / paste / drop a photo of a part or nameplate
  *
+ * v5.0 — Oct 26, 2026 — TIA REDESIGN
+ *   - Display modes: 'modal' (full screen, page blurred) or 'popup' (bottom-right widget with a
+ *     launcher bubble). Header toggle + menu; saved in localStorage 'shopAiDisplayMode'.
+ *   - Theme: Light / Dark / Auto (follows the OS), saved in localStorage 'shopAiTheme'.
+ *   - Streaming caret while text arrives; new typing indicator, product cards (part number chip,
+ *     price, "View" link, "Best match" badge) and a match-confidence chip for photo results.
+ *   - History strips the server's "[[Cards shown: …]]" follow-up memory note.
+ *
  * v4.2 — Oct 24, 2026 — PHOTO SEARCH
  *   The camera button (or paste / drag-and-drop) attaches one photo. It is resized in the
  *   browser (longest side 1568 px, JPEG) before upload and sent as `image` with the message;
@@ -94,6 +102,29 @@
   const PHOTO_MAX_SOURCE_BYTES = 25 * 1024 * 1024;
   const PHOTO_MARKER_RE = /^\[Photo(?::\s*([^\]]*))?\]\s*/;
 
+  // Same pattern as CARDS_MARKER_RE in app/services/card-memory.server.js.
+  const CARDS_MARKER_RE = /\n*\[\[Cards shown:[\s\S]*?\]\]\s*$/;
+
+  const MODE_KEY = 'shopAiDisplayMode';
+  const THEME_KEY = 'shopAiTheme';
+  const MODES = ['modal', 'popup'];
+  const THEMES = ['light', 'dark', 'system'];
+
+  // localStorage can throw (private mode, blocked storage): never let that break the widget.
+  function readPref(key, allowed, fallback) {
+    try {
+      const v = localStorage.getItem(key);
+      return allowed.includes(v) ? v : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+  function writePref(key, value) {
+    try { localStorage.setItem(key, value); } catch (_) { /* ignore */ }
+  }
+
+  const ARROW_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>';
+
   const CAMERA_ICON_SVG = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>';
 
   function loadImageElement(file) {
@@ -164,6 +195,8 @@
       // { dataUrl, data, mediaType } of the photo waiting to be sent with the next message
       pendingImage: null,
       isPreparingImage: false,
+      displayMode: readPref(MODE_KEY, MODES, 'modal'),
+      themePref: readPref(THEME_KEY, THEMES, 'light'),
     },
 
     placeholders: [
@@ -177,6 +210,8 @@
 
     init() {
       this.elements = {
+        root: document.querySelector('.shop-ai-reset'),
+        modeBtn: document.getElementById('shop-ai-mode-btn'),
         floatingGroup: document.getElementById('shop-ai-floating-group'),
         modal: document.getElementById('shop-ai-modal'),
         backdrop: document.getElementById('shop-ai-backdrop'),
@@ -201,12 +236,14 @@
         return;
       }
 
+      this.applyTheme(this.state.themePref);
+      this.applyDisplayMode(this.state.displayMode, { animate: false, save: false });
       this.bindEvents();
       this.startPlaceholderRotation();
       this.restoreState();
       this.exposeAPI();
 
-      console.log('ShopAIChat v4.1 initialized');
+      console.log('ShopAIChat v5.0 (TIA) initialized');
     },
 
     bindEvents() {
@@ -299,8 +336,35 @@
         });
       }
 
+      if (this.elements.modeBtn) {
+        this.elements.modeBtn.addEventListener('click', () => {
+          this.applyDisplayMode(this.state.displayMode === 'modal' ? 'popup' : 'modal');
+        });
+      }
+
+      // OS theme changes while "Auto" is selected
+      try {
+        const mq = window.matchMedia('(prefers-color-scheme: dark)');
+        const onChange = () => { if (this.state.themePref === 'system') this.applyTheme('system'); };
+        if (mq.addEventListener) mq.addEventListener('change', onChange);
+        else if (mq.addListener) mq.addListener(onChange);
+      } catch (_) { /* matchMedia unsupported */ }
+
       if (this.elements.menuDropdown) {
         this.elements.menuDropdown.addEventListener('click', (e) => {
+          // Layout / appearance switches keep the menu open so the change is visible.
+          const modeBtn = e.target.closest('[data-set-mode]');
+          if (modeBtn) {
+            e.stopPropagation();
+            this.applyDisplayMode(modeBtn.dataset.setMode);
+            return;
+          }
+          const themeBtn = e.target.closest('[data-set-theme]');
+          if (themeBtn) {
+            e.stopPropagation();
+            this.applyTheme(themeBtn.dataset.setTheme, { save: true });
+            return;
+          }
           const item = e.target.closest('[data-action]');
           if (!item) return;
           const action = item.dataset.action;
@@ -324,7 +388,12 @@
       });
 
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && this.state.isOpen) this.close();
+        if (e.key !== 'Escape' || !this.state.isOpen) return;
+        // Close the innermost layer first: product details → menu → history → chat.
+        if (this.state.selectedProductModal) return this.handleCloseProductModal();
+        if (this.elements.menuDropdown?.classList.contains('active')) return this.elements.menuDropdown.classList.remove('active');
+        if (this.elements.historyPanel?.classList.contains('active')) return this.closeHistory();
+        this.close();
       });
 
       document.addEventListener('click', (e) => {
@@ -375,20 +444,73 @@
         sessionStorage.setItem('shopAiEmailPopupShown', 'true');
       }
 
-      document.body.classList.add('shop-ai-open');
+      document.body.classList.add('shop-ai-open', `shop-ai-mode-${this.state.displayMode}`);
+      if (this.state.needsRestore) {
+        this.state.needsRestore = false;
+        const hasMessages = !!this.elements.messages?.querySelector('.shop-ai-message');
+        if (!hasMessages && this.state.conversationId) this.loadConversation(this.state.conversationId, { quiet: true });
+      }
       if (this.elements.floatingGroup) {
         this.elements.floatingGroup.classList.add('hidden');
       }
       this.state.isOpen = true;
-      this.elements.input?.focus();
+      // Wait for the open transition so mobile keyboards don't jump the layout.
+      setTimeout(() => this.elements.input?.focus({ preventScroll: true }), 120);
     },
 
     close() {
-      document.body.classList.remove('shop-ai-open');
+      document.body.classList.remove('shop-ai-open', 'shop-ai-mode-modal', 'shop-ai-mode-popup');
+      this.elements.menuDropdown?.classList.remove('active');
       if (this.elements.floatingGroup) {
         this.elements.floatingGroup.classList.remove('hidden');
       }
       this.state.isOpen = false;
+    },
+
+    /** 'modal' (full screen, page blurred) or 'popup' (bottom-right widget). */
+    applyDisplayMode(mode, { animate = true, save = true } = {}) {
+      const next = MODES.includes(mode) ? mode : 'modal';
+      const root = this.elements.root;
+      const swap = () => {
+        this.state.displayMode = next;
+        if (root) {
+          root.classList.remove('tia-mode-modal', 'tia-mode-popup');
+          root.classList.add(`tia-mode-${next}`);
+        }
+        if (this.state.isOpen) {
+          document.body.classList.remove('shop-ai-mode-modal', 'shop-ai-mode-popup');
+          document.body.classList.add(`shop-ai-mode-${next}`);
+        }
+        this.elements.modeBtn?.setAttribute('aria-label', next === 'modal' ? 'Switch to side popup' : 'Switch to full screen');
+        root?.querySelectorAll('[data-set-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.setMode === next)));
+        if (save) writePref(MODE_KEY, next);
+      };
+
+      if (!animate || !root || !this.state.isOpen || this.state.displayMode === next) return swap();
+      // Blur cross-fade: fade out, switch layout, fade back in.
+      root.classList.add('tia-switching');
+      setTimeout(() => {
+        swap();
+        requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('tia-switching')));
+      }, 160);
+    },
+
+    /** 'light' | 'dark' | 'system' (follows the OS). */
+    applyTheme(pref, { save = false } = {}) {
+      const choice = THEMES.includes(pref) ? pref : 'light';
+      let resolved = choice;
+      if (choice === 'system') {
+        try { resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch (_) { resolved = 'light'; }
+      }
+      this.state.themePref = choice;
+      this.elements.root?.setAttribute('data-theme', resolved);
+      this.elements.root?.querySelectorAll('[data-set-theme]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.setTheme === choice)));
+      if (save) writePref(THEME_KEY, choice);
+    },
+
+    openPhotoPicker() {
+      if (!this.state.isOpen) this.open();
+      this.elements.fileInput?.click();
     },
 
     showEmailPopup() {
@@ -460,12 +582,11 @@
       const image = fromArg ? null : this.state.pendingImage;
       if (!message && !image) return;
 
-      if (this.state.isFirstMessage) {
-        this.state.isFirstMessage = false;
-        if (this.elements.suggestions) {
-          this.elements.suggestions.classList.remove('visible');
-          this.elements.suggestions.style.display = 'none';
-        }
+      // Hide the welcome on any send (it can also be showing after a restored chat failed to load).
+      this.state.isFirstMessage = false;
+      if (this.elements.suggestions) {
+        this.elements.suggestions.classList.remove('visible');
+        this.elements.suggestions.style.display = 'none';
       }
 
       this.addMessage(message, 'user', { imageUrl: image?.dataUrl });
@@ -574,6 +695,7 @@
                 activeBubbleEl = currentAssistantMsg.querySelector('.shop-ai-bubble');
               }
               if (activeBubbleEl) {
+                activeBubbleEl.classList.add('is-streaming');
                 activeBubbleEl.innerHTML = this.parseMarkdown(fullText);
                 this.scrollToBottom();
               }
@@ -596,7 +718,7 @@
                 if (currentTurnGridEl && currentTurnGridEl.parentNode) {
                   currentTurnGridEl.parentNode.removeChild(currentTurnGridEl);
                 }
-                currentTurnGridEl = this.renderProductsGrid(products);
+                currentTurnGridEl = this.renderProductsGrid(products, data.match || null);
                 productsRenderedThisTurn = true;
               }
             }
@@ -610,6 +732,7 @@
 
             if (data.type === 'message_complete') {
               this.removeThinking();
+              activeBubbleEl?.classList.remove('is-streaming');
               if (currentAssistantMsg) {
                 // v4.0: Do NOT reset currentTurnGridEl here.
                 // The grid belongs to the turn, not the message.
@@ -621,6 +744,7 @@
 
             if (data.type === 'end_turn') {
               this.removeThinking();
+              this.stopStreamingCarets();
               // v4.0: Products already rendered. Just clean up state.
               currentAssistantMsg = null;
               activeBubbleEl = null;
@@ -637,8 +761,10 @@
         }
 
         this.removeThinking();
+        this.stopStreamingCarets();
       } catch (err) {
         this.removeThinking();
+        this.stopStreamingCarets();
         console.error('❌ Chat error:', err);
         this.addMessage(err.userMessage || 'Sorry, there was an error. Please try again.', 'assistant');
       }
@@ -786,9 +912,13 @@
       const container = document.createElement('div');
       container.id = 'shop-ai-thinking';
       container.className = 'shop-ai-thinking-container';
+      container.setAttribute('role', 'status');
       container.innerHTML =
-        '<div class="shop-ai-thinking-dots"><span></span><span></span><span></span></div>' +
-        '<span class="shop-ai-thinking-text">' + (initialText || idlePhrases[0]) + '</span>';
+        '<div class="shop-ai-thinking-pill">' +
+          '<div class="shop-ai-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></div>' +
+          '<span class="shop-ai-thinking-text"></span>' +
+        '</div>';
+      container.querySelector('.shop-ai-thinking-text').textContent = initialText || idlePhrases[0];
 
       this.elements.messages?.appendChild(container);
       this.scrollToBottom();
@@ -863,13 +993,37 @@
       this.state.isThinking = false;
     },
 
-    renderProductsGrid(products) {
+    /**
+     * Cards carousel, optionally headed by a confidence chip (photo matches send
+     * match = { confidence: 'high'|'medium'|'low', label }). Returns the wrapper so a
+     * later search in the same turn can replace it.
+     */
+    renderProductsGrid(products, match = null) {
       if (!products || !products.length) return null;
 
       console.log(`[ShopAIChat] Rendering ${products.length} products as carousel`);
 
+      const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+      const safeUrl = (u) => (typeof u === 'string' && /^https?:\/\//i.test(u) ? u : '');
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'shop-ai-results';
+
+      const confidence = match && ['high', 'medium', 'low'].includes(match.confidence) ? match.confidence : null;
+      if (confidence) {
+        const chip = document.createElement('div');
+        chip.className = `shop-ai-match is-${confidence}`;
+        chip.innerHTML = '<i aria-hidden="true"></i><span></span>';
+        chip.querySelector('span').textContent =
+          match.label || { high: 'Strong match', medium: 'Likely match', low: 'Possible matches' }[confidence];
+        wrapper.appendChild(chip);
+      }
+
       const container = document.createElement('div');
       container.className = 'shop-ai-product-grid';
+      container.setAttribute('role', 'list');
 
       products.forEach((prod, idx) => {
         const productId = String(prod.id || `prod-${idx}`);
@@ -878,41 +1032,61 @@
         const card = document.createElement('div');
         card.className = 'shop-ai-product-card';
         card.dataset.productId = productId;
-
-        const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
-          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-        }[c]));
+        card.setAttribute('role', 'listitem');
+        card.tabIndex = 0;
 
         const safeTitle = escapeHtml(prod.title || 'Untitled');
         const safeSku = escapeHtml(prod.sku || '');
-        const safePrice = escapeHtml(prod.price || '');
-        const safeAlt = escapeHtml(prod.title || 'Product');
+        const url = safeUrl(prod.url);
 
-        const imageEl = buildProductImage(prod.image_url, safeAlt, 'shop-ai-product-image-wrap');
-        if (imageEl.tagName !== 'IMG') {
-          imageEl.className = 'shop-ai-product-image shop-ai-product-image-wrap';
+        const media = document.createElement('div');
+        media.className = 'shop-ai-product-media';
+        media.appendChild(buildProductImage(prod.image_url, prod.title || 'Product', 'shop-ai-product-image-wrap'));
+        // Best match badge: first card of a confident photo match, else the card's own label.
+        const badgeText = idx === 0 && (confidence === 'high' || confidence === 'medium')
+          ? (prod.match_label === 'Exact part number' ? 'Exact match' : 'Best match')
+          : null;
+        if (badgeText) {
+          const badge = document.createElement('span');
+          badge.className = 'shop-ai-badge';
+          badge.textContent = badgeText;
+          media.appendChild(badge);
         }
-        card.appendChild(imageEl);
+        card.appendChild(media);
 
         const infoDiv = document.createElement('div');
         infoDiv.className = 'shop-ai-product-info';
         infoDiv.innerHTML = `
           <h4 class="shop-ai-product-title" title="${safeTitle}">${safeTitle}</h4>
-          ${safeSku ? `<div class="shop-ai-product-sku">SKU: ${safeSku}</div>` : ''}
-          <div class="shop-ai-product-price">${safePrice}</div>
+          ${safeSku ? `<div class="shop-ai-product-sku" title="Part number">${safeSku}</div>` : ''}
+          <div class="shop-ai-product-foot">
+            <span class="shop-ai-product-price${prod.price ? '' : ' is-empty'}">${prod.price ? escapeHtml(prod.price) : 'Price on request'}</span>
+            ${url ? `<a class="shop-ai-product-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="View ${safeTitle} on the store">View ${ARROW_ICON_SVG}</a>` : ''}
+          </div>
         `;
         card.appendChild(infoDiv);
 
-        card.addEventListener('click', () => {
-          this.handleOpenProductModal(productId);
+        // The "View" link opens the product page; anywhere else on the card opens the details.
+        infoDiv.querySelector('.shop-ai-product-link')?.addEventListener('click', (e) => e.stopPropagation());
+        card.addEventListener('click', () => this.handleOpenProductModal(productId));
+        card.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            this.handleOpenProductModal(productId);
+          }
         });
 
         container.appendChild(card);
       });
 
-      this.elements.messages?.appendChild(container);
+      wrapper.appendChild(container);
+      this.elements.messages?.appendChild(wrapper);
       this.scrollToBottom();
-      return container;
+      return wrapper;
+    },
+
+    stopStreamingCarets() {
+      this.elements.messages?.querySelectorAll('.is-streaming').forEach((el) => el.classList.remove('is-streaming'));
     },
 
     handleOpenProductModal(productId) {
@@ -975,7 +1149,8 @@
         imgSlot.appendChild(modalImg);
       }
 
-      document.body.appendChild(overlay);
+      // Inside the widget root so it picks up the theme tokens (light / dark).
+      (this.elements.root || document.body).appendChild(overlay);
       requestAnimationFrame(() => overlay.classList.add('active'));
       this.state.selectedProductModal = overlay;
 
@@ -1351,7 +1526,17 @@
       });
     },
 
-    async loadConversation(conversationId) {
+    /** Greeting + suggestion chips (also used when a restored chat can't be loaded). */
+    showWelcome() {
+      const sugg = this.elements.suggestions;
+      if (!sugg) return;
+      sugg.style.display = '';
+      if (!sugg.parentNode) this.elements.messages?.appendChild(sugg);
+      sugg.classList.add('visible');
+    },
+
+    /** quiet: used when re-opening after a page reload — on failure fall back to the greeting. */
+    async loadConversation(conversationId, { quiet = false } = {}) {
       this.closeHistory();
 
       if (this.elements.messages) {
@@ -1383,18 +1568,21 @@
         if (data.messages && data.messages.length) {
           data.messages.forEach(msg => {
             if (msg.role === 'user' || msg.role === 'assistant') {
-              const content = typeof msg.content === 'string' ? msg.content : '';
+              const content = typeof msg.content === 'string' ? msg.content.replace(CARDS_MARKER_RE, '') : '';
               if (content) this.addMessage(content, msg.role);
             }
           });
           this.scrollToBottom();
+        } else if (quiet) {
+          this.showWelcome();
         } else {
           this.addMessage('This conversation has no messages.', 'assistant');
         }
       } catch (err) {
         this.removeThinking();
         console.error('Failed to load conversation:', err);
-        this.addMessage('Could not load conversation history.', 'assistant');
+        if (quiet) this.showWelcome();
+        else this.addMessage('Could not load conversation history.', 'assistant');
       }
     },
 
@@ -1419,6 +1607,8 @@
     restoreState() {
       if (this.state.conversationId) {
         this.state.isFirstMessage = false;
+        // The page was reloaded mid-conversation: bring the messages back on first open.
+        this.state.needsRestore = true;
         if (this.elements.suggestions) {
           this.elements.suggestions.classList.remove('visible');
           this.elements.suggestions.style.display = 'none';
