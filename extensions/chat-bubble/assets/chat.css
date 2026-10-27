@@ -35,12 +35,20 @@
   --tia-on-accent: #ffffff;
   --tia-invert-bg: #1c1917;
   --tia-invert-text: #fafaf9;
+  --tia-btn-bg: #1c1917;
+  --tia-btn-bg-hover: #292524;
+  --tia-btn-text: #fafaf9;
+  --tia-btn-bg-disabled: #e7e5e4;
+  --tia-btn-text-disabled: #57534e;
   --tia-success: #16a34a;
   --tia-warning: #d97706;
   --tia-neutral: #a8a29e;
   --tia-danger: #dc2626;
   --tia-danger-soft: rgba(220, 38, 38, 0.06);
-  --tia-scrim: rgba(28, 25, 23, 0.32);
+  --tia-scrim: rgba(28, 25, 23, 0.24);
+  --tia-scrim-solid: rgba(28, 25, 23, 0.5);
+  --tia-blur: 12px;
+  --tia-blur-sm: 6px;
   --tia-media-bg: #ffffff;
   --tia-hover: rgba(28, 25, 23, 0.05);
   --tia-press: rgba(28, 25, 23, 0.09);
@@ -101,12 +109,18 @@
   --tia-on-accent: #1c1917;
   --tia-invert-bg: #f5f5f4;
   --tia-invert-text: #1c1917;
+  --tia-btn-bg: #f5f5f4;
+  --tia-btn-bg-hover: #e7e5e4;
+  --tia-btn-text: #1c1917;
+  --tia-btn-bg-disabled: #2c2a28;
+  --tia-btn-text-disabled: #b6b0ab;
   --tia-success: #4ade80;
   --tia-warning: #fbbf24;
   --tia-neutral: #78716c;
   --tia-danger: #f87171;
   --tia-danger-soft: rgba(248, 113, 113, 0.08);
-  --tia-scrim: rgba(0, 0, 0, 0.56);
+  --tia-scrim: rgba(0, 0, 0, 0.48);
+  --tia-scrim-solid: rgba(0, 0, 0, 0.72);
   --tia-media-bg: #ffffff;
   --tia-hover: rgba(245, 245, 244, 0.06);
   --tia-press: rgba(245, 245, 244, 0.1);
@@ -124,7 +138,11 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
-.shop-ai-reset button { font: inherit; color: inherit; }
+/* :where() keeps this at element specificity, so a class rule such as
+   .shop-ai-product-modal-primary { color: … } always wins. (As ".shop-ai-reset button" it beat
+   every single-class button rule and made the Add to Cart / launcher labels inherit the body
+   text colour: dark-on-dark in light mode, light-on-light in dark mode.) */
+:where(.shop-ai-reset) button { font: inherit; color: inherit; }
 .shop-ai-reset svg { flex-shrink: 0; }
 .shop-ai-reset h2,
 .shop-ai-reset h3,
@@ -220,14 +238,19 @@
 .shop-ai-launcher:active { transform: scale(0.97); }
 .shop-ai-launcher .tia-mark { width: 24px; height: 24px; }
 
-/* ---------- Scrim (modal mode) ---------- */
+/* ---------- Scrim + blur (full-screen modal only; the side panel leaves the page usable) ----------
+   backdrop-filter blurs whatever is behind the scrim; only opacity animates, so the blur
+   costs one composited layer instead of re-filtering the page every frame. */
 .shop-ai-backdrop {
   position: fixed;
   inset: 0;
   z-index: 999998;
   background: var(--tia-scrim);
+  -webkit-backdrop-filter: blur(var(--tia-blur)) saturate(115%);
+  backdrop-filter: blur(var(--tia-blur)) saturate(115%);
   opacity: 0;
   visibility: hidden;
+  will-change: opacity;
   transition: opacity var(--tia-d2) var(--tia-out), visibility 0s linear var(--tia-d2);
 }
 body.shop-ai-open.shop-ai-mode-modal .shop-ai-backdrop { opacity: 1; visibility: visible; transition: opacity var(--tia-d2) var(--tia-out), visibility 0s; }
@@ -509,7 +532,12 @@ body.shop-ai-open .shop-ai-modal {
 .shop-ai-thinking-dots span { width: 5px; height: 5px; border-radius: 50%; background: var(--tia-text-3); animation: tiaDot 1.1s var(--tia-out) infinite; }
 .shop-ai-thinking-dots span:nth-child(2) { animation-delay: 0.14s; }
 .shop-ai-thinking-dots span:nth-child(3) { animation-delay: 0.28s; }
-.shop-ai-thinking-text { font-size: var(--tia-fs-13); line-height: var(--tia-lh-13); color: var(--tia-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shop-ai-thinking-text { font-size: var(--tia-fs-13); line-height: var(--tia-lh-13); color: var(--tia-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Live status line: old and new labels share one grid cell and cross-slide (transform + opacity) */
+.shop-ai-thinking-label { display: inline-grid; min-width: 0; overflow: hidden; }
+.shop-ai-thinking-label > .shop-ai-thinking-text { grid-area: 1 / 1; }
+.shop-ai-thinking-text.is-entering { animation: tiaStatusIn var(--tia-d2) var(--tia-out) both; }
+.shop-ai-thinking-text.is-leaving { animation: tiaStatusOut var(--tia-d1) var(--tia-in) both; }
 
 /* ---------- Empty state ---------- */
 .shop-ai-suggestions { display: flex; flex-direction: column; margin: auto 0; padding: var(--tia-s6) 0 var(--tia-s2); }
@@ -550,6 +578,7 @@ body.shop-ai-open .shop-ai-modal {
 .shop-ai-match::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--tia-neutral); }
 .shop-ai-match.is-high::before { background: var(--tia-success); }
 .shop-ai-match.is-medium::before { background: var(--tia-warning); }
+.shop-ai-match.is-none { color: var(--tia-text-3); font-weight: 400; }
 .shop-ai-results-sep::before { content: "·"; }
 
 .shop-ai-product-grid {
@@ -612,6 +641,7 @@ body.shop-ai-open .shop-ai-modal {
   font-size: var(--tia-fs-12);
   font-weight: 500;
 }
+.shop-ai-badge.is-best { color: var(--tia-accent-text); }
 .shop-ai-product-info { display: flex; flex: 1; flex-direction: column; gap: var(--tia-s1); min-width: 0; padding: var(--tia-s2) 10px 10px; }
 .shop-ai-reset .shop-ai-product-title {
   display: -webkit-box;
@@ -651,8 +681,12 @@ body.shop-ai-open .shop-ai-modal {
   justify-content: center;
   padding: var(--tia-s4);
   background: var(--tia-scrim);
+  /* Product details sit above the chat: blur and dim both the chat and the page behind */
+  -webkit-backdrop-filter: blur(var(--tia-blur-sm)) saturate(110%);
+  backdrop-filter: blur(var(--tia-blur-sm)) saturate(110%);
   opacity: 0;
   visibility: hidden;
+  will-change: opacity;
   transition: opacity var(--tia-d2) var(--tia-out), visibility 0s linear var(--tia-d2);
 }
 .shop-ai-product-modal-overlay.active { opacity: 1; visibility: visible; transition: opacity var(--tia-d2) var(--tia-out), visibility 0s; }
@@ -699,8 +733,28 @@ body.shop-ai-open .shop-ai-modal {
 }
 .shop-ai-product-modal-primary:active,
 .shop-ai-product-modal-secondary:active { transform: scale(0.97); }
-.shop-ai-product-modal-primary { flex: 1; border: none; background: var(--tia-invert-bg); color: var(--tia-invert-text); }
-.shop-ai-product-modal-primary:disabled { opacity: 0.6; cursor: default; }
+/* Primary (Add to Cart / Go to Cart): explicit colours per theme, all ≥ 15:1 text contrast */
+.shop-ai-product-modal-primary {
+  flex: 1;
+  gap: var(--tia-s2);
+  border: none;
+  background: var(--tia-btn-bg);
+  color: var(--tia-btn-text);
+}
+.shop-ai-product-modal-primary:hover { background: var(--tia-btn-bg-hover); }
+.shop-ai-product-modal-primary:focus-visible { outline: 2px solid var(--tia-accent) !important; outline-offset: 2px; }
+.shop-ai-product-modal-primary:disabled { cursor: default; background: var(--tia-btn-bg-disabled); color: var(--tia-btn-text-disabled); }
+/* Loading ("Adding…"): stays readable, shows a spinner instead of fading out */
+.shop-ai-product-modal-primary[aria-busy="true"] { cursor: progress; background: var(--tia-btn-bg); color: var(--tia-btn-text); }
+.shop-ai-product-modal-primary[aria-busy="true"]::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: tiaSpin 0.7s linear infinite;
+}
 .shop-ai-product-modal-secondary { border: 1px solid var(--tia-border-strong); background: var(--tia-bg); color: var(--tia-text); }
 .shop-ai-product-modal-close {
   position: absolute;
@@ -834,6 +888,7 @@ body.shop-ai-open .shop-ai-modal {
 
 /* ---------- Phones: both layouts become a full-height sheet ---------- */
 @media (max-width: 599px) {
+  .shop-ai-reset { --tia-blur: 6px; --tia-blur-sm: 4px; }
   body.shop-ai-open { overflow: hidden; }
   .tia-mode-modal .shop-ai-modal,
   .tia-mode-popup .shop-ai-modal {
@@ -870,10 +925,18 @@ body.shop-ai-open .shop-ai-modal {
   .shop-ai-message.user { max-width: 86%; }
 }
 
+/* No backdrop-filter support: a denser scrim so the page still recedes */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .shop-ai-backdrop,
+  .shop-ai-product-modal-overlay { background: var(--tia-scrim-solid); }
+}
+
 /* ---------- Motion ---------- */
 @keyframes tiaFadeUp { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes tiaDot { 0%, 70%, 100% { opacity: 0.35; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
 @keyframes tiaBlink { to { opacity: 0; } }
+@keyframes tiaStatusIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes tiaStatusOut { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-6px); } }
 @keyframes tiaSpin { to { transform: rotate(360deg); } }
 
 @media (prefers-reduced-motion: reduce) {

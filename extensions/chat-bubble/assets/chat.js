@@ -67,6 +67,7 @@
  *   - onerror on <img> replaces with placeholder SVG
  */
 
+/* global PUB_SUB_EVENTS */ // Dawn's cart pub/sub, a script-level const (checked with typeof)
 (function () {
   'use strict';
 
@@ -152,12 +153,13 @@
   }
 
   // Short, fixed labels for the typing indicator (the server sends these states).
+  // Older backends sent these strings; newer ones send the final wording ("Analyzing your image").
   const THINKING_LABELS = {
-    'Reading your photo...': 'Reading your photo',
+    'Reading your photo...': 'Analyzing your image',
     'Searching products...': 'Searching the catalogue',
     'Adding to cart...': 'Adding to cart',
-    'Looking up product...': 'Looking up the product',
-    'Looking up product details...': 'Looking up product details',
+    'Looking up product...': 'Gathering product details',
+    'Looking up product details...': 'Gathering product details',
     'Checking availability...': 'Checking availability',
     'Loading conversation...': 'Loading your conversation',
   };
@@ -736,7 +738,8 @@
       }
 
       if (!retry) this.saveToHistory(message || 'Photo');
-      this.showThinking();
+      // The first real status arrives from the server; until then say what has started.
+      this.showThinking(image ? 'Analyzing your image' : 'Thinking');
 
       try {
         const apiUrl = window.shopChatConfig?.apiUrl;
@@ -783,8 +786,6 @@
         // replace it if Claude does multiple searches in one turn.
         // This is a per-turn reference — reset on each send().
         let currentTurnGridEl = null;
-        // Track whether products were rendered this turn
-        let productsRenderedThisTurn = false;
 
         // Track the active assistant text bubble across tool-result cycles.
         let activeBubbleEl = null;
@@ -851,7 +852,6 @@
                   currentTurnGridEl.parentNode.removeChild(currentTurnGridEl);
                 }
                 currentTurnGridEl = this.renderProductsGrid(products, data.match || null);
-                productsRenderedThisTurn = true;
               }
             }
 
@@ -884,7 +884,6 @@
               activeBubbleEl = null;
               fullText = '';
               currentTurnGridEl = null;
-              productsRenderedThisTurn = false;
             }
 
             if (data.type === 'error') {
@@ -1096,20 +1095,38 @@
       container.insertAdjacentHTML(
         'beforeend',
         '<span class="shop-ai-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>' +
-          '<span class="shop-ai-thinking-text"></span>'
+          '<span class="shop-ai-thinking-label"><span class="shop-ai-thinking-text"></span></span>'
       );
-      container.querySelector('.shop-ai-thinking-text').textContent =
-        THINKING_LABELS[initialText] || initialText || 'Thinking';
+      container.querySelector('.shop-ai-thinking-text').textContent = this.thinkingLabel(initialText);
 
       this.elements.messages?.appendChild(container);
       this.scrollToBottom();
     },
 
-    updateThinkingState(toolText) {
-      const label = THINKING_LABELS[toolText] || String(toolText || 'Thinking').replace(/\.+$/, '');
-      const el = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-      if (el) el.textContent = label;
-      else this.showThinking(label);
+    thinkingLabel(state) {
+      return THINKING_LABELS[state] || String(state || 'Thinking').replace(/\.+$/, '');
+    },
+
+    /**
+     * Live status line, driven by the server's thinking_state events. The old label slides out
+     * and the new one slides in (transform + opacity); both share one grid cell, so the row
+     * never changes height.
+     */
+    updateThinkingState(state) {
+      const label = this.thinkingLabel(state);
+      const holder = document.querySelector('#shop-ai-thinking .shop-ai-thinking-label');
+      if (!holder) return this.showThinking(label);
+      const current = holder.querySelector('.shop-ai-thinking-text:not(.is-leaving)');
+      if (current && current.textContent === label) return;
+      if (current) {
+        current.classList.add('is-leaving');
+        current.addEventListener('animationend', () => current.remove(), { once: true });
+        setTimeout(() => current.remove(), 400); // reduced motion / no animation events
+      }
+      const next = document.createElement('span');
+      next.className = 'shop-ai-thinking-text is-entering';
+      next.textContent = label;
+      holder.appendChild(next);
     },
 
     removeThinking() {
@@ -1137,7 +1154,8 @@
       const wrapper = document.createElement('div');
       wrapper.className = 'shop-ai-results';
 
-      const confidence = match && ['high', 'medium', 'low'].includes(match.confidence) ? match.confidence : null;
+      // 'none' = closest catalogue products, not a confirmed match (shown with a neutral chip).
+      const confidence = match && ['high', 'medium', 'low', 'none'].includes(match.confidence) ? match.confidence : null;
       const head = document.createElement('div');
       head.className = 'shop-ai-results-head';
       const count = document.createElement('span');
@@ -1177,12 +1195,15 @@
         media.className = 'shop-ai-product-media';
         media.appendChild(buildProductImage(prod.image_url, prod.title || 'Product', 'shop-ai-product-image-wrap'));
         // Best match badge: first card of a confident photo match, else the card's own label.
-        const badgeText = idx === 0 && (confidence === 'high' || confidence === 'medium')
-          ? (prod.match_label === 'Exact part number' ? 'Exact match' : 'Best match')
+        // Photo matches label every card ("Best match", "Possible match"); plain searches only the
+        // first card of a confident match.
+        const PHOTO_BADGES = { 'Exact part number': 'Exact match', 'Best match': 'Best match', 'Possible match': 'Possible match' };
+        const badgeText = confidence
+          ? PHOTO_BADGES[prod.match_label] || (idx === 0 && (confidence === 'high' || confidence === 'medium') ? 'Best match' : null)
           : null;
         if (badgeText) {
           const badge = document.createElement('span');
-          badge.className = 'shop-ai-badge';
+          badge.className = `shop-ai-badge${badgeText === 'Best match' || badgeText === 'Exact match' ? ' is-best' : ''}`;
           badge.textContent = badgeText;
           media.appendChild(badge);
         }
@@ -1335,8 +1356,9 @@
       const button = document.querySelector(`[data-product-action="add-to-cart"][data-product-id="${productId}"]`);
 
       if (button) {
-        button.textContent = 'Adding...';
+        button.textContent = 'Adding…';
         button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
       }
 
       try {
@@ -1378,6 +1400,7 @@
             btn.textContent = 'Go to Cart';
             btn.dataset.productAction = 'go-to-cart';
             btn.disabled = false;
+            btn.removeAttribute('aria-busy');
           }
         });
 
@@ -1387,6 +1410,7 @@
         if (button) {
           button.textContent = 'Add to Cart';
           button.disabled = false;
+          button.removeAttribute('aria-busy');
         }
         this.addMessage(
           err.userMessage
