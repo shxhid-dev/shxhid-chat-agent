@@ -7,6 +7,15 @@
  * - SSE streaming with thinking indicators
  * - Photo search: attach / paste / drop a photo of a part or nameplate
  *
+ * v6.0 — Oct 26, 2026 — STUDIO UI
+ *   - TIA logo mark on assistant messages, empty state and launcher; Lucide icons; no emoji.
+ *   - Modal ⇄ side-panel switch is a FLIP layout animation (transform only, no flicker).
+ *   - Streaming renders are batched per animation frame; auto-scroll only sticks to the bottom
+ *     when the reader is already there.
+ *   - Static typing-indicator labels (no cycling phrases / intervals), error rows with Retry,
+ *     focus trap + focus return, Enter/Shift+Enter via keydown (IME-safe), visualViewport
+ *     sizing on phones so the keyboard never covers the composer.
+ *
  * v5.0 — Oct 26, 2026 — TIA REDESIGN
  *   - Display modes: 'modal' (full screen, page blurred) or 'popup' (bottom-right widget with a
  *     launcher bubble). Header toggle + menu; saved in localStorage 'shopAiDisplayMode'.
@@ -62,7 +71,7 @@
   'use strict';
 
   // ─── Image placeholder SVG ────────────────────────────────────────────────
-  const PLACEHOLDER_SVG = `<div class="shop-ai-img-placeholder" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#f5f5f5;border-radius:8px 8px 0 0;"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#c8c8c8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="14" rx="2"/><circle cx="12" cy="13" r="3"/><path d="M9 6l1.5-2h3L15 6"/></svg></div>`;
+  const PLACEHOLDER_SVG = `<div class="shop-ai-img-placeholder"><svg class="tia-i" viewBox="0 0 24 24" aria-hidden="true" style="width:28px;height:28px;stroke-width:1.5"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"/></svg></div>`;
 
   function buildProductImage(imageUrl, altText, cssClass) {
     const src = (imageUrl && typeof imageUrl === 'string' && imageUrl.startsWith('http'))
@@ -123,9 +132,35 @@
     try { localStorage.setItem(key, value); } catch (_) { /* ignore */ }
   }
 
-  const ARROW_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>';
+  // ─── Brand + icons (Lucide paths, MIT) ────────────────────────────────────
+  const MARK_SVG = '<svg class="tia-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="tia-mark-tile" width="24" height="24" rx="7"/><path class="tia-mark-glyph" d="M7.5 7.5h9M12 7.5v9"/><circle class="tia-mark-dot" cx="17.25" cy="16.5" r="1.75"/></svg>';
+  const ICON_PATHS = {
+    arrowUpRight: '<path d="M7 7h10v10"/><path d="M7 17 17 7"/>',
+    camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+    x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+    message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  };
+  function icon(name, size = '') {
+    return `<svg class="tia-i${size ? ` tia-i-${size}` : ''}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICON_PATHS[name] || ''}</svg>`;
+  }
+  function avatarEl() {
+    const span = document.createElement('span');
+    span.className = 'tia-avatar';
+    span.innerHTML = MARK_SVG;
+    return span;
+  }
 
-  const CAMERA_ICON_SVG = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>';
+  // Short, fixed labels for the typing indicator (the server sends these states).
+  const THINKING_LABELS = {
+    'Reading your photo...': 'Reading your photo',
+    'Searching products...': 'Searching the catalogue',
+    'Adding to cart...': 'Adding to cart',
+    'Looking up product...': 'Looking up the product',
+    'Looking up product details...': 'Looking up product details',
+    'Checking availability...': 'Checking availability',
+    'Loading conversation...': 'Loading your conversation',
+  };
 
   function loadImageElement(file) {
     return new Promise((resolve, reject) => {
@@ -177,7 +212,6 @@
       emailPopupShown: sessionStorage.getItem('shopAiEmailPopupShown') === 'true',
       isFirstMessage: !sessionStorage.getItem('shopAiConversationId'),
       buffer: '',
-      placeholderIndex: 0,
       chatHistory: JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]'),
       cartId: sessionStorage.getItem('shopAiCartId') || null,
       checkoutUrl: sessionStorage.getItem('shopAiCheckoutUrl') || null,
@@ -198,13 +232,6 @@
       displayMode: readPref(MODE_KEY, MODES, 'modal'),
       themePref: readPref(THEME_KEY, THEMES, 'light'),
     },
-
-    placeholders: [
-      'Ask me anything...',
-      'Search for products',
-      'What do you need?',
-      'Tell me a product name...',
-    ],
 
     elements: {},
 
@@ -236,10 +263,13 @@
         return;
       }
 
+      // A shorter prompt fits one line on phones (a wrapped placeholder grows the box and shows a scrollbar).
+      if (this.elements.input && window.matchMedia?.('(max-width: 599px)').matches) {
+        this.elements.input.placeholder = 'Ask TIA about a part';
+      }
       this.applyTheme(this.state.themePref);
       this.applyDisplayMode(this.state.displayMode, { animate: false, save: false });
       this.bindEvents();
-      this.startPlaceholderRotation();
       this.restoreState();
       this.exposeAPI();
 
@@ -257,6 +287,13 @@
       if (this.elements.closeBtn) {
         this.elements.closeBtn.addEventListener('click', () => this.close());
       }
+
+      // Auto-scroll sticks to the bottom only while the reader is there.
+      this._stick = true;
+      this.elements.messages?.addEventListener('scroll', () => {
+        const m = this.elements.messages;
+        this._stick = m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+      }, { passive: true });
       if (this.elements.backdrop) {
         this.elements.backdrop.addEventListener('click', () => this.close());
       }
@@ -265,8 +302,9 @@
         this.elements.sendBtn.addEventListener('click', () => this.send());
       }
       if (this.elements.input) {
-        this.elements.input.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
+        // keydown (not the deprecated keypress) and never while an IME is composing text.
+        this.elements.input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
             e.preventDefault();
             this.send();
           }
@@ -274,7 +312,7 @@
         this.elements.input.addEventListener('input', () => {
           const el = this.elements.input;
           el.style.height = 'auto';
-          el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+          el.style.height = Math.min(el.scrollHeight, 140) + 'px';
           this.updateSendState();
         });
         // Paste a screenshot / copied photo straight into the box.
@@ -332,7 +370,7 @@
       if (this.elements.menuBtn) {
         this.elements.menuBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          this.elements.menuDropdown?.classList.toggle('active');
+          this.setMenuOpen(!this.elements.menuDropdown?.classList.contains('active'));
         });
       }
 
@@ -368,7 +406,7 @@
           const item = e.target.closest('[data-action]');
           if (!item) return;
           const action = item.dataset.action;
-          this.elements.menuDropdown.classList.remove('active');
+          this.setMenuOpen(false);
           if (action === 'new') this.startNewChat();
           if (action === 'history') this.openHistory();
           if (action === 'end') { this.startNewChat(); this.close(); }
@@ -383,15 +421,20 @@
         if (this.elements.menuDropdown?.classList.contains('active') &&
             !this.elements.menuBtn?.contains(e.target) &&
             !this.elements.menuDropdown?.contains(e.target)) {
-          this.elements.menuDropdown.classList.remove('active');
+          this.setMenuOpen(false);
         }
       });
 
       document.addEventListener('keydown', (e) => {
-        if (e.key !== 'Escape' || !this.state.isOpen) return;
+        if (!this.state.isOpen) return;
+        if (e.key === 'Tab') return this.trapFocus(e);
+        if (e.key !== 'Escape') return;
         // Close the innermost layer first: product details → menu → history → chat.
         if (this.state.selectedProductModal) return this.handleCloseProductModal();
-        if (this.elements.menuDropdown?.classList.contains('active')) return this.elements.menuDropdown.classList.remove('active');
+        if (this.elements.menuDropdown?.classList.contains('active')) {
+          this.setMenuOpen(false);
+          return this.elements.menuBtn?.focus();
+        }
         if (this.elements.historyPanel?.classList.contains('active')) return this.closeHistory();
         this.close();
       });
@@ -420,20 +463,6 @@
       });
     },
 
-    startPlaceholderRotation() {
-      setInterval(() => {
-        const input = this.elements.input;
-        if (input && !input.value) {
-          input.classList.add('placeholder-fade');
-          setTimeout(() => {
-            this.state.placeholderIndex = (this.state.placeholderIndex + 1) % this.placeholders.length;
-            input.placeholder = this.placeholders[this.state.placeholderIndex];
-            input.classList.remove('placeholder-fade');
-          }, 300);
-        }
-      }, 4000);
-    },
-
     open() {
       // Email capture popup is controlled by the "Show email capture popup"
       // setting on the app embed (off by default).
@@ -453,24 +482,88 @@
       if (this.elements.floatingGroup) {
         this.elements.floatingGroup.classList.add('hidden');
       }
+      if (!this.state.isOpen) this.state.returnFocus = document.activeElement;
       this.state.isOpen = true;
+      this.bindViewport(true);
       // Wait for the open transition so mobile keyboards don't jump the layout.
       setTimeout(() => this.elements.input?.focus({ preventScroll: true }), 120);
     },
 
     close() {
       document.body.classList.remove('shop-ai-open', 'shop-ai-mode-modal', 'shop-ai-mode-popup');
-      this.elements.menuDropdown?.classList.remove('active');
+      this.setMenuOpen(false);
       if (this.elements.floatingGroup) {
         this.elements.floatingGroup.classList.remove('hidden');
       }
       this.state.isOpen = false;
+      this.bindViewport(false);
+      // Give focus back to whatever opened the chat (header button, launcher, suggestion).
+      const back = this.state.returnFocus;
+      this.state.returnFocus = null;
+      if (back && typeof back.focus === 'function' && document.contains(back)) back.focus({ preventScroll: true });
+      else this.elements.floatingGroup?.querySelector('button')?.focus({ preventScroll: true });
     },
 
-    /** 'modal' (full screen, page blurred) or 'popup' (bottom-right widget). */
+    setMenuOpen(open) {
+      this.elements.menuDropdown?.classList.toggle('active', !!open);
+      this.elements.menuBtn?.setAttribute('aria-expanded', String(!!open));
+    },
+
+    /** Keep Tab inside the dialog while it is modal (full screen, or the phone sheet). */
+    trapFocus(e) {
+      const modal = this.elements.modal;
+      const isSheet = window.matchMedia?.('(max-width: 599px)').matches;
+      if (!modal || (this.state.displayMode !== 'modal' && !isSheet && !this.state.selectedProductModal)) return;
+      const scope = this.state.selectedProductModal || modal;
+      // Skip controls in the closed menu / history panel: they are visibility:hidden, not display:none.
+      const focusable = [...scope.querySelectorAll('button, [href], textarea, input:not([type="hidden"]), [tabindex]:not([tabindex="-1"])')]
+        .filter((el) => !el.disabled && !el.hidden && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden');
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && (document.activeElement === first || !scope.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (document.activeElement === last || !scope.contains(document.activeElement))) {
+        e.preventDefault();
+        first.focus();
+      }
+    },
+
+    /**
+     * Phones: size the sheet to the visual viewport so the on-screen keyboard never covers the
+     * composer. Writes two CSS variables at most once per frame.
+     */
+    bindViewport(on) {
+      const vv = window.visualViewport;
+      const root = this.elements.root;
+      if (!vv || !root) return;
+      if (!this._onViewport) {
+        let frame = 0;
+        this._onViewport = () => {
+          if (frame) return;
+          frame = requestAnimationFrame(() => {
+            frame = 0;
+            root.style.setProperty('--tia-vv-height', `${Math.round(vv.height)}px`);
+            root.style.setProperty('--tia-vv-top', `${Math.round(vv.offsetTop)}px`);
+          });
+        };
+      }
+      if (on) {
+        this._onViewport();
+        vv.addEventListener('resize', this._onViewport);
+        vv.addEventListener('scroll', this._onViewport);
+      } else {
+        vv.removeEventListener('resize', this._onViewport);
+        vv.removeEventListener('scroll', this._onViewport);
+      }
+    },
+
+    /** 'modal' (full screen with a scrim) or 'popup' (bottom-right side panel). */
     applyDisplayMode(mode, { animate = true, save = true } = {}) {
       const next = MODES.includes(mode) ? mode : 'modal';
       const root = this.elements.root;
+      const panel = this.elements.modal;
       const swap = () => {
         this.state.displayMode = next;
         if (root) {
@@ -481,18 +574,47 @@
           document.body.classList.remove('shop-ai-mode-modal', 'shop-ai-mode-popup');
           document.body.classList.add(`shop-ai-mode-${next}`);
         }
-        this.elements.modeBtn?.setAttribute('aria-label', next === 'modal' ? 'Switch to side popup' : 'Switch to full screen');
+        this.elements.modeBtn?.setAttribute('aria-label', next === 'modal' ? 'Switch to side panel' : 'Switch to full screen');
         root?.querySelectorAll('[data-set-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.setMode === next)));
         if (save) writePref(MODE_KEY, next);
       };
 
-      if (!animate || !root || !this.state.isOpen || this.state.displayMode === next) return swap();
-      // Blur cross-fade: fade out, switch layout, fade back in.
-      root.classList.add('tia-switching');
-      setTimeout(() => {
-        swap();
-        requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('tia-switching')));
-      }, 160);
+      const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      const isSheet = window.matchMedia?.('(max-width: 599px)').matches;
+      if (!animate || !root || !panel || !this.state.isOpen || this.state.displayMode === next || reduced || isSheet) return swap();
+
+      // FLIP: measure, switch layout, then animate the panel from its old box to the new one
+      // with transform only. Content fades out for the morph so stretched text is never seen.
+      const first = panel.getBoundingClientRect();
+      root.classList.add('tia-morphing');
+      swap();
+      const last = panel.getBoundingClientRect();
+      if (!last.width || !last.height) {
+        root.classList.remove('tia-morphing');
+        return;
+      }
+      const dx = first.left - last.left;
+      const dy = first.top - last.top;
+      const sx = first.width / last.width;
+      const sy = first.height / last.height;
+      panel.style.transition = 'none';
+      panel.style.transformOrigin = 'top left';
+      panel.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
+      panel.getBoundingClientRect(); // commit the inverted frame before animating
+      panel.style.transition = 'transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1)';
+      panel.style.transform = '';
+      const done = () => {
+        panel.removeEventListener('transitionend', onEnd);
+        clearTimeout(fallback);
+        panel.style.transition = '';
+        panel.style.transformOrigin = '';
+        root.classList.remove('tia-morphing');
+      };
+      const onEnd = (ev) => { if (ev.target === panel && ev.propertyName === 'transform') done(); };
+      const fallback = setTimeout(done, 320);
+      panel.addEventListener('transitionend', onEnd);
+      // Bring the content back while the panel settles, so the whole switch stays near 250ms.
+      setTimeout(() => root.classList.remove('tia-morphing'), 120);
     },
 
     /** 'light' | 'dark' | 'system' (follows the OS). */
@@ -574,13 +696,22 @@
       }
     },
 
-    async send(messageArg) {
-      const fromArg = typeof messageArg === 'string' && !!messageArg.trim();
-      const message = fromArg ? messageArg.trim() : (this.elements.input?.value?.trim() || '');
-      // Suggestion buttons (openAndSend) send their text only; a typed send carries the pending photo.
-      if (!fromArg && this.state.isPreparingImage) return;
-      const image = fromArg ? null : this.state.pendingImage;
+    async send(messageArg, { retry = false } = {}) {
+      let message;
+      let image;
+      if (retry) {
+        // "Retry" on an error row re-sends the last request without adding a new user bubble.
+        if (!this.state.lastRequest) return;
+        ({ message, image } = this.state.lastRequest);
+      } else {
+        const fromArg = typeof messageArg === 'string' && !!messageArg.trim();
+        message = fromArg ? messageArg.trim() : (this.elements.input?.value?.trim() || '');
+        // Suggestion buttons (openAndSend) send their text only; a typed send carries the pending photo.
+        if (!fromArg && this.state.isPreparingImage) return;
+        image = fromArg ? null : this.state.pendingImage;
+      }
       if (!message && !image) return;
+      this.state.lastRequest = { message, image };
 
       // Hide the welcome on any send (it can also be showing after a restored chat failed to load).
       this.state.isFirstMessage = false;
@@ -589,20 +720,22 @@
         this.elements.suggestions.style.display = 'none';
       }
 
-      this.addMessage(message, 'user', { imageUrl: image?.dataUrl });
-      if (this.elements.input) {
-        this.elements.input.value = '';
-        this.elements.input.style.height = 'auto';
+      if (!retry) {
+        this.addMessage(message, 'user', { imageUrl: image?.dataUrl });
+        if (this.elements.input) {
+          this.elements.input.value = '';
+          this.elements.input.style.height = 'auto';
+        }
+        if (image) this.clearPendingImage();
+        this.updateSendState();
       }
-      if (image) this.clearPendingImage();
-      this.updateSendState();
 
       if (!this.state.conversationId) {
         this.state.conversationId = 'conv_' + Date.now();
         sessionStorage.setItem('shopAiConversationId', this.state.conversationId);
       }
 
-      this.saveToHistory(message || '📷 Photo');
+      if (!retry) this.saveToHistory(message || 'Photo');
       this.showThinking();
 
       try {
@@ -696,8 +829,7 @@
               }
               if (activeBubbleEl) {
                 activeBubbleEl.classList.add('is-streaming');
-                activeBubbleEl.innerHTML = this.parseMarkdown(fullText);
-                this.scrollToBottom();
+                this.queueStreamRender(activeBubbleEl, fullText);
               }
             }
 
@@ -732,6 +864,7 @@
 
             if (data.type === 'message_complete') {
               this.removeThinking();
+              this.flushStreamRender();
               activeBubbleEl?.classList.remove('is-streaming');
               if (currentAssistantMsg) {
                 // v4.0: Do NOT reset currentTurnGridEl here.
@@ -744,6 +877,7 @@
 
             if (data.type === 'end_turn') {
               this.removeThinking();
+              this.flushStreamRender();
               this.stopStreamingCarets();
               // v4.0: Products already rendered. Just clean up state.
               currentAssistantMsg = null;
@@ -755,29 +889,83 @@
 
             if (data.type === 'error') {
               this.removeThinking();
-              this.addMessage(data.error || 'An error occurred', 'assistant');
+              this.flushStreamRender();
+              this.addError(data.error || 'Something went wrong on our side.', { retry: true });
             }
           }
         }
 
         this.removeThinking();
+        this.flushStreamRender();
         this.stopStreamingCarets();
       } catch (err) {
         this.removeThinking();
+        this.flushStreamRender();
         this.stopStreamingCarets();
         console.error('❌ Chat error:', err);
-        this.addMessage(err.userMessage || 'Sorry, there was an error. Please try again.', 'assistant');
+        if (err.userMessage) this.addError(err.userMessage);
+        else this.addError("Couldn't reach TIA. Check your connection and try again.", { retry: true });
       }
+    },
+
+    /** Coalesce streamed chunks into one DOM write per animation frame. */
+    queueStreamRender(el, text) {
+      this._stream = { el, text };
+      if (this._streamFrame) return;
+      this._streamFrame = requestAnimationFrame(() => {
+        this._streamFrame = 0;
+        this.flushStreamRender();
+      });
+    },
+
+    flushStreamRender() {
+      if (this._streamFrame) {
+        cancelAnimationFrame(this._streamFrame);
+        this._streamFrame = 0;
+      }
+      const job = this._stream;
+      if (!job) return;
+      this._stream = null;
+      job.el.innerHTML = this.parseMarkdown(job.text);
+      this.scrollToBottom();
+    },
+
+    /** Error row: icon, message and (for network / server errors) a Retry button. */
+    addError(text, { retry = false } = {}) {
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'shop-ai-message assistant is-error tia-enter';
+      msgDiv.setAttribute('role', 'alert');
+      msgDiv.appendChild(avatarEl());
+      const row = document.createElement('div');
+      row.className = 'shop-ai-error';
+      row.innerHTML = `${icon('alert', 'sm')}<span class="shop-ai-error-text"></span>`;
+      row.querySelector('.shop-ai-error-text').textContent = text;
+      if (retry && this.state.lastRequest) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'shop-ai-retry';
+        btn.textContent = 'Retry';
+        btn.addEventListener('click', () => {
+          msgDiv.remove();
+          this.send(null, { retry: true });
+        }, { once: true });
+        row.appendChild(btn);
+      }
+      msgDiv.appendChild(row);
+      this.elements.messages?.appendChild(msgDiv);
+      this.scrollToBottom({ force: true });
+      return msgDiv;
     },
 
     addMessage(content, role, opts = {}) {
       const msgDiv = document.createElement('div');
-      msgDiv.className = `shop-ai-message ${role}`;
+      msgDiv.className = `shop-ai-message ${role} tia-enter`;
 
       const bubble = document.createElement('div');
       bubble.className = 'shop-ai-bubble';
 
       if (role === 'assistant') {
+        msgDiv.appendChild(avatarEl());
         bubble.innerHTML = this.parseMarkdown(content);
         msgDiv.appendChild(bubble);
       } else {
@@ -795,12 +983,12 @@
           photo.className = 'shop-ai-user-photo';
           photo.src = opts.imageUrl;
           photo.alt = 'Photo you sent';
-          photo.addEventListener('load', () => this.scrollToBottom(), { once: true });
+          photo.addEventListener('load', () => this.scrollToBottom({ force: true }), { once: true });
           msgDiv.appendChild(photo);
         } else if (photoLabel) {
           const chip = document.createElement('div');
           chip.className = 'shop-ai-photo-chip';
-          chip.innerHTML = CAMERA_ICON_SVG;
+          chip.innerHTML = icon('camera', 'xs');
           const label = document.createElement('span');
           label.textContent = photoLabel;
           chip.appendChild(label);
@@ -813,7 +1001,7 @@
         }
       }
       this.elements.messages?.appendChild(msgDiv);
-      this.scrollToBottom();
+      this.scrollToBottom({ force: role === 'user' });
       return msgDiv;
     },
 
@@ -826,11 +1014,11 @@
     async handleImageFile(file) {
       if (!file || this.state.isPreparingImage) return;
       if (!file.type.startsWith('image/')) {
-        this.addMessage('Please attach a photo (JPG, PNG or WebP).', 'assistant');
+        this.addError('Please attach a photo (JPG, PNG or WebP).');
         return;
       }
       if (file.size > PHOTO_MAX_SOURCE_BYTES) {
-        this.addMessage('That photo is too large — please pick one under 25 MB.', 'assistant');
+        this.addError('That photo is too large — please pick one under 25 MB.');
         return;
       }
 
@@ -844,7 +1032,7 @@
         console.warn('Photo could not be read:', err);
         this.state.pendingImage = null;
         this.renderImagePreview(null, false);
-        this.addMessage("I couldn't open that photo. Please try a JPG or PNG — on iPhone, a screenshot of the photo works too.", 'assistant');
+        this.addError("I couldn't open that photo. Please try a JPG or PNG — on iPhone, a screenshot of the photo works too.");
       } finally {
         this.state.isPreparingImage = false;
         this.updateSendState();
@@ -862,16 +1050,14 @@
       }
       preview.hidden = false;
       preview.innerHTML = `
-        <div class="shop-ai-image-preview-thumb${loading ? ' loading' : ''}">
+        <div class="shop-ai-image-preview-thumb">
           ${dataUrl ? '<img alt="Photo to send">' : '<span class="shop-ai-image-preview-spinner" aria-hidden="true"></span>'}
         </div>
-        <div class="shop-ai-image-preview-text">
-          <span class="shop-ai-image-preview-title">${loading ? 'Preparing photo…' : 'Photo attached'}</span>
-          <span class="shop-ai-image-preview-hint">${loading ? 'Just a moment' : 'Add a question or just press send'}</span>
+        <div class="shop-ai-image-preview-text" aria-live="polite">
+          <span class="shop-ai-image-preview-title">${loading ? 'Preparing photo' : 'Photo attached'}</span>
+          <span class="shop-ai-image-preview-hint">${loading ? 'Resizing for upload' : 'Add a question, or press Enter to send'}</span>
         </div>
-        ${loading ? '' : `<button type="button" class="shop-ai-image-preview-remove" data-image-action="remove" aria-label="Remove photo">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>`}
+        ${loading ? '' : `<button type="button" class="shop-ai-image-preview-remove tia-press" data-image-action="remove" aria-label="Remove photo">${icon('x', 'sm')}</button>`}
       `;
       if (dataUrl) preview.querySelector('img').src = dataUrl;
     },
@@ -902,87 +1088,28 @@
       if (this.state.isThinking) return;
       this.state.isThinking = true;
 
-      const idlePhrases = [
-        'Thinking...',
-        'Analyzing your request...',
-        'Processing...',
-        'Working on it...',
-      ];
-
       const container = document.createElement('div');
       container.id = 'shop-ai-thinking';
-      container.className = 'shop-ai-thinking-container';
+      container.className = 'shop-ai-thinking-container tia-enter';
       container.setAttribute('role', 'status');
-      container.innerHTML =
-        '<div class="shop-ai-thinking-pill">' +
-          '<div class="shop-ai-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></div>' +
-          '<span class="shop-ai-thinking-text"></span>' +
-        '</div>';
-      container.querySelector('.shop-ai-thinking-text').textContent = initialText || idlePhrases[0];
+      container.appendChild(avatarEl());
+      container.insertAdjacentHTML(
+        'beforeend',
+        '<span class="shop-ai-thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>' +
+          '<span class="shop-ai-thinking-text"></span>'
+      );
+      container.querySelector('.shop-ai-thinking-text').textContent =
+        THINKING_LABELS[initialText] || initialText || 'Thinking';
 
       this.elements.messages?.appendChild(container);
       this.scrollToBottom();
-
-      let cycleIdx = 0;
-      this.state.thinkingInterval = setInterval(() => {
-        cycleIdx = (cycleIdx + 1) % idlePhrases.length;
-        const el = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-        if (el) {
-          el.style.opacity = '0';
-          setTimeout(() => {
-            if (el.parentNode) {
-              el.textContent = idlePhrases[cycleIdx];
-              el.style.opacity = '1';
-            }
-          }, 200);
-        }
-      }, 2500);
     },
 
     updateThinkingState(toolText) {
-      clearInterval(this.state.thinkingInterval);
-      this.state.thinkingInterval = null;
-
-      const toolPhrases = {
-        'Reading your photo...':   ['Reading your photo...', 'Looking for the part number...', 'Reading the nameplate...', 'Almost done...'],
-        'Searching products...':   ['Searching catalog...', 'Finding best matches...', 'Filtering results...', 'Almost done...'],
-        'Adding to cart...':       ['Adding to cart...', 'Preparing your order...', 'Updating basket...', 'Almost done...'],
-        'Looking up product...':   ['Looking up product...', 'Fetching details...', 'Checking availability...', 'Almost done...'],
-        'Looking up product details...': ['Fetching product details...', 'Loading specs...', 'Checking inventory...', 'Almost done...'],
-        'Checking availability...': ['Checking availability...', 'Looking up stock...', 'Verifying details...', 'Almost done...'],
-      };
-
-      const phrases = toolPhrases[toolText] || [toolText, 'Processing...', 'Working on it...', 'Almost done...'];
-
+      const label = THINKING_LABELS[toolText] || String(toolText || 'Thinking').replace(/\.+$/, '');
       const el = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-      if (el) {
-        el.style.opacity = '0';
-        setTimeout(() => {
-          if (el.parentNode) {
-            el.textContent = phrases[0];
-            el.style.opacity = '1';
-          }
-        }, 150);
-
-        let cycleIdx = 0;
-        this.state.thinkingInterval = setInterval(() => {
-          cycleIdx = (cycleIdx + 1) % phrases.length;
-          const el2 = document.querySelector('#shop-ai-thinking .shop-ai-thinking-text');
-          if (el2) {
-            el2.style.opacity = '0';
-            setTimeout(() => {
-              if (el2.parentNode) {
-                el2.textContent = phrases[cycleIdx];
-                el2.style.opacity = '1';
-              }
-            }, 200);
-          }
-        }, 2500);
-      } else {
-        if (!this.state.isThinking) {
-          this.showThinking(toolText);
-        }
-      }
+      if (el) el.textContent = label;
+      else this.showThinking(label);
     },
 
     removeThinking() {
@@ -1001,7 +1128,6 @@
     renderProductsGrid(products, match = null) {
       if (!products || !products.length) return null;
 
-      console.log(`[ShopAIChat] Rendering ${products.length} products as carousel`);
 
       const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -1012,14 +1138,22 @@
       wrapper.className = 'shop-ai-results';
 
       const confidence = match && ['high', 'medium', 'low'].includes(match.confidence) ? match.confidence : null;
+      const head = document.createElement('div');
+      head.className = 'shop-ai-results-head';
+      const count = document.createElement('span');
+      count.textContent = `${products.length} ${products.length === 1 ? 'product' : 'products'}`;
+      head.appendChild(count);
       if (confidence) {
-        const chip = document.createElement('div');
+        const sep = document.createElement('span');
+        sep.className = 'shop-ai-results-sep';
+        sep.setAttribute('aria-hidden', 'true');
+        const chip = document.createElement('span');
         chip.className = `shop-ai-match is-${confidence}`;
-        chip.innerHTML = '<i aria-hidden="true"></i><span></span>';
-        chip.querySelector('span').textContent =
+        chip.textContent =
           match.label || { high: 'Strong match', medium: 'Likely match', low: 'Possible matches' }[confidence];
-        wrapper.appendChild(chip);
+        head.append(sep, chip);
       }
+      wrapper.appendChild(head);
 
       const container = document.createElement('div');
       container.className = 'shop-ai-product-grid';
@@ -1061,7 +1195,7 @@
           ${safeSku ? `<div class="shop-ai-product-sku" title="Part number">${safeSku}</div>` : ''}
           <div class="shop-ai-product-foot">
             <span class="shop-ai-product-price${prod.price ? '' : ' is-empty'}">${prod.price ? escapeHtml(prod.price) : 'Price on request'}</span>
-            ${url ? `<a class="shop-ai-product-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="View ${safeTitle} on the store">View ${ARROW_ICON_SVG}</a>` : ''}
+            ${url ? `<a class="shop-ai-product-link tia-press" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="View ${safeTitle} on the store" title="View on the store">${icon('arrowUpRight', 'sm')}</a>` : ''}
           </div>
         `;
         card.appendChild(infoDiv);
@@ -1080,6 +1214,7 @@
       });
 
       wrapper.appendChild(container);
+      wrapper.classList.add('tia-enter');
       this.elements.messages?.appendChild(wrapper);
       this.scrollToBottom();
       return wrapper;
@@ -1115,23 +1250,19 @@
       }[c]));
 
       overlay.innerHTML = `
-        <div class="shop-ai-product-modal">
-          <button class="shop-ai-product-modal-close" data-product-action="modal-close">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
+        <div class="shop-ai-product-modal" role="dialog" aria-modal="true" aria-label="${escapeHtmlAttr(product.title || 'Product details')}">
+          <button type="button" class="shop-ai-product-modal-close tia-press" data-product-action="modal-close" aria-label="Close details">${icon('x')}</button>
 
           <div class="shop-ai-product-modal-left" id="shop-ai-modal-img-slot"></div>
 
           <div class="shop-ai-product-modal-right">
             <div class="shop-ai-product-modal-title">${escapeHtmlAttr(product.title || 'Product')}</div>
             <div class="shop-ai-product-modal-price">${escapeHtmlAttr(product.price || 'Price on request')}</div>
-            ${product.sku ? `<div class="shop-ai-product-modal-sku"><span class="shop-ai-sku-label">SKU</span> ${escapeHtmlAttr(product.sku)}</div>` : ''}
+            ${product.sku ? `<div class="shop-ai-product-modal-sku"><span class="shop-ai-sku-label">Part no.</span> ${escapeHtmlAttr(product.sku)}</div>` : ''}
             ${safeDescription ? `<div class="shop-ai-product-modal-description">${escapeHtmlAttr(safeDescription)}</div>` : ''}
 
             <div class="shop-ai-product-modal-actions">
-              ${product.url ? `<a href="${escapeHtmlAttr(product.url)}" target="_blank" rel="noopener noreferrer" class="shop-ai-product-modal-secondary">View on Store</a>` : ''}
+              ${product.url ? `<a href="${escapeHtmlAttr(product.url)}" target="_blank" rel="noopener noreferrer" class="shop-ai-product-modal-secondary">View on store</a>` : ''}
               ${(product.variant_id || product.merchandise_id) ? `<button class="shop-ai-product-modal-primary"
                 data-product-action="${isAdded ? 'go-to-cart' : 'add-to-cart'}"
                 data-product-id="${productId}">
@@ -1151,7 +1282,11 @@
 
       // Inside the widget root so it picks up the theme tokens (light / dark).
       (this.elements.root || document.body).appendChild(overlay);
-      requestAnimationFrame(() => overlay.classList.add('active'));
+      this.state.modalReturnFocus = document.activeElement;
+      requestAnimationFrame(() => {
+        overlay.classList.add('active');
+        overlay.querySelector('.shop-ai-product-modal-close')?.focus({ preventScroll: true });
+      });
       this.state.selectedProductModal = overlay;
 
       overlay.addEventListener('click', (e) => {
@@ -1164,7 +1299,10 @@
         const m = this.state.selectedProductModal;
         m.classList.remove('active');
         this.state.selectedProductModal = null;
-        setTimeout(() => m.remove(), 300);
+        setTimeout(() => m.remove(), 250);
+        const back = this.state.modalReturnFocus;
+        this.state.modalReturnFocus = null;
+        if (back && document.contains(back)) back.focus({ preventScroll: true });
       }
     },
 
@@ -1243,7 +1381,7 @@
           }
         });
 
-        this.addMessage('Added to cart! 🎉 Tap **Go to Cart** to view your cart and check out.', 'assistant');
+        this.addMessage('Added to your cart. Use **Go to Cart** to review it and check out.', 'assistant');
       } catch (err) {
         console.error('❌ Add to cart error:', err);
         if (button) {
@@ -1444,10 +1582,19 @@
       }
     },
 
-    scrollToBottom() {
-      if (this.elements.messages) {
-        this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
-      }
+    /**
+     * Keep the newest message in view, but only if the reader is already near the bottom
+     * (force: their own message, or an error). One scroll write per animation frame.
+     */
+    scrollToBottom({ force = false } = {}) {
+      const m = this.elements.messages;
+      if (!m) return;
+      if (force) this._stick = true;
+      if (this._scrollFrame) return;
+      this._scrollFrame = requestAnimationFrame(() => {
+        this._scrollFrame = 0;
+        if (this._stick !== false) m.scrollTop = m.scrollHeight;
+      });
     },
 
     startNewChat() {
@@ -1503,23 +1650,23 @@
       const history = JSON.parse(localStorage.getItem('shopAiChatHistory') || '[]');
 
       if (!history.length) {
-        list.innerHTML = '<div class="shop-ai-history-empty">No previous conversations yet</div>';
+        list.innerHTML = `<div class="shop-ai-history-empty">${icon('message')}<span>No previous chats yet</span></div>`;
         return;
       }
 
       list.innerHTML = '';
       history.forEach(conv => {
-        const item = document.createElement('div');
-        item.className = 'shop-ai-history-item';
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'shop-ai-history-item tia-press';
 
         const timeStr = conv.timestamp
           ? new Date(conv.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : '';
 
-        item.innerHTML = `
-          <div class="shop-ai-history-item-title">${conv.title || 'Conversation'}</div>
-          <div class="shop-ai-history-item-time">${timeStr}</div>
-        `;
+        item.innerHTML = '<div class="shop-ai-history-item-title"></div><div class="shop-ai-history-item-time"></div>';
+        item.firstChild.textContent = conv.title || 'Conversation';
+        item.lastChild.textContent = timeStr;
 
         item.addEventListener('click', () => this.loadConversation(conv.id));
         list.appendChild(item);
