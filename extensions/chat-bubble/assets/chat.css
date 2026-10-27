@@ -143,6 +143,11 @@
    every single-class button rule and made the Add to Cart / launcher labels inherit the body
    text colour: dark-on-dark in light mode, light-on-light in dark mode.) */
 :where(.shop-ai-reset) button { font: inherit; color: inherit; }
+/* Dawn-based themes ship "div:empty { display: none }" (0,1,1), which beats a single class and
+   hid the empty scrim, so the page behind the modal was never dimmed or blurred. Restore the
+   widget's intentionally empty elements at two-class specificity. */
+.shop-ai-reset .shop-ai-backdrop,
+.shop-ai-reset .shop-ai-menu-sep { display: block; }
 .shop-ai-reset svg { flex-shrink: 0; }
 .shop-ai-reset h2,
 .shop-ai-reset h3,
