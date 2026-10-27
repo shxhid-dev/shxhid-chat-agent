@@ -97,13 +97,21 @@ test("confidence tiers", () => {
   assert.equal(classifyMatch(s({ exactPart: true, typeHit: false }), {}), "high");
 });
 
-test("low confidence shows at most 3 cards, none shows nothing", () => {
+test("low confidence shows at most 4 cards; none still shows the closest typed products", () => {
   const photo = { ...M23_PHOTO, distinctiveTerms: ["M8", "angled", "PUR"] };
   const many = Array.from({ length: 8 }, (_, i) => ({ id: `c${i}`, title: `Generic angled connector ${i}`, sku: `X${i}`, description: "" }));
   const low = rankPhotoCandidates([{ products: many, queryIndex: 0 }], photo);
   assert.equal(low.confidence, "low");
-  assert.ok(low.products.length <= 3);
+  assert.ok(low.products.length <= 4);
 
+  // No distinctive term matches, but they are connectors: shown as the closest, unconfirmed.
+  const plain = [1, 2, 3, 4].map((i) => ({ id: `p${i}`, title: `Plain connector ${i}`, sku: `P${i}`, description: "" }));
+  const closest = rankPhotoCandidates([{ products: plain, queryIndex: 0 }], M23_PHOTO);
+  assert.equal(closest.confidence, "none");
+  assert.equal(closest.products.length, 3);
+  assert.match(closest.label, /not confirmed/);
+
+  // Nothing of the right type at all → no cards.
   const none = rankPhotoCandidates([{ products: [{ id: "z", title: "Siemens Circuit Breaker", sku: "5SL6", description: "" }], queryIndex: 0 }], M23_PHOTO);
   assert.equal(none.confidence, "none");
   assert.equal(none.products.length, 0);
@@ -126,9 +134,11 @@ test("scoreProduct penalises missing distinctive terms", () => {
   assert.ok(good > bad + 30, `${good} vs ${bad}`);
 });
 
-test("photoQueries falls back to brand + type", () => {
-  assert.deepEqual(photoQueries({ searchQueries: [], brand: "SMC", productType: "solenoid valve" }), ["SMC solenoid valve"]);
-  assert.equal(photoQueries({ ...M23_PHOTO, searchQueries: ["a b", "c d", "e f", "g h"] }).length, 3);
+test("photoQueries falls back to brand + type and always ends with the broad type", () => {
+  assert.deepEqual(photoQueries({ searchQueries: [], brand: "SMC", productType: "solenoid valve" }), ["SMC solenoid valve", "solenoid valve"]);
+  const many = photoQueries({ ...M23_PHOTO, searchQueries: ["aa b", "cc d", "ee f", "gg h", "ii j", "kk l", "mm n"] });
+  assert.equal(many.length, 6);
+  assert.equal(many.at(-1), "circular connector");
 });
 
 test("photoSearch: exact SKU short-circuits the query searches", async () => {
@@ -151,9 +161,11 @@ test("photoSearch: runs the queries in parallel, survives failing searches, neve
     return { products: [WEIDMULLER_M12, HARTING_M23_17], searchType: "algolia_search" };
   };
   const r = await photoSearch(M23_PHOTO, "shop.example", { searchFn });
-  assert.equal(calls.length, 2);
+  // the model's 2 queries + the broad type, then one product-line (family) query from the top hit
+  assert.deepEqual(r.queries.slice(0, 3), [...M23_PHOTO.searchQueries, "circular connector"]);
+  assert.ok(calls.length >= 3);
   assert.equal(r.products[0].id, "h1");
-  assert.deepEqual(r.queries, M23_PHOTO.searchQueries);
+  assert.equal(r.visualChecked, false);
 
   const notProduct = await photoSearch({ ...M23_PHOTO, isProductPhoto: false }, "shop.example", { searchFn });
   assert.equal(notProduct.confidence, "none");

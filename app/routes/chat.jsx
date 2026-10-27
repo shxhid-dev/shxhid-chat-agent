@@ -1,6 +1,14 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v2.8 (26 Oct 2026)
+ * Chat API Route — v2.9 (27 Oct 2026)
+ *
+ * CHANGES (v2.9):
+ *   1. Live status steps: thinking_state events now follow the real pipeline — "Analyzing your
+ *      image" → "Identifying the part" → "Searching the catalogue" → "Comparing matches" →
+ *      "Preparing your answer"; tool calls report "Searching the catalogue" / "Gathering product
+ *      details" / "Adding to cart". The widget animates each change.
+ *   2. Photo search v2: the photo is passed to photoSearch for visual verification
+ *      (image-intel compareProductImages); "none" now still shows the closest cards.
  *
  * CHANGES (v2.8) — grounding + photo matching:
  *   1. Photo turns run photo-search.server.js instead of the plain pre-pass: the analysis' search
@@ -62,7 +70,20 @@
 
 import { withCardsMarker, stripCardsMarker, specSnippet } from "../services/card-memory.server.js";
 
-const CHAT_VERSION = "2.8";
+const CHAT_VERSION = "2.9";
+
+// Status lines shown in the widget's typing indicator, sent as they actually happen.
+const STATUS = {
+  image: "Analyzing your image",
+  identify: "Identifying the part",
+  search: "Searching the catalogue",
+  compare: "Comparing matches",
+  details: "Gathering product details",
+  cart: "Adding to cart",
+  cartCheck: "Checking your cart",
+  answer: "Preparing your answer",
+  working: "Working on it",
+};
 
 // Pre-search paths whose results may be off-target. For these the catalog search tool stays
 // available so Claude can recover / be honest. Router v6 types algolia_category, algolia_multi
@@ -672,7 +693,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
   // Read the photo while the MCP servers connect (analyzeProductImage never throws).
   let photoAnalysisJob = null;
   if (image && imageIntel) {
-    send({ type: "thinking_state", state: "Reading your photo..." });
+    send({ type: "thinking_state", state: STATUS.image });
     photoAnalysisJob = imageIntel.analyzeProductImage(image, { caption: userMessage });
   }
 
@@ -926,6 +947,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     if (photoAnalysisJob) {
       const analysis = await photoAnalysisJob;
       photoAnalysis = analysis;
+      if (analysis?.isProductPhoto) send({ type: "thinking_state", state: STATUS.identify });
       const imageSearchText = imageIntel.buildImageSearchText(analysis);
       savedUserText = [imageIntel.buildPhotoMarker(analysis), userMessage].filter(Boolean).join(" ");
       queryText = [userMessage, imageSearchText].filter(Boolean).join(" ");
@@ -1000,7 +1022,11 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       // ── Photo pre-pass: candidate queries → scored against the photo → confidence ──
       try {
         const { photoSearch } = await import("../services/photo-search.server.js");
-        const match = await photoSearch(photoAnalysis, shopDomain);
+        const match = await photoSearch(photoAnalysis, shopDomain, {
+          image,
+          compareFn: imageIntel.compareProductImages,
+          onStage: (stage) => send({ type: "thinking_state", state: stage === "comparing" ? STATUS.compare : STATUS.search }),
+        });
         photoNote = imageIntel.buildPhotoNote(photoAnalysis, match);
         track("photoMatched", { conversationId, confidence: match.confidence, cards: match.products.length });
         if (match.products.length) {
@@ -1008,7 +1034,9 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
           const confident = match.confidence === "high" || match.confidence === "medium";
           smartResult = { products: shown, searchType: confident ? "photo_match" : "photo_match_low" };
           systemNote =
-            `[SYSTEM NOTE — NOT FROM USER] Products matching the customer's photo were found and product cards are ALREADY DISPLAYED, ranked by how well they fit the photo. ` +
+            `[SYSTEM NOTE — NOT FROM USER] Products matching the customer's photo were found and product cards are ALREADY DISPLAYED, ranked by how well they fit the photo` +
+            (match.visualChecked ? ` (each catalogue photo was compared with the customer's photo). ` : `. `) +
+            (match.confidence === "none" ? `None of them is a confirmed match: they are only the closest catalogue products. ` : ``) +
             (confident
               ? `Do NOT call the catalog search again. `
               : `You may call the catalog search ONCE if the photo clearly shows something these cards miss. `) +
@@ -1034,6 +1062,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
         if (advisory?.searchQuery && !photoHasPartNumber) {
           console.log(`[Chat] Advisory search query: "${advisory.searchQuery}" (customer wrote: "${queryText.slice(0, 80)}")`);
         }
+        send({ type: "thinking_state", state: STATUS.search });
         let smart = await smartSearch(searchInput, shopDomain, historyForSearch);
 
         if (smart && Array.isArray(smart.products) && smart.products.length > 0) {
@@ -1158,6 +1187,7 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
       currentAssistantMessage = null;
       console.log(`[Chat] Claude call #${loopCount} | history=${conversationHistory.length} messages`);
 
+      send({ type: "thinking_state", state: STATUS.answer });
       finalMessage = await claudeService.streamConversation(
         { messages: conversationHistory, promptType, tools: mcpClient.tools },
         {
@@ -1198,15 +1228,15 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
               console.log(`[Chat] Tool use: ${toolName} (id=${toolUseId})`);
 
               const thinkingStates = {
-                search_shop_catalog: "Searching products...",
-                search_catalog: "Searching products...",
-                search_products: "Searching products...",
-                update_cart: "Adding to cart...",
-                get_cart: "Checking availability...",
-                get_product: "Looking up product...",
-                get_product_details: "Looking up product details...",
+                search_shop_catalog: STATUS.search,
+                search_catalog: STATUS.search,
+                search_products: STATUS.search,
+                update_cart: STATUS.cart,
+                get_cart: STATUS.cartCheck,
+                get_product: STATUS.details,
+                get_product_details: STATUS.details,
               };
-              send({ type: "thinking_state", state: thinkingStates[toolName] || "Thinking..." });
+              send({ type: "thinking_state", state: thinkingStates[toolName] || STATUS.working });
               send({ type: "tool_use", tool_name: toolName });
               track("toolCalled", { conversationId, toolName, toolArgs });
 

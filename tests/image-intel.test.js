@@ -159,10 +159,19 @@ test("analyzeProductImage returns null on refusal, bad JSON or API errors", asyn
 test("normalizeAnalysis keeps search queries and distinctive terms, de-duplicated and capped", () => {
   const a = normalizeAnalysis({
     ...NAMEPLATE,
-    search_queries: ["M23 17 pin female connector", "m23 17 PIN female connector", "M23 connector", "x", "a b", "c d", "e f"],
+    search_queries: ["M23 17 pin female connector", "m23 17 PIN female connector", "M23 connector", "x", "a b", "c d", "e f", "g h", "i j"],
     distinctive_terms: ["M23", "17 pin", "female", "straight", "IP67", ""],
+    brand_guess: " IFM ",
+    function: "valve position feedback",
+    color: "orange",
+    connector: "M12 connector",
   });
-  assert.deepEqual(a.searchQueries, ["M23 17 pin female connector", "M23 connector", "a b", "c d"]);
+  assert.deepEqual(a.searchQueries, ["M23 17 pin female connector", "M23 connector", "a b", "c d", "e f", "g h"]);
+  assert.equal(a.brandGuess, "IFM");
+  assert.equal(a.function, "valve position feedback");
+  assert.equal(a.color, "orange");
+  assert.equal(a.connector, "M12 connector");
+  assert.equal(a.shape, "");
   assert.deepEqual(a.distinctiveTerms, ["M23", "17 pin", "female", "straight"]);
   assert.deepEqual(normalizeAnalysis(NAMEPLATE).searchQueries, []);
 });
