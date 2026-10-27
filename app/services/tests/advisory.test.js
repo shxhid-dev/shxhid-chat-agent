@@ -11,7 +11,7 @@ import {
   bodiesFor,
   maxGapFor,
   ADVISORY_TAG,
-} from "../app/services/advisory.server.js";
+} from "../advisory.server.js";
 
 const SAMPLE =
   "I need a sensor solution for detecting metal parts on a conveyor belt, about 5 mm away, 24V DC, in a dusty factory environment. Suggest the right sensor type, key specs to look for, and what to check before buying.";

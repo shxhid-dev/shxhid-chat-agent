@@ -1,4 +1,4 @@
-// app/services/image-intel.server.js — v1.1
+// app/services/image-intel.server.js — v1.2
 //
 // PHOTO SEARCH: the customer attaches a photo of a part or its nameplate; we read the brand,
 // part number and product type from it and hand that text to the normal search pipeline
@@ -9,6 +9,8 @@
 //   buildImageSearchText()— analysis → search text ("Siemens 3RT2026-1BB40 contactor")
 //   buildPhotoMarker()    — what we store in the DB instead of the image ("[Photo: …]")
 //   buildPhotoNote()      — [PHOTO ANALYSIS] note placed in the last user turn for Claude
+//   compareProductImages()— one vision call scoring how much each catalogue photo looks like the
+//                           customer's photo (visual verification for photo-search.server.js)
 //   createRateLimiter()   — per-conversation + global caps (vision calls cost more than text)
 //
 // The image itself is never stored: the DB keeps the marker text, so follow-up turns still
@@ -16,13 +18,15 @@
 //   IMAGE_UPLOAD=off                kill switch (the widget hides nothing; the API answers 400)
 //   IMAGE_INTEL_MODEL               default claude-opus-5-5
 //   IMAGE_INTEL_TIMEOUT_MS          default 25000
+//   IMAGE_COMPARE_MODEL             default IMAGE_INTEL_MODEL
+//   IMAGE_COMPARE_TIMEOUT_MS        default 25000
 //   IMAGE_MAX_BYTES                 default 3932160 (3.75 MB decoded = 5 MB base64, the API limit)
 //   IMAGE_MAX_PER_CONVERSATION_HOUR default 8
 //   IMAGE_MAX_PER_MINUTE            default 30 (all conversations together)
 
 import Anthropic from "@anthropic-ai/sdk";
 
-export const IMAGE_INTEL_VERSION = "1.1.0";
+export const IMAGE_INTEL_VERSION = "1.2.0";
 export const PHOTO_NOTE_TAG = "[PHOTO ANALYSIS — NOT FROM USER]";
 
 function intEnv(name, fallback) {
@@ -32,9 +36,11 @@ function intEnv(name, fallback) {
 
 const MAX_IMAGE_BYTES = intEnv("IMAGE_MAX_BYTES", 3932160);
 const ANALYSIS_TIMEOUT_MS = intEnv("IMAGE_INTEL_TIMEOUT_MS", 25000);
+const COMPARE_TIMEOUT_MS = intEnv("IMAGE_COMPARE_TIMEOUT_MS", 25000);
+const MAX_COMPARE = 8;
 const MAX_PART_NUMBERS = 3;
 const MAX_SPECS = 6;
-const MAX_QUERIES = 4;
+const MAX_QUERIES = 6;
 const MAX_TERMS = 4;
 
 export function isImageUploadEnabled() {
@@ -127,7 +133,16 @@ const ANALYSIS_SCHEMA = {
       items: { type: "string" },
       description: "Orderable part / order / type numbers exactly as printed, most likely first. No serial numbers, dates, certificate or batch numbers.",
     },
+    brand_guess: {
+      type: "string",
+      description: "If no brand is printed: the manufacturer the design most likely comes from (housing colour, shape, logo style), e.g. 'IFM' for an orange IFM-style housing. Used only to search, never shown as fact. Empty if you have no real idea.",
+    },
     product_type: { type: "string", description: "2-4 word product type, e.g. 'contactor', 'inductive proximity sensor', 'pneumatic cylinder'." },
+    function: { type: "string", description: "What the part is used for, in catalogue words, e.g. 'valve position feedback on quarter-turn actuators'. Empty if unclear." },
+    color: { type: "string", description: "Main housing colour, e.g. 'orange', 'grey'." },
+    shape: { type: "string", description: "Body shape, e.g. 'rectangular block', 'cylindrical threaded barrel'." },
+    connector: { type: "string", description: "Connection type, e.g. 'M12 connector', 'M8 connector', 'flying cable', 'screw terminals'." },
+    mounting: { type: "string", description: "Mounting style, e.g. 'two slotted holes', 'threaded body with nuts', 'DIN rail'." },
     key_specs: {
       type: "array",
       items: { type: "string" },
@@ -137,7 +152,7 @@ const ANALYSIS_SCHEMA = {
     search_queries: {
       type: "array",
       items: { type: "string" },
-      description: "2-4 catalogue search queries, most specific first, 2-6 words each, e.g. 'M23 17 pin female cable connector', 'M23 circular connector'. Include the brand only if it was read.",
+      description: "4-6 catalogue search queries, most specific first, 2-6 words each. Order: brand (or brand_guess) + part number if read; brand or brand_guess + the catalogue product name (e.g. 'IFM dual inductive valve sensor'); the product name alone; type + key visual / connector traits (e.g. 'rectangular inductive sensor M12'); the broad type.",
     },
     distinctive_terms: {
       type: "array",
@@ -148,7 +163,8 @@ const ANALYSIS_SCHEMA = {
     notes: { type: "string", description: "Short note for the sales assistant, e.g. 'label partly cut off' or 'photo is blurry'." },
   },
   required: [
-    "is_product_photo", "brand", "part_numbers", "product_type", "key_specs", "visible_text",
+    "is_product_photo", "brand", "brand_guess", "part_numbers", "product_type", "function",
+    "color", "shape", "connector", "mounting", "key_specs", "visible_text",
     "search_queries", "distinctive_terms", "confidence", "notes",
   ],
   additionalProperties: false,
@@ -160,6 +176,8 @@ Identify the product so the shop can search its catalogue:
 - Copy part numbers character by character, exactly as printed (keep dashes, dots, slashes and spaces inside the code). Never complete or guess characters you cannot read; leave a code out rather than invent one.
 - Prefer the orderable code (often labelled "Order No.", "Art.-Nr.", "Cat. No.", "Type", "Model", "MLFB", "P/N"). Leave out serial numbers, production dates, batch and certificate numbers.
 - Brand: use the printed name or logo. Do not infer a brand from the product's look alone.
+- brand_guess is different: when nothing is printed, say which manufacturer the design most likely comes from (housing colour, form factor, logo style). It is only used to search the catalogue.
+- Never give up on an unlabelled part: describe it the way a catalogue names it (by function, e.g. "dual inductive valve sensor", "quarter-turn valve position sensor"), plus its visual traits (colour, shape, connector, mounting).
 - Search queries: write them the way an industrial catalogue titles products (type + size / series designation + key variant), most specific first and a broader one last. Read the designation from the part itself (thread or body size like M8/M12/M23, pin count, port configuration like 5/2, bore and stroke) — when it is clearly visible, even without a label.
 - Distinctive terms: the few designations that separate the right product from similar ones (an M12 connector is not an M23 connector). Leave out generic words like "industrial" or "connector".
 - If the photo is not of a product (a person, a room, a screenshot of unrelated content), set is_product_photo to false and leave the other fields empty.`;
@@ -205,6 +223,12 @@ export function normalizeAnalysis(raw) {
   return {
     isProductPhoto: raw.is_product_photo !== false,
     brand: cleanString(raw.brand, 60),
+    brandGuess: cleanString(raw.brand_guess, 40),
+    function: cleanString(raw.function, 120),
+    color: cleanString(raw.color, 40),
+    shape: cleanString(raw.shape, 60),
+    connector: cleanString(raw.connector, 60),
+    mounting: cleanString(raw.mounting, 60),
     partNumbers,
     productType: cleanString(raw.product_type, 60),
     keySpecs: (Array.isArray(raw.key_specs) ? raw.key_specs : []).map((s) => cleanString(s, 40)).filter(Boolean).slice(0, MAX_SPECS),
@@ -263,7 +287,8 @@ export async function analyzeProductImage(image, { caption = "", client = getCli
     const analysis = normalizeAnalysis(JSON.parse(text));
     console.log(
       `[ImageIntel] ${model} | ${Date.now() - t0}ms | product=${analysis?.isProductPhoto} brand="${analysis?.brand}" ` +
-        `parts=[${analysis?.partNumbers.join(", ")}] type="${analysis?.productType}" confidence=${analysis?.confidence} ` +
+        `parts=[${analysis?.partNumbers.join(", ")}] type="${analysis?.productType}" guess="${analysis?.brandGuess}" ` +
+        `function="${analysis?.function}" traits="${[analysis?.color, analysis?.shape, analysis?.connector, analysis?.mounting].filter(Boolean).join(" / ")}" confidence=${analysis?.confidence} ` +
         `queries=${JSON.stringify(analysis?.searchQueries)} terms=${JSON.stringify(analysis?.distinctiveTerms)}`
     );
     return analysis;
@@ -275,6 +300,101 @@ export async function analyzeProductImage(image, { caption = "", client = getCli
     } else {
       console.warn(`[ImageIntel] Failed: ${error?.message} | ${Date.now() - t0}ms`);
     }
+    return null;
+  }
+}
+
+// ─── Visual verification ───────────────────────────────────────────────
+
+const COMPARE_SCHEMA = {
+  type: "object",
+  properties: {
+    matches: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          candidate: { type: "integer", description: "Candidate number as labelled (1-based)." },
+          visual_similarity: { type: "integer", description: "0-100: how much the catalogue photo looks like the customer's part (shape, colour, connector, mounting, markings). 100 = same product." },
+          same_product_type: { type: "boolean", description: "True if it is the same kind of product." },
+          likely_same_product: { type: "boolean", description: "True if it is very likely the exact same model." },
+        },
+        required: ["candidate", "visual_similarity", "same_product_type", "likely_same_product"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["matches"],
+  additionalProperties: false,
+};
+
+const COMPARE_SYSTEM = `You compare a customer's photo of an industrial part with catalogue product photos.
+Score each candidate on what you can see: body shape and proportions, colour, connector, mounting holes, markings and labels. Two products of the same type but a different form factor (e.g. rectangular vs cylindrical, M8 vs M12) are not the same product. Score every candidate.`;
+
+/** Smaller Shopify CDN renditions are plenty for comparison and keep the call fast. */
+function compareImageUrl(url) {
+  try {
+    const u = new URL(url);
+    if (/(^|\.)shopify\.com$/.test(u.hostname) || u.pathname.includes("/cdn/shop/")) u.searchParams.set("width", "400");
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * candidates: [{ title, imageUrl }] (max 8 used). Returns an array aligned with the candidates that
+ * were sent — { visual, sameType, sameProduct } or null per candidate — or null if the call failed.
+ */
+export async function compareProductImages(image, candidates, { client = getClient(), timeoutMs = COMPARE_TIMEOUT_MS } = {}) {
+  const list = (Array.isArray(candidates) ? candidates : []).slice(0, MAX_COMPARE);
+  if (!image?.data || !image?.mediaType || !list.some((c) => c?.imageUrl)) return null;
+  const t0 = Date.now();
+  const model = process.env.IMAGE_COMPARE_MODEL || process.env.IMAGE_INTEL_MODEL || "claude-opus-5-5";
+  const content = [
+    { type: "text", text: "Customer photo:" },
+    { type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } },
+  ];
+  list.forEach((c, i) => {
+    content.push({ type: "text", text: `Candidate ${i + 1}: ${String(c.title || "").slice(0, 120)}` });
+    if (c.imageUrl) content.push({ type: "image", source: { type: "url", url: compareImageUrl(c.imageUrl) } });
+    else content.push({ type: "text", text: "(no photo for this candidate — score it 0)" });
+  });
+  content.push({ type: "text", text: `Score all ${list.length} candidates against the customer photo.` });
+
+  try {
+    const response = await client.beta.messages.create(
+      {
+        model,
+        max_tokens: 4000,
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default",
+        output_config: { effort: "low", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
+        system: COMPARE_SYSTEM,
+        messages: [{ role: "user", content }],
+      },
+      { timeout: timeoutMs }
+    );
+    if (response.stop_reason === "refusal" || response.stop_reason === "max_tokens") {
+      console.warn(`[ImageIntel] compare stopped (${response.stop_reason}) | ${Date.now() - t0}ms`);
+      return null;
+    }
+    const text = (response.content || []).filter((b) => b?.type === "text").map((b) => b.text).join("");
+    const parsed = JSON.parse(text);
+    const out = list.map(() => null);
+    for (const m of Array.isArray(parsed?.matches) ? parsed.matches : []) {
+      const i = Number(m?.candidate) - 1;
+      if (!Number.isInteger(i) || i < 0 || i >= list.length) continue;
+      const visual = Math.max(0, Math.min(100, Math.round(Number(m.visual_similarity) || 0)));
+      out[i] = { visual, sameType: m.same_product_type !== false, sameProduct: m.likely_same_product === true };
+    }
+    console.log(
+      `[ImageIntel] compare ${model} | ${Date.now() - t0}ms | ` +
+        list.map((c, i) => `${String(c.title || "").slice(0, 28)}=${out[i]?.visual ?? "?"}`).join(", ")
+    );
+    return out;
+  } catch (error) {
+    console.warn(`[ImageIntel] compare failed: ${error?.message} | ${Date.now() - t0}ms`);
     return null;
   }
 }
@@ -326,6 +446,9 @@ export function buildPhotoNote(analysis, match = null) {
     `product type: ${analysis.productType || "unknown"}`,
   ];
   if (analysis.distinctiveTerms.length) lines.push(`identifying designations: ${analysis.distinctiveTerms.join(", ")}`);
+  const traits = [analysis.color, analysis.shape, analysis.connector, analysis.mounting].filter(Boolean);
+  if (traits.length) lines.push(`appearance: ${traits.join(", ")}`);
+  if (analysis.function) lines.push(`likely use: ${analysis.function}`);
   if (analysis.keySpecs.length) lines.push(`ratings on the part: ${analysis.keySpecs.join(", ")}`);
   if (analysis.visibleText) lines.push(`other text: ${analysis.visibleText}`);
   lines.push(`reading confidence: ${analysis.confidence}${analysis.notes ? ` (${analysis.notes})` : ""}`);
@@ -345,8 +468,9 @@ export function buildPhotoNote(analysis, match = null) {
         medium:
           "Say these are likely matches, name the best one, and ask ONE question that would confirm it (e.g. pin count, size, brand or the part number on the label).",
         low: "Say these are only possible matches, not confirmed. Ask for the part number, a sharp photo of the nameplate, or the key specs.",
-        none:
-          "No product in the catalogue fits this photo, and no cards are shown. Say what you could identify, say we don't list a match on the website, and ask for the part number, a nameplate photo or the key specs; offer websales@creativeautomation.ae.",
+        none: shown
+          ? "None of the shown cards is a confirmed match; they are only the closest catalogue products. Say what you could identify, say you couldn't confirm a match, name the closest card if it is plausible, and ask ONE question (part number, a nameplate photo, or the key spec that decides it)."
+          : "No product in the catalogue fits this photo, and no cards are shown. Say what you could identify, say we don't list a match on the website, and ask for the part number, a nameplate photo or the key specs; offer websales@creativeautomation.ae.",
       }[match.confidence] || ""
     );
   } else {
@@ -370,4 +494,5 @@ export default {
   buildImageSearchText,
   buildPhotoMarker,
   buildPhotoNote,
+  compareProductImages,
 };
