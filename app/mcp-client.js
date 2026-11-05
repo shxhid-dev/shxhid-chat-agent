@@ -7,7 +7,6 @@
  *     endpoints never become "//api/mcp" and the customer account host
  *     regex still matches.
  *   - JSON-RPC errors now keep the server's `data` field for debugging.
- *   - Cart quantity parsing uses an explicit radix.
  *
  * CHANGES (v2.3 — Sept 2026):
  *   - Shopify's UCP migration moved the catalog tools off /api/mcp.
