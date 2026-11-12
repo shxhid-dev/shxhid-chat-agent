@@ -29,7 +29,10 @@ export async function action({ request }) {
 
   try {
     const body = await request.json();
-    const { variantId, quantity = 1, cartId } = body;
+    const { variantId, cartId } = body;
+    // Whole units only, 1-999 ("abc" or 0 used to reach the Storefront API and come back as a 500).
+    const qty = Number.parseInt(body.quantity ?? 1, 10);
+    const quantity = Number.isFinite(qty) ? Math.min(999, Math.max(1, qty)) : 1;
 
     console.log(
       `[CartAPI] Request: variant=${variantId?.substring(0, 50)} ` +
@@ -55,11 +58,16 @@ export async function action({ request }) {
       );
     }
 
-    const result = await addToCart({
-      variantId,
-      quantity,
-      cartId: cartId || null
-    });
+    let result;
+    try {
+      result = await addToCart({ variantId, quantity, cartId: cartId || null });
+    } catch (cartError) {
+      // A completed or expired cart can't take new lines: start a fresh cart once instead of
+      // failing every Add to Cart for the rest of the session.
+      if (!cartId) throw cartError;
+      console.warn(`[CartAPI] Existing cart failed (${cartError.message}) — creating a new cart`);
+      result = await addToCart({ variantId, quantity, cartId: null });
+    }
 
     console.log(
       `[CartAPI] Success: cartId=${result.cartId?.substring(0, 30)}... ` +
@@ -82,7 +90,8 @@ export async function action({ request }) {
     return Response.json(
       {
         status: 'error',
-        message: error.message || 'Failed to add to cart'
+        // Upstream error text stays in the logs; the shopper gets a plain message.
+        message: 'Could not add this item to the cart. Please try again.'
       },
       {
         status: 500,
