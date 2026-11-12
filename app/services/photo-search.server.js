@@ -69,7 +69,8 @@ export function hasTerm(text, term) {
   const thread = /^m(\d+(?:\.\d+)?)(?: ?x ?\d+(?:\.\d+)?)?$/.exec(t);
   if (thread) {
     const size = thread[1].replace(".", "\\.");
-    return new RegExp(` m${size}(?: ?x ?\\d+(?:\\.\\d+)?)? `).test(hay);
+    // "/" separates sizes too: "M12/M8 adapter" shows M12.
+    return new RegExp(` m${size}(?: ?x ?\\d+(?:\\.\\d+)?)? `).test(hay.replace(/\//g, " "));
   }
   if (hay.includes(` ${t} `)) return true;
   // plural/singular of the last word ("connector" ↔ "connectors")
@@ -77,9 +78,39 @@ export function hasTerm(text, term) {
   const last = words[words.length - 1];
   const alt = [...words.slice(0, -1), singular(last) === last ? `${last}s` : singular(last)].join(" ");
   if (hay.includes(` ${alt} `)) return true;
-  // "17pin" / "17-pin": compare without separators, only for mixed letter+digit terms
+  // "17pin" / "17-pin": compare without separators, only for mixed letter+digit terms. The match
+  // must not continue a number: "7 pin" is not in "17-pin", nor "32 mm" in "132mm".
   const c = compact(term);
-  return c.length >= 4 && /\d/.test(c) && /[a-z]/.test(c) && compact(text).includes(c);
+  if (c.length < 4 || !/\d/.test(c) || !/[a-z]/.test(c)) return false;
+  const ct = compact(text);
+  for (let i = ct.indexOf(c); i !== -1; i = ct.indexOf(c, i + 1)) {
+    const before = ct[i - 1];
+    const after = ct[i + c.length];
+    const joinsBefore = before !== undefined && /\d/.test(before) && /^\d/.test(c);
+    const joinsAfter = after !== undefined && /\d/.test(after) && /\d$/.test(c);
+    if (!joinsBefore && !joinsAfter) return true;
+  }
+  return false;
+}
+
+/** True when a part number appears in the title as a whole code ("IN5225", not "IN52250"). */
+function titleHasCode(title, code) {
+  const tokens = String(title ?? "").split(/[\s,;()[\]]+/).map(compact).filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === code) return true;
+    // A code printed with an inner space: "6ES7 214-1AG40-0XB0"
+    if (i + 1 < tokens.length && tokens[i] + tokens[i + 1] === code) return true;
+  }
+  return false;
+}
+
+/**
+ * The part of a title that names the product: before " for ", " with ", "," or "(".
+ * "Connection cable for IFM IN5225" → "Connection cable"; "IFM IN5225 - Dual Inductive Sensor,
+ * M12 connector" → "IFM IN5225 - Dual Inductive Sensor".
+ */
+function titleHead(title) {
+  return String(title ?? "").split(/\s(?:for|with|incl\.?|including)\s|[,(]/i)[0];
 }
 
 /** Last meaningful word of the product type: "inductive proximity sensor" → "sensor". */
@@ -165,10 +196,17 @@ export function scoreProduct(product, analysis, source = {}) {
   let score = 0;
   let exactPart = !!source.exactSku;
 
+  // "Sensor Connector …" or "Connection cable for IN5225" is an accessory, not the product —
+  // unless the photo itself shows a connector / cable / bracket. Only the title's head counts:
+  // "Dual Inductive Sensor, M12 connector" is a sensor.
+  const accessory = ACCESSORY_RE.test(titleHead(title)) && !ACCESSORY_RE.test(analysis?.productType || "");
+
   for (const pn of analysis?.partNumbers || []) {
     const c = compact(pn);
     if (c.length < 4) continue;
-    if (compact(sku) === c || (c.length >= 5 && compact(titleAndSku).includes(c))) {
+    // Whole codes only: "3RT2026-1BB40" is not "3RT2026-1BB40-0CC0", and a cable whose title
+    // mentions the sensor's code is not that sensor.
+    if (compact(sku) === c || (c.length >= 5 && !accessory && titleHasCode(title, c))) {
       exactPart = true;
     } else if (c.length >= 6 && compact(sku).startsWith(c.slice(0, Math.ceil(c.length * 0.7)))) {
       score += 35; // same series / family
@@ -202,9 +240,6 @@ export function scoreProduct(product, analysis, source = {}) {
   score += Math.min(fnHits, 2) * 6;
 
   const noun = typeNoun(analysis?.productType);
-  // "Sensor Connector …" or "Sensor Cable …" is an accessory of a sensor, not a sensor — unless the
-  // photo itself shows a connector / cable / bracket.
-  const accessory = ACCESSORY_RE.test(title) && !ACCESSORY_RE.test(analysis?.productType || "");
   const typeHit = !accessory && (!noun || hasTerm(title, noun) || hasTerm(product?.productType || "", noun));
   score += typeHit ? 10 : accessory ? -20 : -10;
 
@@ -229,19 +264,28 @@ export function classifyMatch(top, analysis) {
   if (top.exactPart) return "high";
   if (!top.typeHit) return "none";
   const terms = top.termsTotal;
-  const brandOk = top.brandHit || !analysis?.brand;
-  if (terms > 0 && top.termsHit === terms && brandOk) return "high";
-  if (terms > 0 ? top.termsHit >= Math.ceil(terms / 2) : top.brandHit) return "medium";
+  // Without a part number, "high" needs every distinctive term plus the printed brand, or (when
+  // no brand was printed) at least three terms. An unlabelled photo matching only "M12" is not
+  // a confirmed model; "M23 + 17 pin + female" is.
+  const allTerms = terms >= 2 && top.termsHit === terms;
+  if (allTerms && (top.brandHit || (!analysis?.brand && terms >= 3))) return "high";
+  if (allTerms || (terms > 0 ? top.termsHit >= Math.ceil(terms / 2) : top.brandHit)) return "medium";
   return "low";
 }
 
-/** Confidence from the visual check of the top card. */
-export function classifyVisual(top) {
+/**
+ * Confidence from the visual check of the top card. Siblings look alike (IN5224 vs IN5225), so
+ * "high" without a part number needs the model to call it the same product, or a clear lead
+ * (10+ points) over the runner-up; otherwise it is "medium" and Claude asks one question.
+ */
+export function classifyVisual(top, runnerUp = null) {
   if (!top) return "none";
   if (top.s.exactPart) return "high";
   const v = top.v;
   if (!v) return "none";
-  if (v.visual >= 80 && v.sameType) return "high";
+  const clearLead = !runnerUp?.v || v.visual - runnerUp.v.visual >= 10;
+  if (v.visual >= 80 && v.sameType && (v.sameProduct || clearLead)) return "high";
+  if (v.visual >= 80 && v.sameType) return "medium";
   if (v.visual >= 60 && v.sameType) return "medium";
   if (v.visual >= 40) return "low";
   return "none";
@@ -313,7 +357,8 @@ export function rankPhotoCandidates(candidates, analysis) {
 
   let confidence = classifyMatch(kept[0]?.s, analysis);
   if (!kept.length) {
-    // Nothing confident: still show the closest typed products and let Claude ask.
+    // Nothing confident: still show the closest typed products and let Claude ask. Products of
+    // another type (a breaker for a connector photo) are never shown as "closest".
     kept = typed.slice(0, MAX_CLOSEST);
     confidence = "none";
   }
@@ -337,12 +382,13 @@ export function rankWithVisual(shortlist, visual, analysis) {
     .map((x, i) => {
       const v = visual[i] || null;
       const textNorm = ((x.s.score - minT) / span) * 100;
-      const final = x.s.exactPart ? 100 + (v?.visual ?? 0) / 100 : v ? VISUAL_WEIGHT * v.visual + (1 - VISUAL_WEIGHT) * textNorm : (1 - VISUAL_WEIGHT) * textNorm;
+      // A candidate the model did not score counts as visual 0, so it can't outrank scored ones.
+      const final = x.s.exactPart ? 100 + (v?.visual ?? 0) / 100 : VISUAL_WEIGHT * (v?.visual ?? 0) + (1 - VISUAL_WEIGHT) * textNorm;
       return { ...x, v, final };
     })
     .sort((a, b) => b.final - a.final);
 
-  const confidence = classifyVisual(scored[0]);
+  const confidence = classifyVisual(scored[0], scored[1]);
   let kept;
   if (confidence === "none") kept = scored.slice(0, MAX_CLOSEST);
   else {
@@ -354,10 +400,16 @@ export function rankWithVisual(shortlist, visual, analysis) {
   return { products: toCards(kept, confidence, { visual: true }), confidence, label, reasons: reasonsFor(top, analysis) };
 }
 
-/** Best candidates for the visual check: top by text score, with photos, at most 8. */
+/**
+ * Best candidates for the visual check: exact part-number hits always (even without a photo,
+ * or the right IN5225 was dropped for a sibling that has one), then the top by text score with
+ * photos, at most 8.
+ */
 export function pickShortlist(merged, max = MAX_VISUAL) {
-  const withImage = merged.filter((x) => typeof x.product?.image_url === "string" && x.product.image_url.startsWith("http"));
-  return (withImage.length ? withImage : merged).slice(0, max);
+  const exact = merged.filter((x) => x.s?.exactPart);
+  const rest = merged.filter((x) => !x.s?.exactPart);
+  const withImage = rest.filter((x) => typeof x.product?.image_url === "string" && x.product.image_url.startsWith("http"));
+  return [...exact, ...(withImage.length ? withImage : rest)].slice(0, max);
 }
 
 // ─── Orchestration ─────────────────────────────────────────────────────
@@ -450,9 +502,20 @@ export async function photoSearch(analysis, shopDomain, { searchFn, image = null
     if (image && typeof compareFn === "function") {
       const shortlist = pickShortlist(merged);
       stage("comparing");
-      const visual = await compareFn(
-        image,
-        shortlist.map((x) => ({ title: x.product.title, imageUrl: x.product.image_url }))
+      // Part numbers and what was read from the photo let the model tell look-alike siblings
+      // apart (M8 vs M12, 4 vs 5 pin) instead of judging the shape alone.
+      const hints = [
+        analysis.partNumbers?.length ? `part number ${analysis.partNumbers.join(", ")}` : "",
+        (analysis.distinctiveTerms || []).join(", "),
+        analysis.connector ? `connector ${analysis.connector}` : "",
+        analysis.shape ? `shape ${analysis.shape}` : "",
+      ].filter(Boolean).join("; ");
+      const visual = await Promise.resolve(
+        compareFn(
+          image,
+          shortlist.map((x) => ({ title: x.product.title, imageUrl: x.product.image_url, sku: x.product.sku })),
+          { hints }
+        )
       ).catch(() => null);
       if (Array.isArray(visual) && visual.some(Boolean)) {
         ranked = { ...rankWithVisual(shortlist, visual, analysis), visualChecked: true };
