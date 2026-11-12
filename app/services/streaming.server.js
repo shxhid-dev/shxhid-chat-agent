@@ -19,6 +19,8 @@ export function createStreamManager(encoder, controller) {
       const text = `data: ${JSON.stringify(data)}\n\n`;
       controller.enqueue(encoder.encode(text));
     } catch (error) {
+      // The shopper closed the widget: the stream is gone, nothing to report.
+      if (error?.code === 'ERR_INVALID_STATE') return;
       console.error('Error sending stream message:', error);
     }
   };
@@ -41,6 +43,7 @@ export function createStreamManager(encoder, controller) {
     try {
       controller.close();
     } catch (error) {
+      if (error?.code === 'ERR_INVALID_STATE') return;
       console.error('Error closing stream:', error);
     }
   };
@@ -88,19 +91,26 @@ export function createStreamManager(encoder, controller) {
  */
 export function createSseStream(streamHandler) {
   const encoder = new TextEncoder();
-  
+  // Aborted when the shopper closes the widget or the connection drops, so the handler can
+  // stop calling Claude and the tools for a reply nobody will read.
+  const abort = new AbortController();
+
   return new ReadableStream({
     async start(controller) {
       const streamManager = createStreamManager(encoder, controller);
-      
+      streamManager.signal = abort.signal;
+
       try {
         await streamHandler(streamManager);
       } catch (error) {
-        streamManager.handleStreamingError(error);
+        if (!abort.signal.aborted) streamManager.handleStreamingError(error);
       } finally {
         streamManager.closeStream();
       }
-    }
+    },
+    cancel() {
+      abort.abort();
+    },
   });
 }
 

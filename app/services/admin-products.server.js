@@ -26,6 +26,7 @@ const SKU_SEARCH_QUERY = `
           id
           title
           handle
+          status
           vendor
           tags
           descriptionHtml
@@ -78,6 +79,12 @@ const ADMIN_TEXT_SEARCH_QUERY = `
   }
 `;
 
+// Draft and archived products (3,573 drafts) are invisible on the storefront: their card links
+// 404 and Add to Cart fails. The variant search has no working status filter, so filter here.
+function activeOnly(variants) {
+  return (Array.isArray(variants) ? variants : []).filter((v) => !v?.product?.status || v.product.status === "ACTIVE");
+}
+
 export async function searchBySku(shopDomain, sku) {
   const skuTrim = String(sku).trim();
   console.log(`[AdminProducts] SKU search: sku:${skuTrim}`);
@@ -89,7 +96,7 @@ export async function searchBySku(shopDomain, sku) {
       shopDomain,
     });
 
-    let variants = data?.productVariants?.nodes || [];
+    let variants = activeOnly(data?.productVariants?.nodes);
 
     const skuUpper = skuTrim.toUpperCase();
     const exact = variants.filter((v) => v.sku && v.sku.toUpperCase() === skuUpper);
@@ -110,7 +117,7 @@ export async function searchBySku(shopDomain, sku) {
         variables: { skuQuery: `sku:${prefix}*`, first: 10 },
         shopDomain,
       });
-      variants = data?.productVariants?.nodes || [];
+      variants = activeOnly(data?.productVariants?.nodes);
       if (variants.length > 0) {
         console.log(`[AdminProducts] wildcard SKU matches for "${prefix}*": ${variants.length}`);
         return { type: "wildcard", variants, originalSku: skuTrim, prefix };
@@ -153,7 +160,7 @@ async function _runAdminSearch(searchQuery, shopDomain) {
   console.log(`[AdminProducts] text search: "${searchQuery}"`);
   const data = await shopifyAdminGraphqlQuery({
     query: ADMIN_TEXT_SEARCH_QUERY,
-    variables: { q: searchQuery, first: 10 },
+    variables: { q: `status:active AND (${searchQuery})`, first: 10 },
     shopDomain,
   });
   const nodes = data?.products?.nodes || [];

@@ -7,7 +7,8 @@ export async function loader({ request }) {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
-  const [conversationId, shopId] = state.split("-");
+  if (!state) return new Response("Missing state", { status: 400 });
+  const [conversationId, shopId] = splitState(state);
 
   if (!code) {
     return new Response(JSON.stringify({ error: "Authorization code is missing" }), { status: 400 });
@@ -91,7 +92,7 @@ export async function loader({ request }) {
  */
 async function exchangeCodeForToken(code, state) {
   const clientId = process.env.SHOPIFY_API_KEY;
-  const [conversationId, shopId] = state.split("-");
+  const [conversationId, shopId] = splitState(state);
   if (!clientId || !shopId) {
     throw new Error("SHOPIFY_API_KEY is required and shopId must be present in state parameter");
   }
@@ -165,4 +166,14 @@ async function exchangeCodeForToken(code, state) {
 async function getTokenUrl(conversationId) {
   const { tokenUrl } = await getCustomerAccountUrls(conversationId);
   return tokenUrl;
+}
+
+/**
+ * state is "<conversationId>-<shopId>". Split on the LAST hyphen: server-made conversation ids
+ * ("conv_<uuid>") contain hyphens, and split("-") looked up the wrong conversation.
+ */
+function splitState(state) {
+  const s = String(state || "");
+  const i = s.lastIndexOf("-");
+  return i === -1 ? [s, ""] : [s.slice(0, i), s.slice(i + 1)];
 }

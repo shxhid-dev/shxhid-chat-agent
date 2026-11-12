@@ -69,7 +69,9 @@ export function parseImagePayload(raw, { maxBytes = MAX_IMAGE_BYTES } = {}) {
   let data = typeof raw === "string" ? raw : raw?.data;
   if (typeof data !== "string" || !data) return { ok: false, status: 400, error: "Image data is missing" };
 
-  const dataUrl = /^data:([\w/+.-]+);base64,/i.exec(data);
+  data = data.trim();
+  // data:image/png;base64,… and data:image/png;name=a.png;base64,…
+  const dataUrl = /^data:[\w/+.-]+(?:;[\w.+-]+=[^;,]*)*;base64,/i.exec(data);
   if (dataUrl) data = data.slice(dataUrl[0].length);
   data = data.replace(/\s+/g, "");
 
@@ -84,7 +86,8 @@ export function parseImagePayload(raw, { maxBytes = MAX_IMAGE_BYTES } = {}) {
   const mediaType = sniffImageType(buf);
   if (!mediaType) return { ok: false, status: 415, error: "Only JPEG, PNG, WebP or GIF photos are supported" };
 
-  return { ok: true, image: { mediaType, data, bytes: buf.length } };
+  // Re-encoded from the decoded bytes: a string with bad padding decodes here but the API rejects it.
+  return { ok: true, image: { mediaType, data: buf.toString("base64"), bytes: buf.length } };
 }
 
 // ─── Rate limiting ─────────────────────────────────────────────────────
@@ -93,6 +96,11 @@ export function parseImagePayload(raw, { maxBytes = MAX_IMAGE_BYTES } = {}) {
 export function createRateLimiter({ max, windowMs, now = () => Date.now() }) {
   const hits = new Map();
   return {
+    /** True if one more hit fits, without recording it. */
+    peek(key) {
+      const t = now();
+      return (hits.get(key) || []).filter((ts) => t - ts < windowMs).length < max;
+    },
     allow(key) {
       const t = now();
       const recent = (hits.get(key) || []).filter((ts) => t - ts < windowMs);
@@ -115,7 +123,11 @@ const globalLimiter = createRateLimiter({ max: intEnv("IMAGE_MAX_PER_MINUTE", 30
 
 /** True if this conversation may send another photo now. */
 export function allowImageUpload(conversationId) {
-  return perConversation.allow(String(conversationId || "anon")) && globalLimiter.allow("all");
+  const key = String(conversationId || "anon");
+  // Both limits are checked before either is charged: a photo refused by the global limit
+  // used to spend one of the conversation's 8 hourly slots anyway.
+  if (!perConversation.peek(key) || !globalLimiter.peek("all")) return false;
+  return perConversation.allow(key) && globalLimiter.allow("all");
 }
 
 // ─── Vision call ───────────────────────────────────────────────────────
@@ -329,7 +341,7 @@ const COMPARE_SCHEMA = {
 };
 
 const COMPARE_SYSTEM = `You compare a customer's photo of an industrial part with catalogue product photos.
-Score each candidate on what you can see: body shape and proportions, colour, connector, mounting holes, markings and labels. Two products of the same type but a different form factor (e.g. rectangular vs cylindrical, M8 vs M12) are not the same product. Score every candidate.`;
+Score each candidate on what you can see: body shape and proportions, colour, connector, mounting holes, markings and labels. Two products of the same type but a different form factor (e.g. rectangular vs cylindrical, M8 vs M12) are not the same product. Use the part numbers and the details read from the customer's photo to tell look-alike siblings apart (pin count, thread size, connector type): set likely_same_product only when nothing visible contradicts it. Score every candidate.`;
 
 /** Smaller Shopify CDN renditions are plenty for comparison and keep the call fast. */
 function compareImageUrl(url) {
@@ -346,7 +358,7 @@ function compareImageUrl(url) {
  * candidates: [{ title, imageUrl }] (max 8 used). Returns an array aligned with the candidates that
  * were sent — { visual, sameType, sameProduct } or null per candidate — or null if the call failed.
  */
-export async function compareProductImages(image, candidates, { client = getClient(), timeoutMs = COMPARE_TIMEOUT_MS } = {}) {
+export async function compareProductImages(image, candidates, { client = getClient(), timeoutMs = COMPARE_TIMEOUT_MS, hints = "" } = {}) {
   const list = (Array.isArray(candidates) ? candidates : []).slice(0, MAX_COMPARE);
   if (!image?.data || !image?.mediaType || !list.some((c) => c?.imageUrl)) return null;
   const t0 = Date.now();
@@ -355,8 +367,10 @@ export async function compareProductImages(image, candidates, { client = getClie
     { type: "text", text: "Customer photo:" },
     { type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } },
   ];
+  if (hints) content.push({ type: "text", text: `Read from the customer photo: ${String(hints).slice(0, 300)}` });
   list.forEach((c, i) => {
-    content.push({ type: "text", text: `Candidate ${i + 1}: ${String(c.title || "").slice(0, 120)}` });
+    const pn = c.sku && !String(c.title || "").includes(c.sku) ? ` (part no. ${String(c.sku).slice(0, 40)})` : "";
+    content.push({ type: "text", text: `Candidate ${i + 1}: ${String(c.title || "").slice(0, 120)}${pn}` });
     if (c.imageUrl) content.push({ type: "image", source: { type: "url", url: compareImageUrl(c.imageUrl) } });
     else content.push({ type: "text", text: "(no photo for this candidate — score it 0)" });
   });
@@ -373,7 +387,7 @@ export async function compareProductImages(image, candidates, { client = getClie
         system: COMPARE_SYSTEM,
         messages: [{ role: "user", content }],
       },
-      { timeout: timeoutMs }
+      { timeout: timeoutMs, maxRetries: 0 } // optional step: on failure the text ranking is used
     );
     if (response.stop_reason === "refusal" || response.stop_reason === "max_tokens") {
       console.warn(`[ImageIntel] compare stopped (${response.stop_reason}) | ${Date.now() - t0}ms`);
@@ -386,6 +400,7 @@ export async function compareProductImages(image, candidates, { client = getClie
       const i = Number(m?.candidate) - 1;
       if (!Number.isInteger(i) || i < 0 || i >= list.length) continue;
       const visual = Math.max(0, Math.min(100, Math.round(Number(m.visual_similarity) || 0)));
+      if (out[i] && out[i].visual >= visual) continue; // a candidate scored twice keeps its best score
       out[i] = { visual, sameType: m.same_product_type !== false, sameProduct: m.likely_same_product === true };
     }
     console.log(

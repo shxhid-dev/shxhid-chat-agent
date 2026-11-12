@@ -1,6 +1,14 @@
 // app/services/claude.server.js
 /**
- * Claude Service — v5.0 (26 Oct 2026)
+ * Claude Service — v5.1 (12 Nov 2026)
+ *
+ * CHANGES (v5.1):
+ *   - max_tokens 4096 → 16000 (thinking counts toward it; long replies were cut off).
+ *   - Prompt caching on the system prompt + tools, and output_config.effort (CHAT_EFFORT,
+ *     default medium). Retried once without them if the API rejects them.
+ *   - Tools sent sorted and de-duplicated (stable cache prefix; no duplicate-name 400s).
+ *   - Tool calls run only on stop_reason "tool_use"; the call is cancelled when the shopper leaves.
+ *   - Usage (incl. cache reads) logged per call.
  *
  * CHANGES (v5.0):
  *   - creativeAutomationAssistant rewritten as "TIA": grounding rules first (every product fact
@@ -26,6 +34,29 @@
  */
 import Anthropic from "@anthropic-ai/sdk";
 
+// Effort for the chat model: "low" | "medium" | "high". "off" sends neither effort nor
+// caching (the pre-v5.1 request). Medium keeps tool use accurate with a shorter pause
+// than the model's default (high).
+const CHAT_EFFORT = (() => {
+  const v = String(process.env.CHAT_EFFORT || "medium").trim().toLowerCase();
+  return ["low", "medium", "high", "off"].includes(v) ? v : "medium";
+})();
+// Turned off for the rest of the process if the API ever rejects the extras.
+let useExtras = CHAT_EFFORT !== "off";
+
+/**
+ * Tools in a fixed order with unique names. MCP servers connect in parallel and append in
+ * whatever order they answer, which changed the cached prefix on every request; a duplicate
+ * name (a late MCP connect next to the local search_catalog) makes the API return a 400.
+ */
+function sortedUniqueTools(tools) {
+  const byName = new Map();
+  for (const t of Array.isArray(tools) ? tools : []) {
+    if (t?.name && !byName.has(t.name)) byName.set(t.name, t);
+  }
+  return [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
 export function createClaudeService() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
@@ -38,7 +69,7 @@ export function createClaudeService() {
 
   return {
     async streamConversation(config, callbacks) {
-      const { messages, promptType = "standardAssistant", tools = [] } = config;
+      const { messages, promptType = "standardAssistant", tools = [], signal = null } = config;
       const { onText, onMessage, onToolUse, onContentBlock } = callbacks;
 
       try {
@@ -55,53 +86,82 @@ export function createClaudeService() {
         // Query-rewriting (query-intelligence.server.js) deliberately uses
         // Haiku — that task is single-shot and ~20-token output, where
         // Haiku's latency/cost wins matter and Sonnet wouldn't help.
-        const apiParams = {
+        const baseParams = {
           model: "claude-sonnet-5",
-          max_tokens: 4096,
+          // Thinking tokens count toward this cap; 4096 cut long advisory replies short.
+          max_tokens: 16000,
           system: systemPrompt,
           messages,
           stream: true,
         };
 
-        if (tools && tools.length > 0) {
-          apiParams.tools = tools;
-        }
+        const toolList = sortedUniqueTools(tools);
+        if (toolList.length > 0) baseParams.tools = toolList;
 
-        console.log(`[Claude] Calling API | model=${apiParams.model} | messages=${messages.length} | tools=${(tools || []).length}`);
+        // Optional extras: prompt caching (the system prompt + ~17 tool schemas are re-sent on
+        // every call, up to 6 per turn) and a lower effort (shorter silent pause before the
+        // first word). If the API ever rejects them, the call is retried once without them.
+        const apiParams = useExtras
+          ? {
+              ...baseParams,
+              system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+              cache_control: { type: "ephemeral" },
+              output_config: { effort: CHAT_EFFORT },
+            }
+          : baseParams;
 
-        const stream = await client.messages.stream(apiParams);
+        console.log(`[Claude] Calling API | model=${apiParams.model} | messages=${messages.length} | tools=${toolList.length}${useExtras ? ` | effort=${CHAT_EFFORT}` : ""}`);
 
-        let currentMessage = {
-          role: "assistant",
-          content: [],
-          stop_reason: null,
+        let streamedText = false;
+        const run = (params) => {
+          const stream = client.messages.stream(params, signal ? { signal } : undefined);
+          stream.on("text", (textDelta) => {
+            streamedText = true;
+            if (onText) onText(textDelta);
+          });
+          stream.on("content_block_stop", (event) => {
+            if (onContentBlock) onContentBlock(event.content_block);
+          });
+          return stream.finalMessage();
         };
 
-        stream.on("text", (textDelta) => {
-          if (onText) onText(textDelta);
-        });
+        let finalMessage;
+        try {
+          finalMessage = await run(apiParams);
+        } catch (firstErr) {
+          const retryable =
+            apiParams !== baseParams &&
+            !streamedText &&
+            firstErr instanceof Anthropic.BadRequestError &&
+            !/credit balance/i.test(firstErr.message || "");
+          if (!retryable) throw firstErr;
+          useExtras = false;
+          console.error(`[Claude] Request rejected with caching/effort (${firstErr.message}) — retrying without them; set CHAT_EFFORT=off to stop sending them`);
+          finalMessage = await run(baseParams);
+        }
 
-        stream.on("content_block_stop", (event) => {
-          if (onContentBlock) onContentBlock(event.content_block);
-        });
+        const currentMessage = {
+          role: "assistant",
+          content: finalMessage.content,
+          stop_reason: finalMessage.stop_reason,
+        };
 
-        stream.on("message_delta", (event) => {
-          if (event.delta?.stop_reason) {
-            currentMessage.stop_reason = event.delta.stop_reason;
-          }
-        });
-
-        const finalMessage = await stream.finalMessage();
-        currentMessage.content = finalMessage.content;
-        currentMessage.stop_reason = finalMessage.stop_reason;
-
-        console.log(`[Claude] Response received | stop_reason=${currentMessage.stop_reason} | blocks=${Array.isArray(finalMessage.content) ? finalMessage.content.length : 1}`);
+        const u = finalMessage.usage || {};
+        console.log(
+          `[Claude] Response received | stop_reason=${currentMessage.stop_reason} | blocks=${Array.isArray(finalMessage.content) ? finalMessage.content.length : 1}` +
+          ` | in=${u.input_tokens ?? "?"} cache_read=${u.cache_read_input_tokens ?? 0} cache_write=${u.cache_creation_input_tokens ?? 0} out=${u.output_tokens ?? "?"}`
+        );
 
         if (onMessage) await onMessage(currentMessage);
 
-        const toolUses = (finalMessage.content || []).filter((c) => c.type === "tool_use");
-        for (const toolUse of toolUses) {
-          if (onToolUse) await onToolUse(toolUse);
+        // Tool calls only run when Claude actually stopped to use them. On max_tokens a
+        // tool_use block can be cut off mid-input (e.g. update_cart with half its lines).
+        if (finalMessage.stop_reason === "tool_use") {
+          const toolUses = (finalMessage.content || []).filter((c) => c.type === "tool_use");
+          for (const toolUse of toolUses) {
+            if (signal?.aborted) break;
+            if (onToolUse) await onToolUse(toolUse);
+          }
         }
 
         return currentMessage;

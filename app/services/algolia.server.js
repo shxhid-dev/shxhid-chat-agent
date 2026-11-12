@@ -37,6 +37,8 @@
  * 5-minute LRU cache, [SearchAudit] line (pool/rescued appended).
  */
 
+import { pickHeadNoun } from './query-terms.server.js';
+
 let _client = null;
 
 // ---------------------------------------------------------------------------
@@ -348,12 +350,24 @@ function isValidImageUrl(value) {
 // ---------------------------------------------------------------------------
 
 // Numeric+unit tokens: "60mm", "60 mm", "24V", "IP67", "M12".
+// Spec notation varies between customers and titles: "24VDC", "24 V DC", "DC 24V", "24 volts".
+// Both sides are normalised to "24vdc" before matching.
+function normSpecText(text) {
+  return String(text ?? '')
+    .replace(/(\d)\s*volts?\b/gi, '$1v')
+    .replace(/(\d)\s*v\s*(?:ac\s*\/\s*dc|dc\s*\/\s*ac|uc)\b/gi, '$1v') // universal supply: fits AC and DC
+    .replace(/(\d)\s*v\s*(d|a)\s*\.?\s*c\b/gi, '$1v$2c')
+    .replace(/\b(dc|ac)\s*(\d+(?:\.\d+)?)\s*v\b/gi, '$2v$1');
+}
+
 function extractSpecTokens(query) {
   if (!query || typeof query !== "string") return [];
+  const text = normSpecText(query);
   const tokens = [];
-  const re = /(\d+(?:\.\d+)?)\s*(mm|cm|m|inch|in|"|v|vdc|vac|a|w|kw|hz|khz|°c|c)\b/gi;
+  // Number boundaries on both sides: "2.5mm" is 2.5 mm, never 5 mm; "2.5mm2" is a cable size.
+  const re = /(?<![\d.])(\d+(?:\.\d+)?)\s*(mm|cm|m|inch|in|vdc|vac|v|kw|w|a|khz|hz|°c|c|bar|psi)(?![a-z0-9])/gi;
   let m;
-  while ((m = re.exec(query)) !== null) {
+  while ((m = re.exec(text)) !== null) {
     tokens.push({
       value: parseFloat(m[1]),
       unit: m[2].toLowerCase().replace("°c", "c"),
@@ -361,15 +375,33 @@ function extractSpecTokens(query) {
     });
   }
   const ipRe = /\bIP(\d{2})\b/gi;
-  while ((m = ipRe.exec(query)) !== null) {
+  while ((m = ipRe.exec(text)) !== null) {
     tokens.push({ value: parseInt(m[1]), unit: "ip", raw: `ip${m[1]}` });
   }
-  // M-thread codes are categorical (M8 vs M10 are different products).
-  const mRe = /\bM(\d{1,2})\b/g;
-  while ((m = mRe.exec(query)) !== null) {
+  // M-thread codes are categorical (M8 vs M10 are different products). "M12x1" is an M12.
+  const mRe = /\bM(\d{1,2})(?:x[\d.]+)?(?!\d)/gi;
+  while ((m = mRe.exec(text)) !== null) {
     tokens.push({ value: parseInt(m[1]), unit: "m_thread", raw: `m${m[1]}` });
   }
   return tokens;
+}
+
+// Units that name the same quantity: "24V" in a query accepts "24 V DC" in a title, and
+// "0.75kW" accepts "750 W".
+const SPEC_UNIT_ALTS = { v: ['v', 'vdc', 'vac'], vdc: ['vdc', 'v'], vac: ['vac', 'v'], kw: ['kw', 'w'], w: ['w', 'kw'] };
+const SPEC_UNIT_SCALE = { kw: 1000, w: 1 };
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Each accepted (value, unit) spelling of a spec token, e.g. 0.75 kW → [0.75 kw, 750 w]. */
+function specForms(tok) {
+  const units = SPEC_UNIT_ALTS[tok.unit] || [tok.unit];
+  return units.map((u) => {
+    const scale = SPEC_UNIT_SCALE[tok.unit] && SPEC_UNIT_SCALE[u] ? SPEC_UNIT_SCALE[tok.unit] / SPEC_UNIT_SCALE[u] : 1;
+    return { value: +(tok.value * scale).toFixed(6), unit: u };
+  });
 }
 
 function _clean(parts) {
@@ -450,31 +482,43 @@ function scoreHitByBusinessSignal(hit) {
 
 function scoreHitBySpec(hit, specTokens) {
   if (!specTokens.length) return 0;
-  const strong = flattenStrongText(hit);
-  const weak = flattenWeakText(hit);
+  const strong = normSpecText(flattenStrongText(hit));
+  const weak = normSpecText(flattenWeakText(hit));
   let score = 0;
 
   for (const tok of specTokens) {
+    // Numbers match on number boundaries: "5 mm" must not match inside "2.5 mm".
+    const forms = tok.unit === "m_thread" || tok.unit === "ip" ? null : specForms(tok);
     let pattern;
     if (tok.unit === "m_thread") {
-      pattern = new RegExp(`\\bm${tok.value}\\b`, "i");
+      pattern = new RegExp(`\\bm${tok.value}(?!\\d)`, "i");
     } else if (tok.unit === "ip") {
       pattern = new RegExp(`\\bip${tok.value}\\b`, "i");
     } else {
-      pattern = new RegExp(`\\b${tok.value}\\s*${tok.unit}\\b`, "i");
+      const alts = forms.map((f) => `${escapeRe(f.value)}\\s*${escapeRe(f.unit)}`).join("|");
+      pattern = new RegExp(`(?<![\\d.])(?:${alts})(?![a-z0-9])`, "i");
     }
 
     function buildMismatchRe() {
-      if (tok.unit === "m_thread") return /\bm(\d{1,2})\b/gi;
+      if (tok.unit === "m_thread") return /\bm(\d{1,2})(?!\d)/gi;
       if (tok.unit === "ip") return /\bip(\d{2})\b/gi;
-      return new RegExp(`\\b(\\d+(?:\\.\\d+)?)\\s*${tok.unit}\\b`, "gi");
+      // Any voltage notation can contradict a voltage request (a 230 V AC coil vs 24 V DC).
+      const unitList = ["v", "vdc", "vac"].includes(tok.unit) ? ["vdc", "vac", "v"] : forms.map((f) => f.unit);
+      const units = unitList.map(escapeRe).join("|");
+      return new RegExp(`(?<![\\d.])(\\d+(?:\\.\\d+)?)\\s*(${units})(?![a-z0-9])`, "gi");
     }
 
     function hasDifferentValue(text) {
       const re = buildMismatchRe();
       let mm;
       while ((mm = re.exec(text)) !== null) {
-        if (parseFloat(mm[1]) !== tok.value) return true;
+        const value = parseFloat(mm[1]);
+        if (!forms) {
+          if (value !== tok.value) return true;
+          continue;
+        }
+        const unit = String(mm[2] || "").toLowerCase();
+        if (!forms.some((f) => f.unit === unit && Math.abs(f.value - value) < 1e-6)) return true;
       }
       return false;
     }
@@ -520,10 +564,15 @@ function scoreHitByCylinderDims(hit, want) {
 function brandAppearsInHits(brand, hits) {
   const b = normVendor(brand);
   if (!b) return true;
+  // Whole words only: "Beta" must not match vendor "Eta", nor "LS" the word "pulse".
+  const words = (s) => ` ${normVendor(s).replace(/[^a-z0-9]+/g, ' ').trim()} `;
+  const bw = words(brand);
   return hits.some((h) => {
     const v = normVendor(h.vendor);
-    if (v && (v === b || v.includes(b) || b.includes(v))) return true;
-    return normVendor(`${h.title || ''} ${Array.isArray(h.tags) ? h.tags.join(' ') : h.tags || ''}`).includes(b);
+    if (v && v === b) return true;
+    const vw = words(h.vendor);
+    if (vw.trim() && (vw.includes(bw) || bw.includes(vw))) return true;
+    return words(`${h.title || ''} ${Array.isArray(h.tags) ? h.tags.join(' ') : h.tags || ''}`).includes(bw);
   });
 }
 
@@ -563,7 +612,8 @@ function headNounOf(query) {
     .replace(/[^a-z0-9\s-]/g, ' ')
     .split(/\s+/)
     .filter((t) => /^[a-z][a-z-]*[a-z]$/.test(t) && t.length >= 3 && !HEAD_STOP.has(t));
-  return toks.length ? singular(toks[toks.length - 1]) : null;
+  const head = pickHeadNoun(toks, firstPart); // skips trailing qualifiers ("long range", "3 pole")
+  return head ? singular(head) : null;
 }
 
 function queryWordSet(query) {
@@ -756,7 +806,8 @@ export async function algoliaSearchDetailed(query, options = {}) {
 
     const looksLikeSku =
       /^[A-Z0-9]{2,}[-\.][A-Z0-9][-A-Z0-9\.\/]{2,}$/i.test(trimmed) ||
-      (/^[A-Z]{2,}\d{2,}/.test(trimmed) && trimmed.length >= 5 && trimmed.length <= 20);
+      // One token only: "RJ45 connector", "ACS580 drive", "IP67 sensor" are product queries.
+      (/^[A-Z]{2,}\d{2,}\S*$/.test(trimmed) && trimmed.length >= 5 && trimmed.length <= 20);
     if (looksLikeSku) _vlog(`[Algolia] SKU query detected — searching exact: "${trimmed}"`);
 
     const indexName = process.env.ALGOLIA_INDEX_NAME || 'shopify_products';

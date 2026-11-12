@@ -78,6 +78,11 @@ class MCPClient {
 
     this.retryAttempts = 3;
     this.retryDelay = 1000;
+    // Without a timeout a hung MCP call waited for undici's default (~5 min) on each attempt.
+    this.requestTimeoutMs = 15000;
+    // chat.jsx stops waiting for slow connects after 8 s; a connect that finishes later must not
+    // change the tool list mid-turn (duplicate tool names make the Claude call fail).
+    this.acceptingTools = true;
 
     // Cache the detected catalog search schema style
     this._catalogSearchSchema = null; // 'flat' or 'nested'
@@ -202,6 +207,7 @@ class MCPClient {
       const toolsData = response.result?.tools || [];
       const customerTools = this._formatToolsData(toolsData);
 
+      if (!this._acceptTools("customer", customerTools)) return customerTools;
       this.customerTools = customerTools;
       this.tools = [...this.tools, ...customerTools];
 
@@ -230,6 +236,7 @@ class MCPClient {
       const toolsData = response.result?.tools || [];
       const storefrontTools = this._formatToolsData(toolsData);
 
+      if (!this._acceptTools("storefront", storefrontTools)) return storefrontTools;
       this.storefrontTools = storefrontTools;
       this.tools = [...this.tools, ...storefrontTools];
 
@@ -258,6 +265,7 @@ class MCPClient {
       const toolsData = response.result?.tools || [];
       const ucpTools = this._formatToolsData(toolsData);
 
+      if (!this._acceptTools("UCP", ucpTools)) return ucpTools;
       this.ucpTools = ucpTools;
       this.tools = [...this.tools, ...ucpTools];
 
@@ -293,7 +301,8 @@ class MCPClient {
     const headers = { "Content-Type": "application/json" };
 
     // UCP rejects the call without an agent profile in meta.
-    const args = { meta: this._ucpMeta(), ...(toolArgs || {}) };
+    // meta goes last so a model-supplied "meta" argument can't replace the agent profile.
+    const args = { ...(toolArgs || {}), meta: this._ucpMeta() };
 
     try {
       const response = await this._makeJsonRpcRequestWithRetry(
@@ -520,6 +529,7 @@ class MCPClient {
     try {
       const response = await fetch(endpoint, {
         method: "POST",
+        signal: AbortSignal.timeout(this.requestTimeoutMs || 15000),
         headers: headers,
         body: JSON.stringify({
           jsonrpc: "2.0",
@@ -559,6 +569,15 @@ class MCPClient {
       if (error.status === 401 || error.status === 400) {
         throw error;
       }
+      // A JSON-RPC error is the server's answer, not a network blip: retrying repeats it.
+      if (error.code !== undefined && error.status === undefined) {
+        throw error;
+      }
+      // Cart and checkout writes are not retried: the first attempt may already have been
+      // applied (5xx after the write, a reset connection), and a retry adds the line twice.
+      if (method === "tools/call" && !this._isReadOnlyTool(params?.name)) {
+        throw error;
+      }
       if (attempt < this.retryAttempts) {
         console.log(`⚠️ Retry attempt ${attempt}/${this.retryAttempts} for ${method}`);
         await new Promise(resolve => setTimeout(resolve, this.retryDelay * attempt));
@@ -566,6 +585,16 @@ class MCPClient {
       }
       throw error;
     }
+  }
+
+  _acceptTools(server, tools) {
+    if (this.acceptingTools !== false) return true;
+    console.warn(`⚠️ ${server} MCP connected after the deadline — ignoring its ${tools.length} tools for this turn`);
+    return false;
+  }
+
+  _isReadOnlyTool(name) {
+    return /^(search|lookup|get|list)_/i.test(String(name || ""));
   }
 
   _formatToolsData(toolsData) {
