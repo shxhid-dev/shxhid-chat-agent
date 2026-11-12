@@ -30,6 +30,8 @@
 import * as Algolia from './algolia.server.js';
 import { rewriteQueryForSearch } from './query-intelligence.server.js';
 import { adminTextSearch } from './admin-products.server.js';
+import { isSpecToken, isThreadToken } from './spec-tokens.server.js';
+import { pickHeadNoun, isQualifierWord } from './query-terms.server.js';
 
 const ROUTER_VERSION = '6.0';
 const SALES_EMAIL = 'websales@creativeautomation.ae';
@@ -167,11 +169,13 @@ function detectSku(message) {
   const normalized = message.trim();
   if (!normalized) return null;
 
-  // Explicit "SKU: X" / "part# X" wins. The captured code must contain a digit.
+  // Explicit "SKU: X" / "part# X" wins. The captured code must contain a digit. One inner space
+  // is allowed when the second half carries a digit and a hyphen (Siemens "6ES7 214-1AG40-0XB0");
+  // the space is dropped because catalogue SKUs are stored without it.
   const explicitPrefix = normalized.match(
-    /\b(?:sku|p\/n|part\s*(?:no\.?|number|#|code)|model\s*(?:no\.?|number|#))\s*[:#]?\s*([A-Z0-9][A-Z0-9\-_\.\/]{2,})/i
+    /\b(?:sku|p\/n|part\s*(?:no\.?|number|#|code)|model\s*(?:no\.?|number|#))\s*[:#]?\s*([A-Z0-9][A-Z0-9\-_\.\/]{2,}(?:\s(?=[A-Z0-9]*\d)[A-Z0-9]+-[A-Z0-9\-_\.\/]+)?)/i
   );
-  if (explicitPrefix && /\d/.test(explicitPrefix[1])) return explicitPrefix[1];
+  if (explicitPrefix && /\d/.test(explicitPrefix[1])) return explicitPrefix[1].replace(/\s+/g, "");
 
   const tokens = normalized
     .split(/\s+/)
@@ -179,6 +183,10 @@ function detectSku(message) {
     .filter(Boolean);
 
   for (const token of tokens) {
+    // Specs ("0.75kW", "24V-DC", "4-20mA", "3-phase") are never part numbers; a thread size
+    // ("M12x1", "G1/4") is one only when it is the whole message.
+    if (isSpecToken(token)) continue;
+    if (tokens.length > 1 && isThreadToken(token)) continue;
     const candidate = matchSkuToken(token);
     if (candidate) return candidate;
   }
@@ -343,7 +351,8 @@ function alphaWords(text) {
 function headNounOf(query) {
   const firstPart = ` ${String(query ?? '').toLowerCase()} `.split(PREP_SPLIT)[0];
   const words = alphaWords(firstPart).filter((w) => !isModifier(w));
-  return words.length ? singular(words[words.length - 1]) : null;
+  const head = pickHeadNoun(words, firstPart); // skips trailing qualifiers ("long range", "3 pole")
+  return head ? singular(head) : null;
 }
 
 function isNounLike(w) {
@@ -540,11 +549,24 @@ function relaxCandidates(query, brand = null) {
   if (!tokens.length) return [];
   const lower = tokens.map((t) => t.toLowerCase());
   const isSpec = (i) => /\d/.test(lower[i]) || (UNIT_WORDS.has(lower[i]) && i > 0 && /^\d+(?:\.\d+)?$/.test(lower[i - 1]));
-  const isWord = (i) => /^[a-z][a-z-]*[a-z]$/.test(lower[i]) && lower[i].length >= 3 && !HEAD_STOP.has(lower[i]);
+  // "supply" is a stop word ("do you supply…") except in "power supply", where it is the product.
+  const isWord = (i) =>
+    /^[a-z][a-z-]*[a-z]$/.test(lower[i]) && lower[i].length >= 3 &&
+    (!HEAD_STOP.has(lower[i]) || (/^suppl(?:y|ies)$/.test(lower[i]) && lower[i - 1] === 'power'));
 
+  // The noun is the last content word that is not a qualifier and comes before any preposition:
+  // "photoelectric sensor long range" relaxes around "sensor" (never "range" alone), and
+  // "variable frequency drive for pump" around "drive" (never "pump").
+  const prepIdx = lower.findIndex((w, i) => i > 0 && /^(?:for|with|to|on|from|by|of|at|under|without)$/.test(w));
+  const end = prepIdx > 0 ? prepIdx - 1 : tokens.length - 1;
   let headIdx = -1;
-  for (let i = tokens.length - 1; i >= 0; i--) {
-    if (!isSpec(i) && isWord(i) && !isModifier(lower[i])) { headIdx = i; break; }
+  for (let i = end; i >= 0; i--) {
+    if (!isSpec(i) && isWord(i) && !isModifier(lower[i]) && !isQualifierWord(lower[i])) { headIdx = i; break; }
+  }
+  if (headIdx < 0) {
+    for (let i = end; i >= 0; i--) {
+      if (!isSpec(i) && isWord(i) && !isModifier(lower[i])) { headIdx = i; break; }
+    }
   }
   if (headIdx < 0) return [];
 
@@ -987,7 +1009,10 @@ async function handleSkuSearch(sku, originalMessage, shopDomain) {
       const products = dedupeById(result.variants.map(skuVariantToCardShape));
       if (products.length > 0) {
         const exact = result.type === "exact";
-        return buildResult(products, exact ? "sku_exact" : "sku_partial", sku, {
+        // A wildcard prefix ("3RT2026-1B*") finds siblings (other coil voltages, sizes), not the
+        // code asked for: its own low-confidence type keeps Claude's search tool available.
+        const type = exact ? "sku_exact" : result.type === "wildcard" ? "sku_wildcard" : "sku_partial";
+        return buildResult(products, type, sku, {
           systemHint: exact
             ? `Found exact SKU match for "${sku}". Acknowledge briefly -- the product card is already shown.`
             : `Found similar products for "${sku}". Tell the user no exact match was found and these are alternatives.`,
@@ -1047,6 +1072,9 @@ async function handleTextSearch(query, shopDomain, conversationHistory = []) {
       intel = await withTimeout(rewriteQueryForSearch(query, conversationHistory), QUERY_INTEL_TIMEOUT_MS, 'QueryIntel');
       if (intel && typeof intel !== 'object') intel = null;
       console.log(`[SearchRouter] QueryIntel: "${query}" → "${intel?.query || query}" (skip=${!!intel?.skip}, reason=${intel?.reason})`);
+      // A failed rewrite echoes the raw message ("Hi, do you have SMPS 24V?"). Treat it as no
+      // rewrite, so the local framing strip and abbreviations still apply.
+      if (intel && /^(?:api_error|parse_error|no_api_key)$/.test(String(intel.reason || ''))) intel = null;
     } catch (err) {
       console.warn(`[SearchRouter] QueryIntel error: ${err.message} -- using original query`);
       intel = null;

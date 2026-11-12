@@ -75,7 +75,9 @@ RULES:
 5. EXCEPTION — NEVER strip SKU / part / model codes. Any alphanumeric token
    with letters AND digits and length >= 5 (e.g. "BP06PP-PTT4-B", "S201-B16",
    "ACS580", "T4171010405-001", "DSNU-20-50-P-A") is a SKU — keep it verbatim
-   and make it the ENTIRE query.
+   and make it the ENTIRE query. Specs are NOT SKUs even when they mix letters
+   and digits: "24VDC", "0.75kW", "4-20mA", "M12x1", "230VAC", "100bar", "IP67"
+   follow rule 4 (keep or strip as a spec) and never replace the product noun.
 
 6. Fix typos silently — but never "fix" SKU/part codes; copy them exactly.
 7. Use catalog-standard terminology (see mappings below)
@@ -104,7 +106,8 @@ TERMINOLOGY MAPPINGS (user term → catalog term):
 "MCCB" → "moulded case circuit breaker"
 "push in/push-in fitting" → "push-in fitting"
 "pneumatic fitting/tube fitting" → "pneumatic fitting"
-"solenoid/solenoid coil" → "solenoid valve"
+"solenoid" (alone) → "solenoid valve"
+"solenoid coil/valve coil" → "solenoid coil" (a coil is its own product — do not turn it into a valve)
 "limit switch/position switch" → "limit switch"
 "encoder/rotary encoder" → "rotary encoder"
 "RTD/thermocouple" → keep as-is
@@ -210,7 +213,7 @@ User: "I need pneumatic components for manufacturing"
 → {"query":"pneumatic cylinder valve","skip":false,"reason":"broad_category_expanded"}
 
 User: "pneumatic parts"
-→ {"query":"pneumatic cylinder SMC","skip":false,"reason":"broad_category_expanded_with_brand"}`;
+→ {"query":"pneumatic cylinder valve","skip":false,"reason":"broad_category_expanded"}`;
 
 // Simple in-memory cache to avoid duplicate rewriter calls for same query
 const queryCache = new Map();
@@ -228,6 +231,16 @@ export function looksLikeRefinement(msg) {
   if (CLARIFIER.test(msg)) return true;
   if (!PRODUCT_NOUN.test(msg)) return REFINE_WORDS.test(msg) || words <= 4;
   return false;
+}
+
+let _client = null;
+let _clientKey = null;
+function getClient(apiKey) {
+  if (!_client || _clientKey !== apiKey) {
+    _client = new Anthropic({ apiKey, timeout: 6000, maxRetries: 0 });
+    _clientKey = apiKey;
+  }
+  return _client;
 }
 
 export async function rewriteQueryForSearch(userMessage, conversationContext = []) {
@@ -275,7 +288,10 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
   }
 
   // Cache key includes context for context-aware caching
-  const cacheKey = `${trimmed}|||${contextSummary.substring(0, 100)}`;
+  // The whole context is part of the key. Cutting it at 100 characters kept only the start of
+  // the oldest turn, so "100 stroke" after "compact cylinder dia 32" reused the answer given
+  // after "ISO cylinder dia 63".
+  const cacheKey = `${trimmed}|||${contextSummary}`;
   if (queryCache.has(cacheKey)) {
     const cached = queryCache.get(cacheKey);
     console.log(`[QueryIntel] Cache hit: "${trimmed}" → "${cached.query}"`);
@@ -288,7 +304,9 @@ export async function rewriteQueryForSearch(userMessage, conversationContext = [
   }
 
   try {
-    const client = new Anthropic({ apiKey });
+    // The router stops waiting after QUERY_INTEL_TIMEOUT_MS (6 s); without a client timeout the
+    // call (and its two SDK retries) kept running and billing after nobody needed it.
+    const client = getClient(apiKey);
 
     const userContent = contextSummary
       ? `${contextSummary}\n\nCurrent user message: "${trimmed}"`
