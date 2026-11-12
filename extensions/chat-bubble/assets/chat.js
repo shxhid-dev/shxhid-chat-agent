@@ -733,7 +733,11 @@
       }
 
       if (!this.state.conversationId) {
-        this.state.conversationId = 'conv_' + Date.now();
+        // Random, not a timestamp: a guessable id let anyone read or continue someone else's chat.
+        const rand = window.crypto?.randomUUID
+          ? window.crypto.randomUUID()
+          : Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        this.state.conversationId = 'conv_' + rand;
         sessionStorage.setItem('shopAiConversationId', this.state.conversationId);
       }
 
@@ -1070,7 +1074,14 @@
     parseMarkdown(text) {
       if (!text || typeof text !== 'string') return '<p></p>';
 
+      // Escape first: replies can echo the customer's text or product data, and this goes into
+      // innerHTML. Only **bold** and https links are turned back into markup.
       let cleaned = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
           (_m, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
