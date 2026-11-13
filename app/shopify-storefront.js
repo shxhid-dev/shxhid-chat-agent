@@ -1,12 +1,16 @@
 /**
  * Shopify Storefront API Client (PRODUCTION SAFE)
  *
- * Token acquisition:
- *   1. Use SHOPIFY_STOREFRONT_TOKEN env var if set (only on first load)
- *   2. If env token returns 401: permanently discard it, never use again
- *   3. Auto-create via Admin REST API:
+ * Token acquisition (13 Nov 2026):
+ *   1. Reuse the newest "Chat Agent Storefront Token" this app already issued:
+ *      GET /admin/api/{version}/storefront_access_tokens.json
+ *      Before, every container start minted a NEW token and none was ever deleted. Shopify caps
+ *      an app at 100 Storefront tokens per shop; past that, creation fails and variant lookups
+ *      and Add to Cart stop working after the next restart.
+ *   2. Only if none exists (or every one was rejected with 401): create one via
  *      POST /admin/api/{version}/storefront_access_tokens.json
- *   4. Cache the new token in-memory for process lifetime
+ *   3. Cache it in memory for the process lifetime; a 401 marks it rejected and repeats 1-2.
+ *   (SHOPIFY_STOREFRONT_TOKEN is still ignored: it caused stale-token 401s on deploy.)
  *
  * Official docs:
  * - https://shopify.dev/docs/api/admin-rest/latest/resources/storefrontaccesstoken
@@ -53,8 +57,8 @@ async function getStorefrontToken() {
   // Dedupe concurrent callers so we mint exactly ONE token even when
   // 10 parallel productByHandle queries race past the cache check.
   if (inFlight) return inFlight;
-  console.log('[Storefront] No cached token — creating via Admin REST API...');
-  inFlight = createStorefrontTokenViaAdminRest()
+  console.log('[Storefront] No cached token — looking up this app\'s existing tokens...');
+  inFlight = acquireStorefrontToken()
     .then((t) => {
       cachedToken = t;
       return t;
@@ -70,32 +74,76 @@ async function getStorefrontToken() {
  * If the env var token caused the 401, mark it as permanently discarded.
  */
 function invalidateToken() {
+  if (cachedToken) rejectedTokens.add(cachedToken);
   cachedToken = null;
-  console.warn('[Storefront] Token invalidated — will auto-create fresh token');
+  console.warn('[Storefront] Token rejected (401) — will look for another or create one');
+}
+
+const TOKEN_TITLE = 'Chat Agent Storefront Token';
+// Tokens that returned 401 in this process: never reused again.
+const rejectedTokens = new Set();
+
+async function getAdminSession() {
+  if (!STORE_DOMAIN) {
+    throw new Error('[Storefront] Missing SHOPIFY_STORE_DOMAIN');
+  }
+  const { default: prisma } = await import('./db.server.js');
+  const session = await prisma.session.findFirst({
+    where: { shop: STORE_DOMAIN },
+    orderBy: { id: 'desc' },
+  });
+  if (!session?.accessToken) {
+    throw new Error(
+      `[Storefront] No Admin API token found for ${STORE_DOMAIN}. App must be installed.`
+    );
+  }
+  return session;
+}
+
+/** Newest token this app issued earlier, or null. Never throws. */
+export function pickReusableToken(tokens, rejected = rejectedTokens) {
+  const ours = (Array.isArray(tokens) ? tokens : [])
+    .filter((t) => t?.title === TOKEN_TITLE && typeof t.access_token === 'string' && t.access_token && !rejected.has(t.access_token))
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return ours[0]?.access_token || null;
+}
+
+async function acquireStorefrontToken() {
+  const session = await getAdminSession();
+  try {
+    const response = await fetch(
+      `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/storefront_access_tokens.json`,
+      {
+        headers: { Accept: 'application/json', 'X-Shopify-Access-Token': session.accessToken },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    if (response.ok) {
+      const list = (await response.json())?.storefront_access_tokens || [];
+      const ours = list.filter((t) => t?.title === TOKEN_TITLE).length;
+      const token = pickReusableToken(list);
+      if (ours >= 50) {
+        console.warn(`[Storefront] ${ours} "${TOKEN_TITLE}" tokens exist (Shopify allows 100 per app). Old ones can be deleted in the Admin API.`);
+      }
+      if (token) {
+        cachedToken = token;
+        console.log(`[Storefront] Reusing existing Storefront token (${ours} issued by this app)`);
+        return token;
+      }
+    } else {
+      console.warn(`[Storefront] Listing Storefront tokens failed (${response.status}) — creating one`);
+    }
+  } catch (e) {
+    console.warn(`[Storefront] Listing Storefront tokens failed (${e.message}) — creating one`);
+  }
+  return createStorefrontTokenViaAdminRest(session);
 }
 
 /**
  * Create a Storefront access token via Admin REST API.
  * POST /admin/api/{version}/storefront_access_tokens.json
  */
-async function createStorefrontTokenViaAdminRest() {
-  if (!STORE_DOMAIN) {
-    throw new Error('[Storefront] Missing SHOPIFY_STORE_DOMAIN');
-  }
-
-  const { default: prisma } = await import('./db.server.js');
-
-  const session = await prisma.session.findFirst({
-    where: { shop: STORE_DOMAIN },
-    orderBy: { id: 'desc' },
-  });
-
-  if (!session?.accessToken) {
-    throw new Error(
-      `[Storefront] No Admin API token found for ${STORE_DOMAIN}. App must be installed.`
-    );
-  }
-
+async function createStorefrontTokenViaAdminRest(session) {
   console.log('[Storefront] Creating Storefront token via Admin REST API...');
 
   const response = await fetch(
@@ -108,7 +156,7 @@ async function createStorefrontTokenViaAdminRest() {
       },
       body: JSON.stringify({
         storefront_access_token: {
-          title: 'Chat Agent Storefront Token',
+          title: TOKEN_TITLE,
         },
       }),
     }
