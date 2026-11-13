@@ -44,6 +44,16 @@ const CATALOG_SEARCH_TOOL_NAMES = new Set([
   "search_products",      // defensive
 ]);
 
+// tools/list for the UCP and storefront servers is the same for every shopper, but it was fetched
+// on every message (two round trips before anything was searched). Cached per endpoint;
+// MCP_TOOLS_CACHE_MS=0 turns it off. The customer server is never cached: its list depends on
+// the shopper's login token.
+const TOOLS_CACHE_MS = (() => {
+  const n = Number(process.env.MCP_TOOLS_CACHE_MS ?? 600000);
+  return Number.isFinite(n) && n >= 0 ? n : 600000;
+})();
+const toolsListCache = new Map(); // endpoint -> { at, tools }
+
 function isCatalogSearchTool(toolName) {
   return CATALOG_SEARCH_TOOL_NAMES.has(String(toolName || "").toLowerCase());
 }
@@ -226,12 +236,7 @@ class MCPClient {
 
       const headers = { "Content-Type": "application/json" };
 
-      const response = await this._makeJsonRpcRequest(
-        this.storefrontMcpEndpoint,
-        "tools/list",
-        {},
-        headers
-      );
+      const response = await this._cachedToolsList(this.storefrontMcpEndpoint, {}, headers);
 
       const toolsData = response.result?.tools || [];
       const storefrontTools = this._formatToolsData(toolsData);
@@ -255,12 +260,7 @@ class MCPClient {
 
       const headers = { "Content-Type": "application/json" };
 
-      const response = await this._makeJsonRpcRequest(
-        this.ucpMcpEndpoint,
-        "tools/list",
-        { meta: this._ucpMeta() },
-        headers
-      );
+      const response = await this._cachedToolsList(this.ucpMcpEndpoint, { meta: this._ucpMeta() }, headers);
 
       const toolsData = response.result?.tools || [];
       const ucpTools = this._formatToolsData(toolsData);
@@ -585,6 +585,20 @@ class MCPClient {
       }
       throw error;
     }
+  }
+
+  async _cachedToolsList(endpoint, params, headers) {
+    const hit = toolsListCache.get(endpoint);
+    if (hit && TOOLS_CACHE_MS > 0 && Date.now() - hit.at < TOOLS_CACHE_MS) {
+      return { result: { tools: hit.tools }, cached: true };
+    }
+    const response = await this._makeJsonRpcRequest(endpoint, "tools/list", params, headers);
+    const tools = response?.result?.tools;
+    // Only a non-empty list is cached, so an outage or a broken profile is retried next message.
+    if (Array.isArray(tools) && tools.length && TOOLS_CACHE_MS > 0) {
+      toolsListCache.set(endpoint, { at: Date.now(), tools });
+    }
+    return response;
   }
 
   _acceptTools(server, tools) {

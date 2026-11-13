@@ -531,6 +531,35 @@ body.shop-ai-open .shop-ai-modal {
 }
 .shop-ai-retry:active { transform: scale(0.96); }
 
+/* Sign-in prompt (order / account questions) */
+.shop-ai-auth {
+  display: flex;
+  align-items: center;
+  gap: var(--tia-s3);
+  padding: var(--tia-s2) var(--tia-s2) var(--tia-s2) var(--tia-s3);
+  border: 1px solid var(--tia-border);
+  border-radius: var(--tia-r-md);
+  background: var(--tia-bg-subtle);
+  color: var(--tia-text);
+  font-size: var(--tia-fs-14);
+  line-height: var(--tia-lh-14);
+}
+.shop-ai-auth-text { flex: 1; min-width: 0; }
+.shop-ai-reset .shop-ai-auth-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 var(--tia-s3);
+  border-radius: var(--tia-r-sm);
+  background: var(--tia-btn-bg);
+  color: var(--tia-btn-text);
+  font-size: var(--tia-fs-13);
+  font-weight: 600;
+  text-decoration: none;
+}
+.shop-ai-reset .shop-ai-auth-btn:hover { background: var(--tia-btn-bg-hover); }
+
 /* Typing indicator */
 .shop-ai-thinking-container { display: flex; align-items: center; gap: 10px; min-height: var(--tia-avatar); }
 .shop-ai-thinking-dots { display: inline-flex; gap: 4px; }

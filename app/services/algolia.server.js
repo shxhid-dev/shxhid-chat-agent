@@ -964,8 +964,11 @@ export async function algoliaSearchDetailed(query, options = {}) {
     const top = finalScored[0];
     const topTermRatio = top?.ratio ?? 0;
     const reasons = [];
-    // A vendor filter is itself strong evidence, so vendor-filtered queries keep v3's exemption.
-    if (!filters && terms.length > 0 && topTermRatio === 0) {
+    // A vendor filter only proves the brand. Brand-only queries ("abb") are exempt; "Siemens
+    // proximity sensor" still needs "proximity"/"sensor" in the top hit, or a Siemens contactor
+    // was graded high and Claude lost its search tool.
+    const brandOnly = !!filters && !String(outgoingQuery || '').trim();
+    if (!brandOnly && terms.length > 0 && topTermRatio === 0) {
       reasons.push('no query term appears in any structured field of the top hit');
     }
     if (specTokens.length > 0 && (top?.spec ?? 0) <= 0) {

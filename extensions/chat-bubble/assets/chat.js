@@ -793,6 +793,8 @@
 
         // Track the active assistant text bubble across tool-result cycles.
         let activeBubbleEl = null;
+        // Sign-in link from an auth_required event, shown under the reply once it has finished.
+        let pendingAuthUrl = null;
 
         while (true) {
           const { value, done } = await reader.read();
@@ -895,12 +897,24 @@
               this.flushStreamRender();
               this.addError(data.error || 'Something went wrong on our side.', { retry: true });
             }
+
+            if (data.type === 'rate_limit_exceeded') {
+              this.removeThinking();
+              this.flushStreamRender();
+              this.addError('TIA is busy right now. Please try again in a moment.', { retry: true });
+            }
+
+            // Order / account questions need the shopper to sign in first.
+            if (data.type === 'auth_required' && data.auth_url) {
+              pendingAuthUrl = data.auth_url;
+            }
           }
         }
 
         this.removeThinking();
         this.flushStreamRender();
         this.stopStreamingCarets();
+        if (pendingAuthUrl) this.addAuthPrompt(pendingAuthUrl);
       } catch (err) {
         this.removeThinking();
         this.flushStreamRender();
@@ -954,6 +968,37 @@
         }, { once: true });
         row.appendChild(btn);
       }
+      msgDiv.appendChild(row);
+      this.elements.messages?.appendChild(msgDiv);
+      this.scrollToBottom({ force: true });
+      return msgDiv;
+    },
+
+    /** Sign-in prompt for order / account questions (customer account login, opens a new tab). */
+    addAuthPrompt(url) {
+      let href;
+      try {
+        const u = new URL(url);
+        if (u.protocol !== 'https:') return null;
+        href = u.toString();
+      } catch (_) {
+        return null;
+      }
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'shop-ai-message assistant tia-enter';
+      msgDiv.appendChild(avatarEl());
+      const row = document.createElement('div');
+      row.className = 'shop-ai-auth';
+      const text = document.createElement('span');
+      text.className = 'shop-ai-auth-text';
+      text.textContent = 'Sign in to your account to see your orders and account details.';
+      const link = document.createElement('a');
+      link.className = 'shop-ai-auth-btn tia-press';
+      link.href = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Sign in';
+      row.append(text, link);
       msgDiv.appendChild(row);
       this.elements.messages?.appendChild(msgDiv);
       this.scrollToBottom({ force: true });
