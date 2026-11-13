@@ -1,6 +1,13 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v3.0 (12 Nov 2026)
+ * Chat API Route — v3.1 (13 Nov 2026)
+ *
+ * CHANGES (v3.1):
+ *   1. Checkout tools (create/update/complete/cancel_checkout) are never given to Claude;
+ *      CHAT_BLOCKED_TOOLS adds more. Shoppers check out through the cart link.
+ *   2. Order/account tools that need a login send an `auth_required` event: the widget shows a
+ *      Sign in button, and Claude is told to point to it instead of pasting the link.
+ *   (mcp-client.js caches the UCP/storefront tool lists; shopify-storefront.js reuses its token.)
  *
  * CHANGES (v3.0) — backend review:
  *   1. Stored messages are always plain text. Typed JSON such as [{"type":"tool_result",…}] was
@@ -86,7 +93,7 @@
 import { withCardsMarker, stripCardsMarker, specSnippet } from "../services/card-memory.server.js";
 import { isSpecToken, isThreadToken } from "../services/spec-tokens.server.js";
 
-const CHAT_VERSION = "3.0";
+const CHAT_VERSION = "3.1";
 
 // Status lines shown in the widget's typing indicator, sent as they actually happen.
 const STATUS = {
@@ -119,6 +126,15 @@ const LOW_CONFIDENCE_PATHS = new Set([
 const ROUTER_GUARDED_TYPES = new Set(["algolia_category", "algolia_multi", "algolia_relaxed"]);
 
 const CATALOG_SEARCH_TOOL_NAMES = new Set(["search_shop_catalog", "search_catalog", "search_products"]);
+
+// MCP tools Claude never gets. CHAT_BLOCKED_TOOLS (comma-separated) adds more.
+const BLOCKED_TOOLS = new Set([
+  "create_checkout",
+  "update_checkout",
+  "complete_checkout",
+  "cancel_checkout",
+  ...String(process.env.CHAT_BLOCKED_TOOLS || "").split(",").map((s) => s.trim()).filter(Boolean),
+]);
 
 function isCatalogSearchTool(toolName) {
   return CATALOG_SEARCH_TOOL_NAMES.has(String(toolName || "").toLowerCase());
@@ -955,7 +971,16 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
     mcpClient.tools = Array.isArray(mcpClient.tools) ? mcpClient.tools : [];
     mcpClient.ucpTools = Array.isArray(mcpClient.ucpTools) ? mcpClient.ucpTools : [];
     mcpClient.storefrontTools = Array.isArray(mcpClient.storefrontTools) ? mcpClient.storefrontTools : [];
-    console.log(`Connected to MCP: ${mcpClient.tools.length} tools`);
+
+    // Checkout stays with the shopper: the widget opens the cart's checkout link. Claude never
+    // gets create/update/complete/cancel_checkout (fewer tokens, and no AI-driven checkout).
+    const blocked = mcpClient.tools.filter((t) => BLOCKED_TOOLS.has(t?.name)).map((t) => t.name);
+    if (blocked.length) {
+      mcpClient.tools = mcpClient.tools.filter((t) => !BLOCKED_TOOLS.has(t?.name));
+      mcpClient.ucpTools = mcpClient.ucpTools.filter((t) => !BLOCKED_TOOLS.has(t?.name));
+      mcpClient.storefrontTools = mcpClient.storefrontTools.filter((t) => !BLOCKED_TOOLS.has(t?.name));
+    }
+    console.log(`Connected to MCP: ${mcpClient.tools.length} tools${blocked.length ? ` (hid ${blocked.join(", ")})` : ""}`);
 
     const mcpCatalogTool = mcpClient.tools.find((t) => isCatalogSearchTool(t?.name));
     if (mcpCatalogTool) {
@@ -1410,7 +1435,24 @@ async function handleChatSession({ request, userMessage, conversationId, promptT
               }
 
               flushAssistant();
-              if (toolUseResponse?.error) {
+              const authUrl = toolUseResponse?.error?.type === "auth_required" ? String(toolUseResponse.error.auth_url || "") : "";
+              if (authUrl.startsWith("https://")) {
+                // Order/account tools need the shopper to sign in. The widget shows a Sign in
+                // button (the link used to reach the shopper only if Claude chose to quote it).
+                send({ type: "auth_required", auth_url: authUrl });
+                pushToolResult({
+                  type: "tool_result",
+                  tool_use_id: toolUseId,
+                  content: JSON.stringify({
+                    error: "login_required",
+                    _system_hint:
+                      "The customer must sign in to their account first. A 'Sign in' button is now shown under your reply. " +
+                      "In one sentence, ask them to sign in with it and then ask again. Do not paste a link.",
+                  }),
+                  is_error: true,
+                });
+                resultPushed = true;
+              } else if (toolUseResponse?.error) {
                 const errPayload = toolUseResponse.error.data || toolUseResponse.error;
                 pushToolResult({ type: "tool_result", tool_use_id: toolUseId, content: JSON.stringify({ error: errPayload }), is_error: true });
                 resultPushed = true;
