@@ -1,6 +1,12 @@
 // app/routes/chat.jsx
 /**
- * Chat API Route — v3.1 (13 Nov 2026)
+ * Chat API Route — v3.2 (19 Nov 2026)
+ *
+ * CHANGES (v3.2):
+ *   1. Message rate limit (rate-limit.server.js): 40 per conversation per 10 minutes, 200 per
+ *      minute overall (CHAT_MAX_PER_CONVERSATION_10MIN, CHAT_MAX_PER_MINUTE) → 429 with a message.
+ *   (claude.server.js runs parallel read-only tool calls together; algolia.server.js hides
+ *   spec-mismatched cards once three cards match the spec.)
  *
  * CHANGES (v3.1):
  *   1. Checkout tools (create/update/complete/cancel_checkout) are never given to Claude;
@@ -92,8 +98,9 @@
 
 import { withCardsMarker, stripCardsMarker, specSnippet } from "../services/card-memory.server.js";
 import { isSpecToken, isThreadToken } from "../services/spec-tokens.server.js";
+import { allowChatMessage } from "../services/rate-limit.server.js";
 
-const CHAT_VERSION = "3.1";
+const CHAT_VERSION = "3.2";
 
 // Status lines shown in the widget's typing indicator, sent as they actually happen.
 const STATUS = {
@@ -673,6 +680,15 @@ async function handleChatRequest(request) {
     const visitorId = body.visitor_id;
     const fingerprintId = body.fingerprint_id;
     const conversationId = normalizeConversationId(body.conversation_id);
+
+    // Each message can cost up to 6 Claude calls; cap the rate per conversation and overall.
+    if (!allowChatMessage(conversationId)) {
+      console.warn(`[Chat] Message rate limit hit | conversation=${conversationId}`);
+      return new Response(
+        JSON.stringify({ error: "You're sending messages very quickly. Please wait a moment and try again." }),
+        { status: 429, headers: { ...getCorsHeaders(request), "Retry-After": "30" } }
+      );
+    }
 
     let image = null;
     let imageIntel = null;
