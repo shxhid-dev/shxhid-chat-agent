@@ -25,6 +25,7 @@
 //   IMAGE_MAX_PER_MINUTE            default 30 (all conversations together)
 
 import Anthropic from "@anthropic-ai/sdk";
+import { createRateLimiter } from "./rate-limit.server.js";
 
 export const IMAGE_INTEL_VERSION = "1.2.0";
 export const PHOTO_NOTE_TAG = "[PHOTO ANALYSIS — NOT FROM USER]";
@@ -92,31 +93,8 @@ export function parseImagePayload(raw, { maxBytes = MAX_IMAGE_BYTES } = {}) {
 
 // ─── Rate limiting ─────────────────────────────────────────────────────
 
-/** Sliding-window counter per key. In-memory: one Railway instance, resets on deploy. */
-export function createRateLimiter({ max, windowMs, now = () => Date.now() }) {
-  const hits = new Map();
-  return {
-    /** True if one more hit fits, without recording it. */
-    peek(key) {
-      const t = now();
-      return (hits.get(key) || []).filter((ts) => t - ts < windowMs).length < max;
-    },
-    allow(key) {
-      const t = now();
-      const recent = (hits.get(key) || []).filter((ts) => t - ts < windowMs);
-      if (recent.length >= max) {
-        hits.set(key, recent);
-        return false;
-      }
-      recent.push(t);
-      hits.set(key, recent);
-      if (hits.size > 5000) {
-        for (const [k, list] of hits) if (!list.some((ts) => t - ts < windowMs)) hits.delete(k);
-      }
-      return true;
-    },
-  };
-}
+// The limiter lives in rate-limit.server.js (chat messages use it too); re-exported for callers here.
+export { createRateLimiter };
 
 const perConversation = createRateLimiter({ max: intEnv("IMAGE_MAX_PER_CONVERSATION_HOUR", 8), windowMs: 60 * 60 * 1000 });
 const globalLimiter = createRateLimiter({ max: intEnv("IMAGE_MAX_PER_MINUTE", 30), windowMs: 60 * 1000 });

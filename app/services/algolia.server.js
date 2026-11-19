@@ -955,7 +955,14 @@ export async function algoliaSearchDetailed(query, options = {}) {
 
     const originalTop3 = hits.slice(0, 3).map((h) => h.sku);
     scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.idx - b.idx));
-    const finalScored = scored.slice(0, firstN);
+    // A card that contradicts the asked spec (15 mm for a 5 mm request) is hidden once at least
+    // three cards match it. With fewer matches it stays, ranked low, as the closest option.
+    const specMatches = specTokens.length ? scored.filter((s) => s.spec > 0).length : 0;
+    const kept = specMatches >= 3 ? scored.filter((s) => s.spec >= 0) : scored;
+    if (kept.length < scored.length) {
+      _vlog(`[Algolia] hid ${scored.length - kept.length} spec-mismatched hit(s); ${specMatches} match the spec`);
+    }
+    const finalScored = kept.slice(0, firstN);
     const finalHits = finalScored.map((s) => s.hit);
     const newTop3 = finalHits.slice(0, 3).map((h) => h.sku);
     const reranked = JSON.stringify(originalTop3) !== JSON.stringify(newTop3);
@@ -1067,6 +1074,13 @@ export async function algoliaSearch(query, options = {}) {
 
 // Exported for unit tests only — not part of the public search surface.
 export const __internals = {
+  // Tests only: replace the Algolia client and reset the caches.
+  setClientForTests(client) {
+    _client = client;
+    _vendorCache = null;
+    _vendorInflight = null;
+    _resultCache.clear();
+  },
   extractSpecTokens,
   flattenStrongText,
   flattenWeakText,

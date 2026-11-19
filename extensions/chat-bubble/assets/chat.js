@@ -770,7 +770,9 @@
           let reason = '';
           try { reason = JSON.parse(errorText)?.error || ''; } catch (_) { /* not JSON */ }
           const error = new Error(`Server returned ${response.status}`);
-          if (image && reason && [400, 413, 415, 429].includes(response.status)) error.userMessage = reason;
+          // Photo rejections and rate limits carry a message meant for the shopper.
+          if (reason && (response.status === 429 || (image && [400, 413, 415].includes(response.status)))) error.userMessage = reason;
+          error.retryable = response.status === 429;
           throw error;
         }
 
@@ -920,7 +922,7 @@
         this.flushStreamRender();
         this.stopStreamingCarets();
         console.error('❌ Chat error:', err);
-        if (err.userMessage) this.addError(err.userMessage);
+        if (err.userMessage) this.addError(err.userMessage, { retry: !!err.retryable });
         else this.addError("Couldn't reach TIA. Check your connection and try again.", { retry: true });
       }
     },
