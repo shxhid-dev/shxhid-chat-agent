@@ -1,6 +1,10 @@
 // app/services/claude.server.js
 /**
- * Claude Service — v5.1 (12 Nov 2026)
+ * Claude Service — v5.2 (19 Nov 2026)
+ *
+ * CHANGES (v5.2):
+ *   - Several read-only tool calls in one reply (two catalog searches) run in parallel;
+ *     anything that writes keeps Claude's order.
  *
  * CHANGES (v5.1):
  *   - max_tokens 4096 → 16000 (thinking counts toward it; long replies were cut off).
@@ -41,6 +45,9 @@ const CHAT_EFFORT = (() => {
   const v = String(process.env.CHAT_EFFORT || "medium").trim().toLowerCase();
   return ["low", "medium", "high", "off"].includes(v) ? v : "medium";
 })();
+// Tools that only read (catalog search, product lookups) may run in parallel.
+const READ_ONLY_TOOL = /^(?:search|lookup|get|list)_/i;
+
 // Turned off for the rest of the process if the API ever rejects the extras.
 let useExtras = CHAT_EFFORT !== "off";
 
@@ -156,11 +163,18 @@ export function createClaudeService() {
 
         // Tool calls only run when Claude actually stopped to use them. On max_tokens a
         // tool_use block can be cut off mid-input (e.g. update_cart with half its lines).
-        if (finalMessage.stop_reason === "tool_use") {
+        if (finalMessage.stop_reason === "tool_use" && onToolUse) {
           const toolUses = (finalMessage.content || []).filter((c) => c.type === "tool_use");
-          for (const toolUse of toolUses) {
-            if (signal?.aborted) break;
-            if (onToolUse) await onToolUse(toolUse);
+          // Several searches in one reply ("a contactor and an MCB") run at the same time: they
+          // only read. Anything that writes (update_cart…) keeps the order Claude gave.
+          const allReadOnly = toolUses.length > 1 && toolUses.every((t) => READ_ONLY_TOOL.test(t?.name || ""));
+          if (allReadOnly && !signal?.aborted) {
+            await Promise.all(toolUses.map((toolUse) => onToolUse(toolUse)));
+          } else {
+            for (const toolUse of toolUses) {
+              if (signal?.aborted) break;
+              await onToolUse(toolUse);
+            }
           }
         }
 
