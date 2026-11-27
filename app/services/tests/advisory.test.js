@@ -127,10 +127,17 @@ test("non-metal objects go to photoelectric", () => {
 });
 
 test("generic selection keeps the normal pre-search", () => {
-  const a = analyzeEnquiry("Which VFD should I use for a 5.5 kW pump on a 415 V supply?", []);
+  const a = analyzeEnquiry("Which PLC should I use for a packaging machine with 20 inputs?", []);
   assert.equal(a.intent, "selection");
   assert.equal(a.domain, "generic");
   assert.equal(a.searchQuery, null);
+  assert.equal(a.skipPreSearch, false);
+});
+
+test("a VFD enquiry uses the drive playbook (v1.2)", () => {
+  const a = analyzeEnquiry("Which VFD should I use for a 5.5 kW pump on a 415 V supply?", []);
+  assert.equal(a.domain, "drive");
+  assert.equal(a.searchQuery, "variable frequency drive 5.5 kW");
   assert.equal(a.skipPreSearch, false);
 });
 

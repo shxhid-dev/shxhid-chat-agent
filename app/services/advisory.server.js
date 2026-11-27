@@ -1,4 +1,9 @@
-// app/services/advisory.server.js — v1.1
+// app/services/advisory.server.js — v1.2
+//
+// v1.2 (27 Nov 2026)
+//   - Two more playbooks (advisory-sizing.server.js): pneumatic/hydraulic cylinder sizing and
+//     variable frequency drive selection. They only take over selection enquiries that used to
+//     get the generic brief; classification is unchanged, so product lookups are not affected.
 //
 // ADVISORY MODE for GENERAL ENQUIRIES
 // e.g. "I need a sensor solution for detecting metal parts on a conveyor belt, about 5 mm
@@ -33,7 +38,9 @@
 //
 // Nothing here changes the DB schema, env vars or package.json. English input only.
 
-export const ADVISORY_VERSION = "1.1.0";
+import { detectSizingDomain, hasSizingParam, buildCylinderPlan, buildDrivePlan } from "./advisory-sizing.server.js";
+
+export const ADVISORY_VERSION = "1.2.0";
 export const ADVISORY_TAG = "[ADVISORY BRIEF — NOT FROM USER]";
 
 const MIN_SELECTION_SCORE = 3; // minimum classify() score for a selection enquiry
@@ -87,6 +94,9 @@ const RE_SELECT_CUE = new RegExp(
     [
       "(?:right|best|suitable|appropriate|correct|ideal|proper)\\s+(?:\\w+\\s+){0,2}?(?:" + SELECT_NOUNS + ")",
       "what\\s+(?:type|kind|sort)\\s+of",
+      // Sizing asks that name a cylinder or drive (v1.2). Kept narrow so other enquiries classify as before.
+      "what\\s+size\\s+(?:of\\s+)?(?:\\w+\\s+){0,2}?(?:cylinders?|vfds?|drives?|inverters?)",
+      "(?:recommend|suggest)\\w*\\s+(?:(?:a|an|the|me)\\s+)?(?:\\w+\\s+){0,3}?(?:cylinders?|vfds?|inverters?|frequency\\s+drives?|speed\\s+drives?)",
       "which\\s+(?:\\w+\\s+){0,3}?(?:should|do|would|to|is\\s+best|is\\s+right|is\\s+suitable)",
       "how\\s+(?:do\\s+|can\\s+|should\\s+|to\\s+)(?:i\\s+|we\\s+)?(?:choose|select|pick|size|specify)",
       "help\\s+(?:me\\s+)?(?:choose|select|pick|decide)",
@@ -1184,7 +1194,8 @@ function findAdvisoryContext(current, history) {
   const cur = lc(current);
   if (RE_LOOKUP_OPENER.test(cur) || RE_COMMERCE.test(cur)) return null;
   if (cur.split(" ").length > MAX_FOLLOWUP_WORDS) return null;
-  if (!hasAnyParam(extractRequirements(cur))) return null;
+  // Sizing answers ("6 bar", "50 kg", "three phase") count as follow-up details too.
+  if (!hasAnyParam(extractRequirements(cur)) && !hasSizingParam(cur)) return null;
 
   const curClean = cleanText(current);
   let users = history
@@ -1224,8 +1235,16 @@ function analyzeEnquiryUnsafe(userMessage, history, opts) {
   const t = lc(segments.join(" "));
   const req = segments.map((s) => extractRequirements(lc(s))).reduce((acc, r) => mergeRequirements(acc, r));
   const sensing = cls.intent === "selection" && isSensing(t);
-  const domain = sensing ? "sensing" : cls.intent === "troubleshooting" ? "troubleshooting" : "generic";
-  const plan = sensing ? buildSensingPlan(req) : emptyPlan();
+  // Cylinder sizing / drive selection: only enquiries that would otherwise be "generic".
+  const sizing = cls.intent === "selection" && !sensing ? detectSizingDomain(t) : null;
+  const domain = sensing ? "sensing" : sizing ? sizing : cls.intent === "troubleshooting" ? "troubleshooting" : "generic";
+  const plan = sensing
+    ? buildSensingPlan(req)
+    : sizing === "cylinder"
+      ? buildCylinderPlan(t)
+      : sizing === "drive"
+        ? buildDrivePlan(t, req)
+        : emptyPlan();
   const trouble = cls.intent === "troubleshooting" ? detectTroubleComponent(t) : null;
   const rewriteSearch = opts.rewriteSearch !== false;
 
@@ -1236,13 +1255,16 @@ function analyzeEnquiryUnsafe(userMessage, history, opts) {
     domain,
     continuation,
     requirements: req,
-    requirementLines: describeRequirements(req, sensing),
+    requirementLines: sizing
+      ? [...(plan.inputs || []), ...describeRequirements({ ...req, voltage: null }, false)]
+      : describeRequirements(req, sensing),
     plan,
     trouble,
     questions: plan.missing.slice(0, MAX_QUESTIONS),
     searchQuery: rewriteSearch ? plan.searchQuery : null,
-    // true = no product query fits yet (troubleshooting, unknown target, gap beyond inductive)
-    skipPreSearch: cls.intent === "troubleshooting" || (sensing && !plan.searchQuery),
+    // true = no product query fits yet (troubleshooting, unknown target, gap beyond inductive,
+    // no load or motor power given)
+    skipPreSearch: cls.intent === "troubleshooting" || (Boolean(sensing || sizing) && !plan.searchQuery),
   };
 }
 
@@ -1275,13 +1297,18 @@ export function buildAdvisoryBrief(a) {
   const req = a.requirements || {};
   const isTrouble = a.intent === "troubleshooting";
   const isSensing = a.domain === "sensing";
+  const isSizing = a.domain === "cylinder" || a.domain === "drive";
   const bullets = (arr) => arr.forEach((x) => L.push(`- ${x}`));
 
   const kind = isTrouble
     ? "troubleshooting (a problem to solve, not a product lookup)"
     : isSensing
       ? "application advice: sensor selection"
-      : "application advice: general product selection";
+      : a.domain === "cylinder"
+        ? "application advice: cylinder sizing"
+        : a.domain === "drive"
+          ? "application advice: drive (VFD) selection"
+          : "application advice: general product selection";
 
   L.push(ADVISORY_TAG);
   L.push(`Enquiry type: ${kind}.`);
@@ -1303,17 +1330,18 @@ export function buildAdvisoryBrief(a) {
     bullets(p.assumptions);
     L.push("");
   }
-  if (req.safety) {
+  if (req.safety && !isSizing) {
     L.push("SAFETY (say this clearly if the sensor is meant to protect people)");
     L.push(`- ${SAFETY_NOTE}`);
     L.push("");
   }
 
-  if (isSensing) {
-    L.push(`RECOMMENDED SENSOR TYPE: ${p.sensorType}`);
+  if (isSensing || isSizing) {
+    L.push(isSensing ? `RECOMMENDED SENSOR TYPE: ${p.sensorType}` : `RECOMMENDED: ${p.recommendation}`);
     L.push("");
     L.push("ENGINEERING FACTS (pre-computed: use these numbers exactly, do not recompute or contradict them)");
-    bullets(p.facts);
+    if (p.facts.length) bullets(p.facts);
+    else L.push("- None yet: the numbers that decide the size are missing (see STILL UNKNOWN). Do not guess a size.");
     L.push("");
     if (p.envNotes.length) {
       L.push("ENVIRONMENT & SUPPLY NOTES");
@@ -1389,9 +1417,10 @@ export function buildAdvisoryBrief(a) {
     L.push("Keep the whole reply under about 200 words.");
   } else {
     L.push("1. One short line confirming what you understood, including any assumption you made.");
+    const recNoun = isSensing ? "sensor" : a.domain === "cylinder" ? "cylinder" : a.domain === "drive" ? "drive" : "solution";
     L.push(
-      `2. **Recommended ${isSensing ? "sensor" : "solution"}:** the type and why it suits their conditions (1-2 sentences)${
-        isSensing ? ", plus one line on what to avoid and why" : ""
+      `2. **Recommended ${recNoun}:** the type${isSizing ? " and size from ENGINEERING FACTS, showing the short calculation" : ""} and why it suits their conditions (1-2 sentences)${
+        isSensing || p.avoid.length ? ", plus one line on what to avoid and why" : ""
       }.`
     );
     L.push("3. **Key specs to look for:** 5-6 bullets with concrete values.");
@@ -1427,6 +1456,14 @@ export function buildAdvisoryFallback(a) {
       L.push(`**Common causes (${a.trouble.label}):**\n` + a.trouble.causes.slice(0, 3).map((c) => `• ${c}`).join("\n"));
     }
     L.push("Please isolate power (and air or hydraulic pressure) before checking anything.");
+    L.push(contact);
+    return L.join("\n\n");
+  }
+
+  if ((a.domain === "cylinder" || a.domain === "drive") && p.recommendation) {
+    const L = [`**Recommended ${a.domain === "cylinder" ? "cylinder" : "drive"}:** ${p.recommendation}.`];
+    if (p.facts.length) L.push(p.facts.slice(0, 2).join(" "));
+    if (qs.length) L.push("**To confirm:**\n" + qs.join("\n"));
     L.push(contact);
     return L.join("\n\n");
   }
