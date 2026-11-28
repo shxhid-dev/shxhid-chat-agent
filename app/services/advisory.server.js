@@ -1,4 +1,4 @@
-// app/services/advisory.server.js — v1.2
+// app/services/advisory.server.js — v1.3
 //
 // v1.2 (27 Nov 2026)
 //   - Two more playbooks (advisory-sizing.server.js): pneumatic/hydraulic cylinder sizing and
@@ -38,9 +38,12 @@
 //
 // Nothing here changes the DB schema, env vars or package.json. English input only.
 
-import { detectSizingDomain, hasSizingParam, buildCylinderPlan, buildDrivePlan } from "./advisory-sizing.server.js";
+import { detectSizingDomain, hasSizingParam, buildCylinderPlan, buildDrivePlan, buildValvePlan, buildStarterPlan } from "./advisory-sizing.server.js";
 
-export const ADVISORY_VERSION = "1.2.0";
+// Domains served by advisory-sizing.server.js, and the noun used for each in the reply.
+const SIZING_NOUN = { cylinder: "cylinder", drive: "drive", valve: "valve", starter: "starter" };
+
+export const ADVISORY_VERSION = "1.3.0";
 export const ADVISORY_TAG = "[ADVISORY BRIEF — NOT FROM USER]";
 
 const MIN_SELECTION_SCORE = 3; // minimum classify() score for a selection enquiry
@@ -94,9 +97,11 @@ const RE_SELECT_CUE = new RegExp(
     [
       "(?:right|best|suitable|appropriate|correct|ideal|proper)\\s+(?:\\w+\\s+){0,2}?(?:" + SELECT_NOUNS + ")",
       "what\\s+(?:type|kind|sort)\\s+of",
-      // Sizing asks that name a cylinder or drive (v1.2). Kept narrow so other enquiries classify as before.
-      "what\\s+size\\s+(?:of\\s+)?(?:\\w+\\s+){0,2}?(?:cylinders?|vfds?|drives?|inverters?)",
-      "(?:recommend|suggest)\\w*\\s+(?:(?:a|an|the|me)\\s+)?(?:\\w+\\s+){0,3}?(?:cylinders?|vfds?|inverters?|frequency\\s+drives?|speed\\s+drives?)",
+      // Sizing asks that name a cylinder, drive, valve or starter part (v1.2-1.3). Kept narrow so
+      // other enquiries classify as before.
+      "what\\s+size\\s+(?:of\\s+)?(?:\\w+\\s+){0,2}?(?:cylinders?|vfds?|drives?|inverters?|valves?|contactors?|breakers?|mcbs?|mpcbs?|starters?)",
+      "(?:recommend|suggest)\\w*\\s+(?:(?:a|an|the|me)\\s+)?(?:\\w+\\s+){0,3}?(?:cylinders?|vfds?|inverters?|frequency\\s+drives?|speed\\s+drives?|solenoid\\s+valves?|contactors?|mpcbs?|motor\\s+starters?)",
+      "which\\s+(?:\\w+\\s+){0,2}?(?:solenoid\\s+valves?|valves?|contactors?|breakers?|mcbs?|mpcbs?|starters?|overload\\s+relays?|vfds?|cylinders?)\\s+(?:for|to|with)\\b",
       "which\\s+(?:\\w+\\s+){0,3}?(?:should|do|would|to|is\\s+best|is\\s+right|is\\s+suitable)",
       "how\\s+(?:do\\s+|can\\s+|should\\s+|to\\s+)(?:i\\s+|we\\s+)?(?:choose|select|pick|size|specify)",
       "help\\s+(?:me\\s+)?(?:choose|select|pick|decide)",
@@ -1244,7 +1249,11 @@ function analyzeEnquiryUnsafe(userMessage, history, opts) {
       ? buildCylinderPlan(t)
       : sizing === "drive"
         ? buildDrivePlan(t, req)
-        : emptyPlan();
+        : sizing === "valve"
+          ? buildValvePlan(t, req)
+          : sizing === "starter"
+            ? buildStarterPlan(t, req)
+            : emptyPlan();
   const trouble = cls.intent === "troubleshooting" ? detectTroubleComponent(t) : null;
   const rewriteSearch = opts.rewriteSearch !== false;
 
@@ -1297,7 +1306,7 @@ export function buildAdvisoryBrief(a) {
   const req = a.requirements || {};
   const isTrouble = a.intent === "troubleshooting";
   const isSensing = a.domain === "sensing";
-  const isSizing = a.domain === "cylinder" || a.domain === "drive";
+  const isSizing = Object.prototype.hasOwnProperty.call(SIZING_NOUN, a.domain);
   const bullets = (arr) => arr.forEach((x) => L.push(`- ${x}`));
 
   const kind = isTrouble
@@ -1308,7 +1317,11 @@ export function buildAdvisoryBrief(a) {
         ? "application advice: cylinder sizing"
         : a.domain === "drive"
           ? "application advice: drive (VFD) selection"
-          : "application advice: general product selection";
+          : a.domain === "valve"
+            ? "application advice: solenoid valve selection"
+            : a.domain === "starter"
+              ? "application advice: motor starter / protection sizing"
+              : "application advice: general product selection";
 
   L.push(ADVISORY_TAG);
   L.push(`Enquiry type: ${kind}.`);
@@ -1417,7 +1430,7 @@ export function buildAdvisoryBrief(a) {
     L.push("Keep the whole reply under about 200 words.");
   } else {
     L.push("1. One short line confirming what you understood, including any assumption you made.");
-    const recNoun = isSensing ? "sensor" : a.domain === "cylinder" ? "cylinder" : a.domain === "drive" ? "drive" : "solution";
+    const recNoun = isSensing ? "sensor" : SIZING_NOUN[a.domain] || "solution";
     L.push(
       `2. **Recommended ${recNoun}:** the type${isSizing ? " and size from ENGINEERING FACTS, showing the short calculation" : ""} and why it suits their conditions (1-2 sentences)${
         isSensing || p.avoid.length ? ", plus one line on what to avoid and why" : ""
@@ -1460,8 +1473,8 @@ export function buildAdvisoryFallback(a) {
     return L.join("\n\n");
   }
 
-  if ((a.domain === "cylinder" || a.domain === "drive") && p.recommendation) {
-    const L = [`**Recommended ${a.domain === "cylinder" ? "cylinder" : "drive"}:** ${p.recommendation}.`];
+  if (SIZING_NOUN[a.domain] && p.recommendation) {
+    const L = [`**Recommended ${SIZING_NOUN[a.domain]}:** ${p.recommendation}.`];
     if (p.facts.length) L.push(p.facts.slice(0, 2).join(" "));
     if (qs.length) L.push("**To confirm:**\n" + qs.join("\n"));
     L.push(contact);

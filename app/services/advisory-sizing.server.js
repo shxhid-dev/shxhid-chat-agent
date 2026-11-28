@@ -46,10 +46,20 @@ const RE_VFD =
   /\b(?:vfds?|vsds?|inverters?|variable\s+(?:frequency|speed)\s+drives?|frequency\s+(?:converters?|inverters?|drives?)|ac\s+drives?|motor\s+drives?)\b/;
 const RE_NOT_MOTOR_INVERTER = /\b(?:solar|pv|photovoltaic|ups|battery|batteries|grid[- ]tie|off[- ]grid)\b/;
 
-/** "cylinder" | "drive" | null for a lower-cased selection enquiry. */
+const RE_VALVE =
+  /\b(?:solenoid\s+valves?|directional\s+(?:control\s+)?valves?|pneumatic\s+valves?|air\s+valves?|[235]\s*\/\s*[23]\s*(?:-?\s*way\s*)?valves?|(?:two|three|five)[- ]way\s+valves?)\b/;
+const RE_STARTER =
+  /\b(?:contactors?|motor\s+starters?|dol\s+starters?|direct[- ]on[- ]line|star[- ]delta|mpcbs?|motor\s+protection\s+(?:circuit\s+)?breakers?|overload\s+relays?|thermal\s+overloads?|(?:mcbs?|mccbs?|circuit\s+breakers?|breakers?)\s+for\s+(?:a|an|the|my|our)?\s*\d)/;
+
+/** "drive" | "valve" | "starter" | "cylinder" | null for a lower-cased selection enquiry. */
 export function detectSizingDomain(t) {
   const s = String(t || "");
   if (RE_VFD.test(s) && !RE_NOT_MOTOR_INVERTER.test(s)) return "drive";
+  // Valve questions often mention the cylinder they drive, so valves are checked first.
+  // A plain "valve" is a solenoid-valve question only next to a cylinder or compressed air; for
+  // water or steam it could be a ball, float or check valve, so those need the word "solenoid".
+  if (RE_VALVE.test(s) || (/\bvalves?\b/.test(s) && /\b(?:cylinders?|pneumatic|compressed\s+air)\b/.test(s))) return "valve";
+  if (RE_STARTER.test(s) && (RE_KW.test(s) || RE_HP.test(s))) return "starter";
   if (RE_CYLINDER.test(s) && !/\b(?:gas\s+cylinders?|oxygen|lpg|cylinder\s+head|lock\s+cylinders?)\b/.test(s)) return "cylinder";
   return null;
 }
@@ -354,4 +364,228 @@ export function buildDrivePlan(t, req = {}) {
   return plan;
 }
 
-export default { detectSizingDomain, hasSizingParam, buildCylinderPlan, buildDrivePlan, pushForceN, pullForceN, standardBoreFor, nextDriveKw };
+// ─── Solenoid valve selection ─────────────────────────────────────────
+
+// Usual cylinder port per bore (ISO 6432 / ISO 15552). The valve normally matches the port.
+const PORT_FOR_BORE = [
+  [16, "M5"], [25, "G1/8"], [32, "G1/8"], [50, "G1/4"], [80, "G3/8"], [125, "G1/2"], [200, "G3/4"], [320, "G1"],
+];
+const RE_BORE = /(?:(\d{1,3})\s*mm\s*(?:bore|cylinder|dia(?:meter)?)|\bbore\s*(?:of|is|=|:)?\s*(\d{1,3})\s*mm|ø\s*(\d{1,3}))/;
+const RE_PORT = /\b(g\s?\d\/\d|g\s?1\b|m5|\d\/\d\s*(?:"|inch|in\b|bsp\w*|npt))/;
+const RE_PROCESS_MEDIA = /\b(?:water|steam|hot\s+water|oil|diesel|fuel|gas|lpg|natural\s+gas|fluid|liquid|chemical|coolant|irrigation)\b/;
+
+/** Cylinder port for a bore (mm), e.g. 63 → G3/8. */
+export function portForBore(bore) {
+  for (const [max, port] of PORT_FOR_BORE) if (bore <= max) return port;
+  return null;
+}
+
+function cleanPort(p) {
+  return String(p || "").replace(/\s+/g, "").toUpperCase().replace(/INCH|IN$/, '"');
+}
+
+export function buildValvePlan(t, req = {}) {
+  const plan = emptyPlan();
+  const ask = (key, question) => plan.missing.push({ key, question });
+  const s = String(t || "");
+
+  const fn = /\b5\s*\/\s*3\b/.test(s) ? "5/3" : /\b5\s*\/\s*2\b/.test(s) ? "5/2" : /\b3\s*\/\s*2\b/.test(s) ? "3/2" : /\b2\s*\/\s*2\b/.test(s) ? "2/2" : null;
+  const doubleActing = /\bdouble[- ]acting\b/.test(s);
+  const singleActing = /\b(?:single[- ]acting|spring[- ]return\s+cylinder)\b/.test(s);
+  const process = RE_PROCESS_MEDIA.test(s) && !/\b(?:air|pneumatic|cylinder)\b/.test(s);
+  const holdOnPowerLoss = /\b(?:power\s+(?:loss|failure|cut)|stay\s+(?:in\s+)?(?:position|where)|hold\s+(?:its\s+)?position|memory|bistable|double\s+solenoid)\b/.test(s);
+  const stopMidStroke = /\b(?:mid[- ]?stroke|middle\s+position|stop\s+(?:in\s+)?(?:the\s+)?middle|intermediate\s+position|emergency\s+stop)\b/.test(s);
+  const boreM = RE_BORE.exec(s);
+  const bore = boreM ? parseInt(boreM[1] || boreM[2] || boreM[3], 10) : null;
+  const portM = RE_PORT.exec(s);
+  const port = portM ? cleanPort(portM[1]) : bore ? portForBore(bore) : null;
+  const v = req.voltage || null;
+  const coil = v ? `${v.value} V${v.type ? ` ${v.type}` : ""}` : null;
+
+  if (bore) plan.inputs.push(`Cylinder bore: ${bore} mm`);
+  if (doubleActing) plan.inputs.push("Cylinder: double-acting");
+  if (singleActing) plan.inputs.push("Cylinder: single-acting");
+  if (portM) plan.inputs.push(`Port size asked for: ${port}`);
+  if (coil) plan.inputs.push(`Coil voltage: ${coil}`);
+  if (process) plan.inputs.push(`Medium: ${(RE_PROCESS_MEDIA.exec(s) || [])[0]}`);
+
+  if (process) {
+    // Water, steam, oil, gas: a 2/2 process valve, not a pneumatic directional valve.
+    plan.recommendation = `2/2 process solenoid valve${port ? `, ${port}` : ""}, normally closed unless it must stay open without power`;
+    plan.facts.push("Liquids and gases go through a 2/2 (on/off) process valve. 5/2 and 3/2 directional valves are for compressed air to cylinders.");
+    plan.facts.push("Direct-acting valves work from 0 bar; pilot (servo-assisted) valves need a minimum pressure difference (often about 0.3-0.5 bar), so check it for gravity feeds and low-pressure lines.");
+    if (/\bsteam|hot\s+water\b/.test(s)) plan.facts.push("Steam and hot water need a valve rated for the temperature (PTFE or EPDM seals, brass or stainless body). Standard NBR seals are for cold water, air and oil.");
+    if (!port) ask("port", "What pipe size (e.g. 1/2\" or 3/4\") is the line?");
+    ask("pressure", "What pressure and temperature is the medium, and is there always a pressure difference across the valve?");
+    if (!coil) ask("coil", "What coil voltage do you need (e.g. 24 V DC or 230 V AC)?");
+    plan.searchQuery = `2/2 solenoid valve${port ? ` ${port}` : ""}`;
+    plan.keySpecs.push("Function 2/2, normally closed (NC) or normally open (NO)", "Port size and orifice (flow, Kv)", "Pressure range and minimum differential pressure", "Medium and temperature: seal (NBR, EPDM, FKM, PTFE) and body material", "Coil voltage, power and IP rating");
+    plan.checks.push("Valve body and seals suit the medium and its temperature", "Direct-acting if the pressure difference can be near zero", "Install a strainer before the valve for dirty water", "Flow direction arrow on the body");
+    return plan;
+  }
+
+  let func = fn;
+  let why = "";
+  if (!func) {
+    if (singleActing) {
+      func = "3/2";
+      why = "a single-acting cylinder needs one port pressurised and exhausted";
+    } else if (stopMidStroke) {
+      func = "5/3";
+      why = "the cylinder must stop in mid-stroke";
+    } else if (doubleActing || bore) {
+      func = "5/2";
+      why = "a double-acting cylinder needs both ports switched";
+    }
+  }
+  const actuation =
+    func === "5/2" ? (holdOnPowerLoss ? "double solenoid (bistable): stays in its last position on power loss" : "single solenoid, spring return (monostable): returns to its rest position on power loss") : null;
+
+  plan.recommendation = func
+    ? `${func} pneumatic solenoid valve${port ? `, ${port}` : ""}${actuation ? `, ${actuation.split(":")[0]}` : ""}${coil ? `, ${coil} coil` : ""}`
+    : "Pneumatic solenoid valve (function depends on the cylinder)";
+  if (func && why) plan.facts.push(`${func} because ${why}.`);
+  if (actuation) plan.facts.push(`${actuation[0].toUpperCase()}${actuation.slice(1)}.`);
+  if (func === "5/3") {
+    plan.facts.push("5/3 centre position: closed centre holds the cylinder (not for long: seals leak), exhaust centre lets it move freely, pressure centre pushes both sides.");
+  }
+  if (bore && !portM) {
+    plan.facts.push(`A ${bore} mm bore cylinder usually has ${port} ports, so a ${port} valve matches it. For fast strokes, check the valve flow (Nl/min or Cv) and go one size up if needed.`);
+  }
+  if (v && v.type === "DC" && v.value === 24) plan.facts.push("24 V DC coils can be driven straight from PLC outputs (check the coil current against the output rating).");
+
+  if (!func) ask("cylinder", "Is the cylinder single-acting or double-acting, and does it need to stop in mid-stroke?");
+  if (!port) ask("port", "What is the cylinder bore (mm) or its port size (e.g. G1/8, G1/4)?");
+  if (!coil) ask("coil", "What coil voltage do you need (24 V DC from a PLC, or 230 V AC)?");
+  if (func === "5/2" && !holdOnPowerLoss) ask("powerLoss", "On power loss, should the cylinder return to its rest position or stay where it is?");
+
+  if (func) plan.searchQuery = `${func} solenoid valve${port ? ` ${port}` : ""}`;
+  plan.keySpecs.push(
+    "Function (3/2, 5/2, 5/3) and actuation (single solenoid spring return, double solenoid, centre position)",
+    "Port size (match the cylinder port) and flow (Nl/min or Cv)",
+    "Coil voltage and power (24 V DC or 230 V AC), connector type (DIN / M8 / M12)",
+    "Pressure range (pilot-operated valves need a minimum, typically about 1.5-2 bar)",
+    "Manual override, mounting (inline or manifold/sub-base) and silencers on the exhausts"
+  );
+  plan.checks.push(
+    "Valve flow is enough for the cylinder speed (long tubes and small ports slow it down)",
+    "Minimum operating pressure of pilot-operated valves",
+    "What happens on power loss and on air loss (safety of the machine)",
+    "Coil voltage matches the PLC or supply; use flow controls on the exhausts for speed"
+  );
+  return plan;
+}
+
+// ─── Motor starter (contactor / MPCB / MCB) selection ─────────────────
+
+// Typical full-load current of 4-pole IEC motors at 400 V three-phase (A). The nameplate wins.
+const FLC_400V = [
+  [0.37, 1.1], [0.55, 1.5], [0.75, 1.9], [1.1, 2.6], [1.5, 3.5], [2.2, 5], [3, 6.6], [4, 8.5], [5.5, 11.5], [7.5, 15.5],
+  [11, 22], [15, 29], [18.5, 35], [22, 42], [30, 57], [37, 69], [45, 83], [55, 100], [75, 135], [90, 160], [110, 195], [132, 230], [160, 280], [200, 350],
+];
+const MCB_RATINGS = [1, 2, 3, 4, 6, 10, 13, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125];
+
+/** Typical full-load current (A) of a motor of this power at this voltage; null if out of range. */
+export function typicalFlc(kw, volts = 400, phase = 3) {
+  if (phase === 1) return Math.round((kw * 1000) / ((volts || 230) * 0.72) * 10) / 10; // single-phase: η·cosφ ≈ 0.72
+  const row = FLC_400V.find(([p]) => p >= kw - 1e-9);
+  if (!row) return null;
+  return Math.round(row[1] * (400 / (volts || 400)) * 10) / 10;
+}
+
+export function buildStarterPlan(t, req = {}) {
+  const plan = emptyPlan();
+  const ask = (key, question) => plan.missing.push({ key, question });
+  const s = String(t || "");
+  const d = readDrive(s);
+  const volts = d.volts || req.voltage?.value || null;
+  const phase = d.phase || (volts && volts >= 380 ? 3 : null);
+  const wantsMcb = /\b(?:mcbs?|mccbs?|circuit\s+breakers?|breakers?)\b/.test(s) && !/\bmotor\s+protection\b/.test(s);
+  const wantsMpcb = /\b(?:mpcbs?|motor\s+protection\s+(?:circuit\s+)?breakers?)\b/.test(s);
+  const wantsOverload = /\b(?:overload\s+relays?|thermal\s+overloads?)\b/.test(s);
+  const starDelta = /\bstar[- ]delta\b/.test(s);
+
+  if (d.motorKw != null) plan.inputs.push(`Motor: ${d.fromHp ? `${fmt(d.hp, 1)} hp (≈ ${fmt(d.motorKw, 2)} kW)` : `${fmt(d.motorKw, 2)} kW`}`);
+  if (volts || phase) plan.inputs.push(`Supply: ${phase ? `${phase === 1 ? "single" : "three"}-phase ` : ""}${volts ? `${volts} V` : ""}`.trim());
+  if (d.flcA != null) plan.inputs.push(`Motor current: ${fmt(d.flcA, 1)} A`);
+
+  if (d.motorKw == null) {
+    ask("power", "What is the motor power (kW) and the full-load current on its nameplate?");
+    plan.recommendation = "Motor starter sized to the motor's full-load current";
+    return plan;
+  }
+
+  if (!volts && !phase) plan.assumptions.push("Supply not given: 400 V three-phase assumed.");
+  const flc = d.flcA ?? typicalFlc(d.motorKw, volts || (phase === 1 ? 230 : 400), phase || 3);
+  const kwSize = nextDriveKw(d.motorKw);
+  plan.numbers = { motorKw: Math.round(d.motorKw * 100) / 100, flcA: flc, phase: phase || 3, volts: volts || (phase === 1 ? 230 : 400) };
+
+  if (d.flcA == null && flc != null) {
+    plan.facts.push(`A ${fmt(d.motorKw, 2)} kW motor draws about ${fmt(flc, 1)} A at full load on ${phase === 1 ? "single-phase" : "three-phase"} ${volts || (phase === 1 ? 230 : 400)} V (typical value; use the nameplate current to set the protection).`);
+  }
+  const threePhase400 = (phase || 3) === 3 && (!volts || (volts >= 380 && volts <= 415));
+  plan.facts.push(
+    `Contactor: AC-3 rating of at least ${fmt(flc, 1)} A${threePhase400 ? ` (a contactor rated ${kwSize} kW AC-3 at 400 V)` : ""}. AC-3 is the motor-switching rating; AC-1 ratings are for resistive loads.`
+  );
+  plan.facts.push(`Overload protection: a motor protection circuit breaker (MPCB) or overload relay whose setting range includes ${fmt(flc, 1)} A, set to the nameplate current.`);
+  if (wantsMcb) {
+    const mcb = MCB_RATINGS.find((r) => r >= flc * 1.25) ?? null;
+    plan.facts.push(
+      mcb
+        ? `If an MCB is used for the motor circuit: C or D curve (motor inrush), about ${mcb} A (≈ 1.25 × full-load current). An MCB does not protect the motor against overload, so an overload relay is still needed.`
+        : "This current is above the usual MCB range: use an MCCB or MPCB sized to the motor."
+    );
+  }
+  if (d.motorKw > 7.5 + 1e-9 || starDelta) {
+    plan.facts.push("Above about 7.5 kW, direct-on-line starting can dip the supply: star-delta (motor must be delta-rated at the supply voltage, 6 wires), a soft starter or a VFD limits the inrush. Check the supply authority's limits.");
+  }
+
+  plan.recommendation =
+    `Motor starter for ${fmt(d.motorKw, 2)} kW: contactor ${threePhase400 ? `${kwSize} kW AC-3` : `rated at least ${fmt(flc, 1)} A AC-3`}` +
+    ` with an MPCB or overload relay set to about ${fmt(flc, 1)} A`;
+  if (d.flcA == null) ask("current", "What full-load current is on the motor nameplate? The overload must be set to it.");
+  if (!volts && !phase) ask("supply", "What is the supply voltage: 400 V three-phase or 230 V single-phase?");
+  ask("coil", "What control voltage should the contactor coil have (e.g. 24 V DC or 230 V AC)?");
+
+  const mcbRating = MCB_RATINGS.find((r) => r >= flc * 1.25) ?? null;
+  plan.searchQuery = wantsMpcb
+    ? "motor protection circuit breaker"
+    : wantsOverload
+      ? "thermal overload relay"
+      : wantsMcb && !/\bcontactor/.test(s)
+        ? mcbRating
+          ? `circuit breaker ${mcbRating} A`
+          : "circuit breaker"
+        : threePhase400
+          ? `contactor ${kwSize} kW`
+          : "contactor";
+  plan.keySpecs.push(
+    "Contactor AC-3 rated current / kW at the supply voltage",
+    "Coil voltage (24 V DC, 110/230 V AC) and auxiliary contacts (NO/NC) for interlocks",
+    "MPCB or overload relay setting range covering the nameplate current; trip class 10 (class 20 for heavy starting)",
+    "Short-circuit breaking capacity (kA) suited to the panel",
+    "Starting method: direct-on-line, star-delta, soft starter or VFD"
+  );
+  plan.checks.push(
+    "Set the overload to the nameplate full-load current, not the breaker size",
+    "Contactor and protection from the same coordination table (type 1 or type 2) when possible",
+    "Cable size and voltage drop for the motor current and run length",
+    "Reversing duty or frequent starts need a higher contactor rating"
+  );
+  return plan;
+}
+
+export default {
+  detectSizingDomain,
+  hasSizingParam,
+  buildCylinderPlan,
+  buildDrivePlan,
+  buildValvePlan,
+  buildStarterPlan,
+  pushForceN,
+  pullForceN,
+  standardBoreFor,
+  nextDriveKw,
+  portForBore,
+  typicalFlc,
+};

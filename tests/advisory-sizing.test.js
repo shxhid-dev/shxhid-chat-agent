@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { analyzeEnquiry, buildAdvisoryBrief, buildAdvisoryFallback } from "../app/services/advisory.server.js";
-import { pushForceN, pullForceN, standardBoreFor, nextDriveKw, detectSizingDomain } from "../app/services/advisory-sizing.server.js";
+import { pushForceN, pullForceN, standardBoreFor, nextDriveKw, detectSizingDomain, portForBore, typicalFlc } from "../app/services/advisory-sizing.server.js";
 
 test("cylinder force maths", () => {
   assert.equal(Math.round(pushForceN(50, 6)), 1178);
@@ -67,4 +67,55 @@ test("lookups, other products and solar inverters are left alone", () => {
     assert.ok(!a || (a.domain !== "cylinder" && a.domain !== "drive"), m);
   }
   assert.equal(detectSizingDomain("gas cylinder regulator"), null);
+});
+
+test("valve: function and port follow the cylinder", () => {
+  const a = analyzeEnquiry("Which solenoid valve should I use for a 63 mm bore double acting cylinder, 24V DC?", []);
+  assert.equal(a.domain, "valve");
+  assert.equal(a.searchQuery, "5/2 solenoid valve G3/8");
+  assert.match(a.plan.recommendation, /24 V DC coil/);
+
+  const single = analyzeEnquiry("Which valve for a single acting cylinder 32 mm bore?", []);
+  assert.equal(single.searchQuery, "3/2 solenoid valve G1/8");
+
+  const mid = analyzeEnquiry("Which solenoid valve for my cylinder? It must stop in the middle of the stroke, 24 V DC", []);
+  assert.match(mid.searchQuery, /^5\/3 solenoid valve/);
+
+  assert.equal(portForBore(63), "G3/8");
+  assert.equal(portForBore(12), "M5");
+});
+
+test("valve: water and steam get a 2/2 process valve; a plain 'valve' for water is not assumed solenoid", () => {
+  const hot = analyzeEnquiry("Suggest a solenoid valve for hot water 1/2 inch 230V AC", []);
+  assert.equal(hot.domain, "valve");
+  assert.match(hot.searchQuery, /^2\/2 solenoid valve/);
+  assert.ok(hot.plan.facts.some((f) => /PTFE or EPDM/.test(f)));
+
+  const tank = analyzeEnquiry("which valve for my water tank?", []);
+  assert.notEqual(tank?.domain, "valve");
+});
+
+test("starter: current estimate, contactor and protection", () => {
+  assert.equal(typicalFlc(7.5, 400, 3), 15.5);
+  assert.equal(typicalFlc(2.2, 230, 1), 13.3);
+
+  const a = analyzeEnquiry("Which contactor for a 7.5 kW motor on 400V 3 phase?", []);
+  assert.equal(a.domain, "starter");
+  assert.equal(a.plan.numbers.flcA, 15.5);
+  assert.equal(a.searchQuery, "contactor 7.5 kW");
+
+  const single = analyzeEnquiry("What size breaker for a 2.2 kW single phase motor 230V?", []);
+  assert.equal(single.searchQuery, "circuit breaker 20 A");
+  assert.doesNotMatch(single.plan.recommendation, /kW AC-3/, "single-phase is sized on current, not kW at 400 V");
+
+  const big = analyzeEnquiry("Recommend an MPCB for a 15 kW conveyor motor 400V", []);
+  assert.equal(big.searchQuery, "motor protection circuit breaker");
+  assert.ok(big.plan.facts.some((f) => /star-delta/.test(f)));
+});
+
+test("valve and starter lookups stay lookups", () => {
+  for (const m of ["do you have 5/2 solenoid valve G1/4?", "do you have contactor 7.5 kW", "do you have ball valve 1 inch", "which brand is best"]) {
+    const a = analyzeEnquiry(m, []);
+    assert.ok(!a || !["valve", "starter"].includes(a.domain), m);
+  }
 });
